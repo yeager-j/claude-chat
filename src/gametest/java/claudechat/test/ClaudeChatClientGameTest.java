@@ -1,0 +1,175 @@
+package claudechat.test;
+
+import claudechat.ClaudeChatClient;
+import claudechat.KnowledgeBase;
+import net.minecraft.SharedConstants;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.metadata.pack.PackFormat;
+import net.minecraft.world.level.storage.LevelResource;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+import com.mojang.blaze3d.platform.InputConstants;
+import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
+import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
+import net.fabricmc.fabric.api.client.gametest.v1.context.TestSingleplayerContext;
+
+/**
+ * Plays through the mod in a real client and saves screenshots to build/run/clientGameTest/screenshots:
+ * the formatting preview, tab completion, and (if CLAUDECHAT_LIVE_TEST=1) a real question answered by Claude.
+ */
+public class ClaudeChatClientGameTest implements FabricClientGameTest {
+	private static final Logger LOGGER = LoggerFactory.getLogger("claudechat-test");
+	private static final int SECONDS = 20;
+	// 26.x uses SDL scancodes for input, not GLFW key codes.
+	private static final int KEY_ENTER = InputConstants.KEY_RETURN;
+	private static final int KEY_ESCAPE = InputConstants.KEY_ESCAPE;
+
+	@Override
+	public void runTest(ClientGameTestContext context) {
+		// Recipe grids read the decompiled data, so wait for the first knowledge base build.
+		context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 600 * SECONDS);
+
+		try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
+			singleplayer.getConnection().waitForChunksRender();
+
+			// 1. The formatting preview, through the real command.
+			chat(context, "/claude preview");
+			context.waitTicks(10);
+			openChat(context);
+			context.takeScreenshot("claudechat-preview");
+			context.getInput().pressKey(KEY_ESCAPE);
+
+			// 2. Tab completion for /claude effort.
+			openChat(context);
+			context.getInput().typeChars("/claude effort ");
+			context.waitTicks(10);
+			context.takeScreenshot("claudechat-autocomplete");
+			// The first Escape only closes the suggestion list; the second closes chat.
+			context.getInput().pressKey(KEY_ESCAPE);
+			context.getInput().pressKey(KEY_ESCAPE);
+			context.waitTicks(2);
+
+			// 3. How installed mods were classified (put mod jars in build/run/clientGameTest/mods to test real ones).
+			for (KnowledgeBase.Source source : ClaudeChatClient.knowledge().sources()) {
+				LOGGER.info("knowledge: {} tier={} state={} reason={} codeJars={}", source.id(),
+					ClaudeChatClient.knowledge().tier(source), ClaudeChatClient.knowledge().state(source),
+					ClaudeChatClient.knowledge().reason(source), source.codeContainers().size());
+			}
+			chat(context, "/claude knowledge");
+			context.waitTicks(10);
+			openChat(context);
+			context.takeScreenshot("claudechat-knowledge");
+			context.getInput().pressKey(KEY_ESCAPE);
+
+			// 4. Optionally, world data packs: a folder pack adding a loot table, and a zip pack overriding a vanilla one.
+			if ("1".equals(System.getenv("CLAUDECHAT_PACK_TEST"))) {
+				Path datapacks = singleplayer.getServer().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR));
+				writeTestPacks(datapacks);
+				singleplayer.getServer().runCommand("reload");
+				context.waitTicks(20);
+				context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 60 * SECONDS);
+				chat(context, "@claude what's in a secret vault chest? and what can dungeon chests have in this world?");
+				context.waitTicks(5);
+				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-datapack-answer");
+				context.getInput().pressKey(KEY_ESCAPE);
+			}
+
+			// 5. Optionally, a question about a data-only mod, which gets decompiled on demand first.
+			String modQuestion = System.getenv("CLAUDECHAT_MOD_QUESTION");
+			if (modQuestion != null && !modQuestion.isBlank()) {
+				chat(context, "@claude " + modQuestion);
+				context.waitTicks(5 * SECONDS);
+				context.takeScreenshot("claudechat-mod-status");
+				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-mod-answer");
+				context.getInput().pressKey(KEY_ESCAPE);
+			}
+
+			// 6. Optionally, a real question. This calls the local claude CLI and uses the signed-in account.
+			if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
+				singleplayer.getServer().runCommand("give @a minecraft:crafter");
+				context.waitTicks(10);
+				chat(context, "@claude how do I craft this? show the recipe");
+				context.waitTicks(5);
+				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-live-answer");
+				context.getInput().pressKey(KEY_ESCAPE);
+
+				// A question that needs research, so Claude streams progress notes between tool calls.
+				chat(context, "/claude reset");
+				chat(context, "@claude how does the crafter decide which slot a hopper fills?");
+				// The live status line: right away, then once a progress note has likely arrived.
+				context.waitTicks(2 * SECONDS);
+				context.takeScreenshot("claudechat-status-2s");
+				context.waitTicks(10 * SECONDS);
+				if (ClaudeChatClient.isBusy()) {
+					context.takeScreenshot("claudechat-status-12s");
+				}
+				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-live-research");
+				context.getInput().pressKey(KEY_ESCAPE);
+			}
+		}
+	}
+
+	private static void writeTestPacks(Path datapacks) {
+		PackFormat format = SharedConstants.getCurrentVersion().packVersion(PackType.SERVER_DATA);
+		String mcmeta = """
+			{"pack": {"description": "%s", "min_format": [%d, %d], "max_format": [%d, %d]}}
+			""";
+		String vault = """
+			{"type": "minecraft:chest", "pools": [{"rolls": 2, "entries": [
+			  {"type": "minecraft:item", "name": "minecraft:diamond", "weight": 1,
+			   "functions": [{"function": "minecraft:set_count", "count": {"type": "minecraft:uniform", "min": 1, "max": 3}}]},
+			  {"type": "minecraft:item", "name": "minecraft:golden_apple", "weight": 3}]}]}
+			""";
+		String dungeon = """
+			{"type": "minecraft:chest", "pools": [{"rolls": 1, "entries": [
+			  {"type": "minecraft:item", "name": "minecraft:netherite_ingot"}]}]}
+			""";
+		try {
+			Path folder = datapacks.resolve("Secret Vaults");
+			Files.createDirectories(folder.resolve("data/claudetest/loot_table/chests"));
+			Files.writeString(folder.resolve("pack.mcmeta"), mcmeta.formatted("Secret vaults", format.major(), format.minor(), format.major(), format.minor()));
+			Files.writeString(folder.resolve("data/claudetest/loot_table/chests/secret_vault.json"), vault);
+
+			try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(datapacks.resolve("Better Dungeons.zip")))) {
+				zip.putNextEntry(new ZipEntry("pack.mcmeta"));
+				zip.write(mcmeta.formatted("Better dungeons", format.major(), format.minor(), format.major(), format.minor()).getBytes(StandardCharsets.UTF_8));
+				zip.putNextEntry(new ZipEntry("data/minecraft/loot_table/chests/simple_dungeon.json"));
+				zip.write(dungeon.getBytes(StandardCharsets.UTF_8));
+			}
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	private static void openChat(ClientGameTestContext context) {
+		context.getInput().pressKey(options -> options.keyChat);
+		context.waitTicks(2);
+	}
+
+	private static void chat(ClientGameTestContext context, String message) {
+		openChat(context);
+		context.getInput().typeChars(message);
+		context.getInput().pressKey(KEY_ENTER);
+		context.waitTicks(2);
+	}
+}

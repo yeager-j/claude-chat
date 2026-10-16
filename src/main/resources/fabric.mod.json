@@ -1,0 +1,28 @@
+{
+	"schemaVersion": 1,
+	"id": "claudechat",
+	"version": "${version}",
+	"name": "Claude Chat",
+	"description": "Ask Claude questions from Minecraft chat with @claude; configure with /claude. Runs your local Claude Code CLI (claude -p).",
+	"authors": [],
+	"license": "CC0-1.0",
+	"icon": "assets/claudechat/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": [
+			"claudechat.ClaudeChatClient"
+		]
+	},
+	"mixins": [
+		{
+			"config": "claudechat.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

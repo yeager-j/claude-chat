@@ -1,0 +1,15 @@
+{
+	"schemaVersion": 1,
+	"id": "claudechat-test",
+	"version": "1.0.0",
+	"name": "Claude Chat tests",
+	"environment": "client",
+	"entrypoints": {
+		"fabric-client-gametest": [
+			"claudechat.test.ClaudeChatClientGameTest"
+		]
+	},
+	"depends": {
+		"claudechat": "*"
+	}
+}
