@@ -1,6 +1,6 @@
 package claudechat;
 
-import net.minecraft.core.Holder;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
@@ -15,7 +15,6 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.SharedConstants;
 import net.minecraft.util.ProblemReporter;
 import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.entity.Entity;
@@ -41,16 +40,12 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -62,46 +57,59 @@ import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
- * A searchable text index of what's stored where in the current single-player world: every container with its contents
+ * What's stored where in the current single-player world, for the world tools: every container with its contents
  * (including items inside shulker boxes and bundles), unopened loot chests, entities that hold items or are named or
- * tamed (chest minecarts, item frames, armor stands, dropped items, pets), and the player's inventory and ender chest.
+ * tamed (chest minecarts, item frames, armor stands, dropped items, pets), each player's inventory and ender chest,
+ * and how long players have spent near each chunk (its InhabitedTime, used to tell visited structures apart).
  * <p>
  * Saved chunks are read straight from the region files (read-only; only chunks whose save timestamp changed are
  * re-read). Chunks that are loaded right now are captured live from the server instead, since the save on disk can be
- * up to an autosave (5 minutes) behind. Written to knowledge/world/&lt;world folder&gt;/index.txt before each question.
+ * up to an autosave (5 minutes) behind.
  */
 public class WorldIndex {
 	private static final Pattern REGION_NAME = Pattern.compile("r\\.(-?\\d+)\\.(-?\\d+)\\.mca");
 	private static final int MAX_NESTING = 2;
 
 	/** One chunk of one dimension; block entities and entities are stored in separate region folders. */
-	private record ChunkKey(String dimension, int x, int z, boolean entities) {
+	public record ChunkKey(String dimension, int x, int z, boolean entities) {
 	}
 
-	private final KnowledgeBase knowledge;
+	/** An item stack, with what's inside it if it's a shulker box or bundle. */
+	public record Item(String id, String name, int count, List<String> enchantments, List<Item> contents) {
+	}
+
+	/** Something that holds items or is worth finding: a container block, an entity, or a player. */
+	public record Holder(String kind, String dimension, int x, int y, int z, String type, String name,
+		String lootTable, boolean tamed, List<Item> items, boolean live) {
+	}
+
+	public record PlayerInfo(String name, String dimension, double x, double y, double z, List<Item> inventory, List<Item> enderChest) {
+	}
+
+	/** Everything at one moment: saved data merged with the live loaded chunks. */
+	public record Snapshot(List<Holder> holders, List<PlayerInfo> players, Map<ChunkKey, Long> inhabitedTicks) {
+		/** How long players have spent within mob-spawning range (128 blocks) of a chunk, or -1 if it was never generated. */
+		public long inhabited(String dimension, int chunkX, int chunkZ) {
+			return inhabitedTicks.getOrDefault(new ChunkKey(dimension, chunkX, chunkZ, false), -1L);
+		}
+	}
+
 	private volatile MinecraftServer server;
-	private volatile Path indexFile;
-	private volatile String relativePath;
 	/** Last-seen save timestamp per chunk, so rescans only parse what changed. */
 	private final Map<ChunkKey, Integer> timestamps = new ConcurrentHashMap<>();
-	private final Map<ChunkKey, List<String>> savedLines = new ConcurrentHashMap<>();
-
-	public WorldIndex(KnowledgeBase knowledge) {
-		this.knowledge = knowledge;
-	}
+	private final Map<ChunkKey, List<Holder>> savedHolders = new ConcurrentHashMap<>();
+	private final Map<ChunkKey, Long> savedInhabited = new ConcurrentHashMap<>();
+	private int failuresLogged;
 
 	/** A single-player world opened. Scans it in the background so the first question is quick. */
 	public void start(MinecraftServer server) {
 		this.server = server;
 		timestamps.clear();
-		savedLines.clear();
-		String world = server.getWorldPath(LevelResource.ROOT).toAbsolutePath().normalize().getFileName().toString();
-		relativePath = "world/" + world.replaceAll("[^A-Za-z0-9._+-]", "_") + "/index.txt";
-		indexFile = knowledge.root().resolve(relativePath);
-		knowledge.setWorldIndex(relativePath);
+		savedHolders.clear();
+		savedInhabited.clear();
 		Thread thread = new Thread(() -> {
 			try {
-				refresh();
+				snapshot();
 			} catch (Exception e) {
 				ClaudeChatClient.LOGGER.warn("Could not index the world", e);
 			}
@@ -113,25 +121,25 @@ public class WorldIndex {
 
 	public void stop() {
 		server = null;
-		knowledge.setWorldIndex(null);
 	}
 
-	public boolean isActive() {
-		return server != null;
+	public MinecraftServer server() {
+		return server;
 	}
 
-	/** Rescan changed chunks, capture the live ones, and rewrite the index. Call off the server and render threads. */
-	public synchronized void refresh() throws Exception {
+	/**
+	 * Rescan chunks saved since last time, capture the loaded ones live, and merge. Usually well under a second.
+	 * Call from a background thread (not the server or render thread).
+	 */
+	public synchronized Snapshot snapshot() throws Exception {
 		MinecraftServer server = this.server;
 		if (server == null) {
-			return;
+			throw new IllegalStateException("No single-player world is open.");
 		}
 		long start = System.nanoTime();
 		RegistryOps<Tag> ops = server.registryAccess().createSerializationContext(NbtOps.INSTANCE);
 		Path worldRoot = server.getWorldPath(LevelResource.ROOT);
 		int changed = 0;
-		regionsSeen = 0;
-		chunksSeen = 0;
 		for (ServerLevel level : server.getAllLevels()) {
 			Path dimensionDir = DimensionType.getStorageFolder(level.dimension(), worldRoot);
 			changed += scanRegions(server, ops, dimensionName(level.dimension()), dimensionDir.resolve("region"), false);
@@ -139,13 +147,20 @@ public class WorldIndex {
 		}
 
 		Live live = server.submit(() -> captureLive(server, ops)).get(20, TimeUnit.SECONDS);
-		write(server, live);
-		ClaudeChatClient.LOGGER.info("World index: {} region files, {} saved chunks ({} re-read), {} live lines, {} ms",
-			regionsSeen, chunksSeen, changed, live.lines.size(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
-	}
+		List<Holder> holders = new ArrayList<>();
+		savedHolders.forEach((key, chunkHolders) -> {
+			if (!live.loaded().contains(key)) {
+				holders.addAll(chunkHolders);
+			}
+		});
+		holders.addAll(live.holders());
+		Map<ChunkKey, Long> inhabited = new HashMap<>(savedInhabited);
+		inhabited.putAll(live.inhabited());
 
-	private int regionsSeen;
-	private int chunksSeen;
+		ClaudeChatClient.LOGGER.debug("World snapshot: {} saved chunks re-read, {} holders, {} ms",
+			changed, holders.size(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+		return new Snapshot(holders, live.players(), inhabited);
+	}
 
 	// --- saved chunks ---------------------------------------------------------------------------------------------
 
@@ -171,16 +186,13 @@ public class WorldIndex {
 				}
 				ByteBuffer header = ByteBuffer.allocate(8192);
 				readFully(channel, header, 0);
-				regionsSeen++;
 				for (int i = 0; i < 1024; i++) {
 					int location = header.getInt(i * 4);
-					if (location != 0) {
-						chunksSeen++;
-					}
 					ChunkKey key = new ChunkKey(dimension, regionX * 32 + (i & 31), regionZ * 32 + (i >> 5), entities);
 					if (location == 0) {
-						if (savedLines.remove(key) != null) {
-							timestamps.remove(key);
+						if (timestamps.remove(key) != null) {
+							savedHolders.remove(key);
+							savedInhabited.remove(key);
 						}
 						continue;
 					}
@@ -192,7 +204,18 @@ public class WorldIndex {
 					try {
 						CompoundTag chunk = readChunk(channel, region, location, key);
 						if (chunk != null) {
-							savedLines.put(key, describeChunk(server, ops, dimension, chunk, entities));
+							chunk = upgrade(server, chunk, entities ? DataFixTypes.ENTITY_CHUNK : DataFixTypes.CHUNK);
+							savedHolders.put(key, describeChunk(ops, dimension, chunk, entities));
+							if (!entities) {
+								// Only fully generated chunks count: structure searches (ours and /locate's) can leave
+								// partly generated "structure starts" chunks on disk that nobody has ever been near.
+								String status = chunk.getStringOr("Status", "");
+								if (status.equals("minecraft:full") || status.equals("full")) {
+									savedInhabited.put(key, chunk.getLongOr("InhabitedTime", 0L));
+								} else {
+									savedInhabited.remove(key);
+								}
+							}
 							timestamps.put(key, timestamp);
 							changed++;
 						}
@@ -206,8 +229,6 @@ public class WorldIndex {
 		}
 		return changed;
 	}
-
-	private int failuresLogged;
 
 	/** Warn about the first few failures (a torn read now and then is normal; a failure on every chunk is a bug). */
 	private void logFailure(String message, Exception e) {
@@ -234,8 +255,7 @@ public class WorldIndex {
 		InputStream raw;
 		if ((type & 0x80) != 0) {
 			// Oversized chunk stored next to the region file as c.<x>.<z>.mcc
-			Path external = region.resolveSibling("c." + key.x() + "." + key.z() + ".mcc");
-			raw = Files.newInputStream(external);
+			raw = Files.newInputStream(region.resolveSibling("c." + key.x() + "." + key.z() + ".mcc"));
 		} else {
 			raw = new ByteArrayInputStream(data.array(), 5, length - 1);
 		}
@@ -257,19 +277,18 @@ public class WorldIndex {
 		}
 	}
 
-	private List<String> describeChunk(MinecraftServer server, RegistryOps<Tag> ops, String dimension, CompoundTag chunk, boolean entities) {
-		chunk = upgrade(server, chunk, entities ? DataFixTypes.ENTITY_CHUNK : DataFixTypes.CHUNK);
-		List<String> lines = new ArrayList<>();
+	private static List<Holder> describeChunk(RegistryOps<Tag> ops, String dimension, CompoundTag chunk, boolean entities) {
+		List<Holder> holders = new ArrayList<>();
 		if (entities) {
 			for (CompoundTag entity : compounds(chunk.getListOrEmpty("Entities"))) {
-				addIfPresent(lines, describeEntity(ops, dimension, entity.getStringOr("id", "?"), entity));
+				addIfPresent(holders, describeEntity(ops, dimension, entity.getStringOr("id", "?"), entity, false));
 			}
 		} else {
 			for (CompoundTag blockEntity : compounds(chunk.getListOrEmpty("block_entities"))) {
-				addIfPresent(lines, describeBlockEntity(ops, dimension, blockEntity));
+				addIfPresent(holders, describeBlockEntity(ops, dimension, blockEntity, false));
 			}
 		}
-		return lines;
+		return holders;
 	}
 
 	/** Chunks saved by older versions are upgraded with the game's own data fixers; if that fails, use them as they are. */
@@ -288,14 +307,15 @@ public class WorldIndex {
 
 	// --- live state -----------------------------------------------------------------------------------------------
 
-	private record Live(Set<ChunkKey> loaded, List<String> lines, List<String> players) {
+	private record Live(Set<ChunkKey> loaded, List<Holder> holders, List<PlayerInfo> players, Map<ChunkKey, Long> inhabited) {
 	}
 
 	/** Server thread: what's in the chunks around players right now, plus the players themselves. */
 	private static Live captureLive(MinecraftServer server, RegistryOps<Tag> ops) {
 		Set<ChunkKey> loaded = new HashSet<>();
-		List<String> lines = new ArrayList<>();
-		List<String> players = new ArrayList<>();
+		List<Holder> holders = new ArrayList<>();
+		List<PlayerInfo> players = new ArrayList<>();
+		Map<ChunkKey, Long> inhabited = new HashMap<>();
 		int radius = server.getPlayerList().getViewDistance() + 1;
 
 		for (ServerLevel level : server.getAllLevels()) {
@@ -313,11 +333,13 @@ public class WorldIndex {
 						if (chunk == null) {
 							continue;
 						}
-						loaded.add(new ChunkKey(dimension, cx, cz, false));
+						ChunkKey blocks = new ChunkKey(dimension, cx, cz, false);
+						loaded.add(blocks);
 						loaded.add(new ChunkKey(dimension, cx, cz, true));
+						inhabited.put(blocks, chunk.getInhabitedTime());
 						for (BlockEntity blockEntity : chunk.getBlockEntities().values()) {
 							try {
-								addIfPresent(lines, describeBlockEntity(ops, dimension, blockEntity.saveWithFullMetadata(server.registryAccess())));
+								addIfPresent(holders, describeBlockEntity(ops, dimension, blockEntity.saveWithFullMetadata(server.registryAccess()), true));
 							} catch (RuntimeException e) {
 								ClaudeChatClient.LOGGER.debug("Skipping block entity at {}", blockEntity.getBlockPos(), e);
 							}
@@ -330,7 +352,7 @@ public class WorldIndex {
 					continue;
 				}
 				try {
-					addIfPresent(lines, describeEntity(ops, dimension, EntityType.getKey(entity.getType()).toString(), save(server, entity)));
+					addIfPresent(holders, describeEntity(ops, dimension, EntityType.getKey(entity.getType()).toString(), save(server, entity), true));
 				} catch (RuntimeException e) {
 					ClaudeChatClient.LOGGER.debug("Skipping entity {}", entity, e);
 				}
@@ -339,12 +361,11 @@ public class WorldIndex {
 
 		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
 			CompoundTag tag = save(server, player);
-			String who = "[player] " + player.getName().getString();
-			players.add(who + " | at " + dimensionName(player.level().dimension()) + " " + player.getBlockX() + " " + player.getBlockY() + " " + player.getBlockZ());
-			players.add(who + " | inventory | " + describeItems(ops, tag.getListOrEmpty("Inventory")));
-			players.add(who + " | ender chest | " + describeItems(ops, tag.getListOrEmpty("EnderItems")));
+			players.add(new PlayerInfo(player.getName().getString(), dimensionName(player.level().dimension()),
+				player.getX(), player.getY(), player.getZ(),
+				items(ops, tag.getListOrEmpty("Inventory")), items(ops, tag.getListOrEmpty("EnderItems"))));
 		}
-		return new Live(loaded, lines, players);
+		return new Live(loaded, holders, players, inhabited);
 	}
 
 	private static CompoundTag save(MinecraftServer server, Entity entity) {
@@ -353,38 +374,34 @@ public class WorldIndex {
 		return output.buildResult();
 	}
 
-	// --- describing things ----------------------------------------------------------------------------------------
+	// --- reading block entities, entities and items ---------------------------------------------------------------
 
-	/** "[overworld] 120 64 -340 | chest "Ores" | 64 Diamond (minecraft:diamond); ..." or null if there's nothing to say. */
-	private static String describeBlockEntity(RegistryOps<Tag> ops, String dimension, CompoundTag tag) {
-		String type = shortId(tag.getStringOr("id", "?"));
+	/** A container block (or any block entity holding items or a name); null if there's nothing worth listing. */
+	private static Holder describeBlockEntity(RegistryOps<Tag> ops, String dimension, CompoundTag tag, boolean live) {
 		String name = customName(ops, tag);
 		String loot = tag.getStringOr("LootTable", "");
-		List<String> items = new ArrayList<>();
-		collectItems(ops, tag.getListOrEmpty("Items"), items);
+		List<Item> items = items(ops, tag.getListOrEmpty("Items"));
 		for (String single : List.of("item", "Book", "RecordItem")) {
-			tag.getCompound(single).ifPresent(item -> addIfPresent(items, describeItem(ops, item, 0)));
+			tag.getCompound(single).flatMap(item -> item(ops, item, 0)).ifPresent(items::add);
 		}
 		if (items.isEmpty() && loot.isEmpty() && name == null) {
 			return null;
 		}
-		String contents = !loot.isEmpty() ? "unopened, will fill from loot table " + loot : String.join("; ", merge(items));
-		return "[" + dimension + "] " + tag.getIntOr("x", 0) + " " + tag.getIntOr("y", 0) + " " + tag.getIntOr("z", 0)
-			+ " | " + type + (name != null ? " \"" + name + "\"" : "") + " | " + (contents.isEmpty() ? "empty" : contents);
+		return new Holder("block", dimension, tag.getIntOr("x", 0), tag.getIntOr("y", 0), tag.getIntOr("z", 0),
+			shortId(tag.getStringOr("id", "?")), name, loot.isEmpty() ? null : loot, false, items, live);
 	}
 
-	/** Entities worth finding: ones holding items (minecarts, item frames, armor stands, dropped items) or named or tamed ones. */
-	private static String describeEntity(RegistryOps<Tag> ops, String dimension, String typeId, CompoundTag tag) {
+	/** Entities worth finding: ones holding items (minecarts, item frames, armor stands, dropped items) or named or tamed. */
+	private static Holder describeEntity(RegistryOps<Tag> ops, String dimension, String typeId, CompoundTag tag, boolean live) {
 		String type = shortId(typeId);
 		String name = customName(ops, tag);
 		boolean tamed = tag.contains("Owner");
-		List<String> items = new ArrayList<>();
-		collectItems(ops, tag.getListOrEmpty("Items"), items);
-		tag.getCompound("Item").ifPresent(item -> addIfPresent(items, describeItem(ops, item, 0)));
+		List<Item> items = items(ops, tag.getListOrEmpty("Items"));
+		tag.getCompound("Item").flatMap(item -> item(ops, item, 0)).ifPresent(items::add);
 		if (type.equals("armor_stand")) {
 			tag.getCompound("equipment").ifPresent(equipment -> {
 				for (String slot : equipment.keySet()) {
-					equipment.getCompound(slot).ifPresent(item -> addIfPresent(items, describeItem(ops, item, 0)));
+					equipment.getCompound(slot).flatMap(item -> item(ops, item, 0)).ifPresent(items::add);
 				}
 			});
 		}
@@ -393,95 +410,56 @@ public class WorldIndex {
 			return null;
 		}
 		ListTag pos = tag.getListOrEmpty("Pos");
-		String where = pos.size() == 3
-			? (int) Math.floor(pos.getDoubleOr(0, 0)) + " " + (int) Math.floor(pos.getDoubleOr(1, 0)) + " " + (int) Math.floor(pos.getDoubleOr(2, 0))
-			: "? ? ?";
-		String contents = !loot.isEmpty() ? "unopened, will fill from loot table " + loot : String.join("; ", merge(items));
-		return "[" + dimension + "] " + where + " | entity " + type + (name != null ? " \"" + name + "\"" : "") + (tamed ? " (tamed)" : "")
-			+ (contents.isEmpty() ? "" : " | " + contents);
+		int x = pos.size() == 3 ? (int) Math.floor(pos.getDoubleOr(0, 0)) : 0;
+		int y = pos.size() == 3 ? (int) Math.floor(pos.getDoubleOr(1, 0)) : 0;
+		int z = pos.size() == 3 ? (int) Math.floor(pos.getDoubleOr(2, 0)) : 0;
+		return new Holder("entity", dimension, x, y, z, type, name, loot.isEmpty() ? null : loot, tamed, items, live);
 	}
 
-	private static String describeItems(RegistryOps<Tag> ops, ListTag list) {
-		List<String> items = new ArrayList<>();
-		collectItems(ops, list, items);
-		return items.isEmpty() ? "empty" : String.join("; ", merge(items));
-	}
-
-	private static void collectItems(RegistryOps<Tag> ops, ListTag list, List<String> into) {
-		for (CompoundTag item : compounds(list)) {
-			addIfPresent(into, describeItem(ops, item, 0));
+	private static List<Item> items(RegistryOps<Tag> ops, ListTag list) {
+		List<Item> items = new ArrayList<>();
+		for (CompoundTag tag : compounds(list)) {
+			item(ops, tag, 0).ifPresent(items::add);
 		}
+		return items;
 	}
 
-	/** "64 Diamond (minecraft:diamond)", plus custom names, enchantments and what's inside shulker boxes and bundles. */
-	private static String describeItem(RegistryOps<Tag> ops, CompoundTag tag, int depth) {
+	private static Optional<Item> item(RegistryOps<Tag> ops, CompoundTag tag, int depth) {
 		Optional<ItemStack> parsed = ItemStack.CODEC.parse(ops, tag).result();
-		if (parsed.isEmpty()) {
-			String id = tag.getStringOr("id", "");
-			return id.isEmpty() ? null : tag.getIntOr("count", 1) + " " + id;
+		if (parsed.isPresent()) {
+			return Optional.ofNullable(item(parsed.get(), depth));
 		}
-		return describeStack(parsed.get(), depth);
+		String id = tag.getStringOr("id", "");
+		return id.isEmpty() ? Optional.empty() : Optional.of(new Item(id, id, tag.getIntOr("count", 1), List.of(), List.of()));
 	}
 
-	private static String describeStack(ItemStack stack, int depth) {
+	/** Name, count, enchantments, and (two levels deep) what's inside shulker boxes and bundles. */
+	private static Item item(ItemStack stack, int depth) {
 		if (stack.isEmpty()) {
 			return null;
 		}
-		StringBuilder sb = new StringBuilder();
-		sb.append(stack.getCount()).append(' ').append(stack.getHoverName().getString())
-			.append(" (").append(stack.typeHolder().getRegisteredName()).append(')');
-
 		List<String> enchantments = new ArrayList<>();
 		for (ItemEnchantments enchants : new ItemEnchantments[] {stack.get(DataComponents.ENCHANTMENTS), stack.get(DataComponents.STORED_ENCHANTMENTS)}) {
 			if (enchants != null) {
 				for (var entry : enchants.entrySet()) {
-					Holder<Enchantment> enchantment = entry.getKey();
-					enchantments.add(Enchantment.getFullname(enchantment, entry.getIntValue()).getString());
+					enchantments.add(Enchantment.getFullname(entry.getKey(), entry.getIntValue()).getString());
 				}
 			}
 		}
-		if (!enchantments.isEmpty()) {
-			sb.append(" {").append(String.join(", ", enchantments)).append('}');
-		}
-
+		List<Item> contents = new ArrayList<>();
 		if (depth < MAX_NESTING) {
-			List<String> inside = new ArrayList<>();
 			ItemContainerContents container = stack.get(DataComponents.CONTAINER);
 			if (container != null) {
-				container.nonEmptyItemCopyStream().forEach(item -> addIfPresent(inside, describeStack(item, depth + 1)));
+				container.nonEmptyItemCopyStream().forEach(inner -> addIfPresent(contents, item(inner, depth + 1)));
 			}
 			BundleContents bundle = stack.get(DataComponents.BUNDLE_CONTENTS);
 			if (bundle != null) {
-				for (ItemStackTemplate item : bundle.items()) {
-					addIfPresent(inside, describeStack(item.create(), depth + 1));
+				for (ItemStackTemplate inner : bundle.items()) {
+					addIfPresent(contents, item(inner.create(), depth + 1));
 				}
 			}
-			if (!inside.isEmpty()) {
-				sb.append(" [contains: ").append(String.join("; ", merge(inside))).append(']');
-			}
 		}
-		return sb.toString();
-	}
-
-	/** Combine identical entries: two stacks of "32 Diamond (minecraft:diamond)" become "64 Diamond (...)". */
-	private static List<String> merge(List<String> items) {
-		Map<String, Integer> counts = new LinkedHashMap<>();
-		for (String item : items) {
-			int space = item.indexOf(' ');
-			int count = 1;
-			String rest = item;
-			if (space > 0) {
-				try {
-					count = Integer.parseInt(item.substring(0, space));
-					rest = item.substring(space + 1);
-				} catch (NumberFormatException ignored) {
-				}
-			}
-			counts.merge(rest, count, Integer::sum);
-		}
-		List<String> out = new ArrayList<>();
-		counts.forEach((item, count) -> out.add(count + " " + item));
-		return out;
+		return new Item(stack.typeHolder().getRegisteredName(), stack.getHoverName().getString(), stack.getCount(), enchantments, contents);
 	}
 
 	private static String customName(RegistryOps<Tag> ops, CompoundTag tag) {
@@ -496,7 +474,7 @@ public class WorldIndex {
 		return list.compoundStream().toList();
 	}
 
-	private static String dimensionName(ResourceKey<Level> dimension) {
+	public static String dimensionName(ResourceKey<Level> dimension) {
 		return dimension.identifier().getNamespace().equals("minecraft") ? dimension.identifier().getPath() : dimension.identifier().toString();
 	}
 
@@ -504,31 +482,9 @@ public class WorldIndex {
 		return id.startsWith("minecraft:") ? id.substring("minecraft:".length()) : id;
 	}
 
-	private static void addIfPresent(List<String> list, String value) {
+	private static <T> void addIfPresent(List<T> list, T value) {
 		if (value != null) {
 			list.add(value);
 		}
-	}
-
-	// --- output ---------------------------------------------------------------------------------------------------
-
-	private void write(MinecraftServer server, Live live) throws IOException {
-		List<String> lines = new ArrayList<>();
-		lines.add("# What's stored where in the world \"" + server.getWorldData().getLevelName() + "\", written "
-			+ LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + ".");
-		lines.add("# One line per container, entity or inventory: [dimension] x y z | what | contents.");
-		lines.add("# Chunks near the player are live; the rest is from the last save (up to ~5 minutes old).");
-		lines.addAll(live.players());
-		Map<ChunkKey, List<String>> saved = new HashMap<>(savedLines);
-		saved.forEach((key, chunkLines) -> {
-			if (!live.loaded().contains(key)) {
-				lines.addAll(chunkLines);
-			}
-		});
-		lines.addAll(live.lines());
-		Files.createDirectories(indexFile.getParent());
-		Path tmp = indexFile.resolveSibling("index.txt.tmp");
-		Files.write(tmp, lines, StandardCharsets.UTF_8);
-		Files.move(tmp, indexFile, java.nio.file.StandardCopyOption.REPLACE_EXISTING, java.nio.file.StandardCopyOption.ATOMIC_MOVE);
 	}
 }

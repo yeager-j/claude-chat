@@ -48,6 +48,8 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static KnowledgeBase knowledge;
 	private static ChatFormatter formatter;
 	private static WorldIndex worldIndex;
+	private static McpServer mcp;
+	private static WorldTools worldTools;
 	private static final StatusLine status = new StatusLine();
 
 	/** For the client game test: is a question still being answered? */
@@ -65,12 +67,19 @@ public class ClaudeChatClient implements ClientModInitializer {
 		return knowledge;
 	}
 
+	/** For the client game test: call the world tools directly, without Claude. */
+	public static WorldTools worldTools() {
+		return worldTools;
+	}
+
 	@Override
 	public void onInitializeClient() {
 		config = ClaudeConfig.load();
 		knowledge = new KnowledgeBase(config);
-		worldIndex = new WorldIndex(knowledge);
-		cli = new ClaudeCli(config, knowledge, worldIndex);
+		worldIndex = new WorldIndex();
+		worldTools = new WorldTools(worldIndex);
+		mcp = new McpServer(worldTools);
+		cli = new ClaudeCli(config, knowledge, mcp);
 		formatter = new ChatFormatter(new RecipeRenderer(knowledge));
 
 		// Start decompiling right away so it's usually done by the time a world has loaded.
@@ -185,10 +194,14 @@ public class ClaudeChatClient implements ClientModInitializer {
 		// (On a multiplayer server its data packs live on the server and can't be read.)
 		ServerLifecycleEvents.SERVER_STARTED.register(ClaudeChatClient::updateWorldPacks);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resources, success) -> updateWorldPacks(server));
-		// ...and index what's stored where, so Claude can answer "where did I put my diamonds?".
-		ServerLifecycleEvents.SERVER_STARTED.register(worldIndex::start);
+		// ...and serve the world tools (containers, entities, player, structures) to Claude over MCP.
+		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+			worldIndex.start(server);
+			mcp.start();
+		});
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
 			knowledge.clearWorldPacks();
+			mcp.stop();
 			worldIndex.stop();
 		});
 	}

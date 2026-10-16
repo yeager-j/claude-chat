@@ -63,6 +63,19 @@ public class ClaudeCli {
 		- Commands go in backticks and become click-to-insert, e.g. `/gamerule keepInventory true`.
 		""";
 
+	private static final String WORLD_TOOLS_PROMPT = """
+
+		The player's own world (single-player) is available through the mcp__minecraft__* tools: search_containers
+		("where are my diamonds?", "which chest has..."), search_entities (pets, named mobs, item frames, dropped items),
+		get_player (inventory, ender chest, position) and find_structures (nearest structures, optionally only ones the
+		player hasn't visited yet). They return exact distances and compass directions; report those instead of working
+		them out yourself. Show coordinates as `x y z` (or `x ~ z` for structures).
+		""";
+	private static final String NO_WORLD_TOOLS_PROMPT = """
+
+		The player is on a multiplayer server, so their world's contents and structure locations aren't available.
+		""";
+
 	private final ClaudeConfig config;
 	private final KnowledgeBase knowledge;
 	private final ExecutorService executor = Executors.newSingleThreadExecutor(runnable -> {
@@ -72,12 +85,12 @@ public class ClaudeCli {
 	});
 	private volatile String sessionId;
 
-	private final WorldIndex worldIndex;
+	private final McpServer worldTools;
 
-	public ClaudeCli(ClaudeConfig config, KnowledgeBase knowledge, WorldIndex worldIndex) {
+	public ClaudeCli(ClaudeConfig config, KnowledgeBase knowledge, McpServer worldTools) {
 		this.config = config;
 		this.knowledge = knowledge;
-		this.worldIndex = worldIndex;
+		this.worldTools = worldTools;
 	}
 
 	public void resetSession() {
@@ -95,14 +108,6 @@ public class ClaudeCli {
 				for (KnowledgeBase.Source mod : knowledge.mentionedWithoutCode(mentionText)) {
 					onProgress.accept("Decompiling " + mod.label());
 					knowledge.buildCodeNow(mod, message -> { });
-				}
-				// Usually well under a second: only chunks saved since last time are re-read.
-				if (worldIndex.isActive()) {
-					try {
-						worldIndex.refresh();
-					} catch (Exception e) {
-						ClaudeChatClient.LOGGER.warn("Could not update the world index", e);
-					}
 				}
 				return run(question, gameContext, onProgress);
 			} catch (IOException e) {
@@ -165,6 +170,7 @@ public class ClaudeCli {
 		Path promptFile = ClaudeConfig.dir().resolve("system-prompt.txt");
 		String systemPrompt = SYSTEM_PROMPT
 			+ "\nCurrent game state:\n" + gameContext
+			+ (worldTools.isRunning() ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
 			+ "\n" + knowledge.describeForPrompt()
 			+ (config.extraInstructions.isEmpty() ? "" : "\n" + config.extraInstructions + "\n");
 		Files.writeString(promptFile, systemPrompt, StandardCharsets.UTF_8);
@@ -185,11 +191,18 @@ public class ClaudeCli {
 
 	private JsonObject invoke(String exe, Path workDir, Path promptFile, String question, String resume,
 		Consumer<String> onProgress) throws IOException, InterruptedException {
+		// Only this mod's MCP server (none on multiplayer): --strict-mcp-config also keeps the player's other MCP servers,
+		// configured for Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON.
+		Path mcpConfig = ClaudeConfig.dir().resolve("mcp.json");
+		Files.writeString(mcpConfig, worldTools.claudeConfig(), StandardCharsets.UTF_8);
+		String allowed = worldTools.isRunning() ? TOOLS + ",mcp__minecraft" : TOOLS;
 		List<String> command = new ArrayList<>(List.of(exe, "-p",
 			"--output-format", "stream-json", "--verbose",
 			"--model", config.model,
 			"--tools", TOOLS,
-			"--allowedTools", TOOLS,
+			"--allowedTools", allowed,
+			"--mcp-config", mcpConfig.toString(),
+			"--strict-mcp-config",
 			"--append-system-prompt-file", promptFile.toString()));
 		if (!config.effort.isEmpty()) {
 			command.add("--effort");

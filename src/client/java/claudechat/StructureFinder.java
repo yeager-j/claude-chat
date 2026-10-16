@@ -1,0 +1,204 @@
+package claudechat;
+
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Holder;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.RegistryAccess;
+import net.minecraft.core.SectionPos;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.tags.TagKey;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.StructureManager;
+import net.minecraft.world.level.chunk.ChunkAccess;
+import net.minecraft.world.level.chunk.ChunkGeneratorStructureState;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.levelgen.structure.Structure;
+import net.minecraft.world.level.levelgen.structure.StructureCheckResult;
+import net.minecraft.world.level.levelgen.structure.StructureStart;
+import net.minecraft.world.level.levelgen.structure.placement.ConcentricRingsStructurePlacement;
+import net.minecraft.world.level.levelgen.structure.placement.RandomSpreadStructurePlacement;
+import net.minecraft.world.level.levelgen.structure.placement.StructurePlacement;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Predicate;
+
+/**
+ * Finds many structures, not just the nearest one like /locate. Uses the same search as /locate: walk the structure's
+ * placement grid outward in rings and ask the game (from the seed and biomes, without generating anything) whether the
+ * structure starts in each candidate chunk. Each hit gets its distance and how long players have spent nearby, so
+ * callers can skip structures the player has already visited.
+ */
+public final class StructureFinder {
+	/** A structure start. {@code inhabitedTicks} is -1 if its chunk has never been generated. */
+	public record Found(String structure, int x, int z, double distance, long inhabitedTicks) {
+		public boolean generated() {
+			return inhabitedTicks >= 0;
+		}
+	}
+
+	/** How long players must have been within 128 blocks for a structure to count as visited. */
+	public static final long VISITED_TICKS = 20 * 60;
+	private static final int MAX_CHECKS = 60_000;
+
+	private StructureFinder() {
+	}
+
+	/**
+	 * Structures matching a query: an id ("minecraft:village_plains"), a tag ("#minecraft:village"), or a plain word
+	 * matched against tags and then ids ("village" → the village tag; "ruined" → every ruined_portal variant).
+	 */
+	public static List<Holder<Structure>> resolve(RegistryAccess access, String query) {
+		HolderLookup.RegistryLookup<Structure> registry = access.lookupOrThrow(Registries.STRUCTURE);
+		String q = query.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
+		if (q.startsWith("#")) {
+			Identifier id = Identifier.tryParse(q.substring(1));
+			return id == null ? List.of() : registry.get(TagKey.create(Registries.STRUCTURE, id))
+				.map(set -> set.stream().toList()).orElse(List.of());
+		}
+		if (q.contains(":")) {
+			Identifier id = Identifier.tryParse(q);
+			if (id != null) {
+				var exact = registry.get(ResourceKey.create(Registries.STRUCTURE, id));
+				if (exact.isPresent()) {
+					return List.of(exact.get());
+				}
+				var tag = registry.get(TagKey.create(Registries.STRUCTURE, id));
+				if (tag.isPresent()) {
+					return tag.get().stream().toList();
+				}
+			}
+			return List.of();
+		}
+		var tag = registry.get(TagKey.create(Registries.STRUCTURE, Identifier.withDefaultNamespace(q)));
+		if (tag.isPresent() && tag.get().size() > 0) {
+			return tag.get().stream().toList();
+		}
+		var exact = registry.get(ResourceKey.create(Registries.STRUCTURE, Identifier.withDefaultNamespace(q)));
+		if (exact.isPresent()) {
+			return List.of(exact.get());
+		}
+		List<Holder<Structure>> matches = new ArrayList<>();
+		registry.listElements().filter(h -> h.key().identifier().getPath().contains(q)).forEach(matches::add);
+		return matches;
+	}
+
+	/**
+	 * Server thread. Searches outward from {@code origin} until {@code limit} structures pass {@code filter} (nearest
+	 * first) or {@code maxDistance} blocks is covered. {@code inhabited} gives a chunk's InhabitedTime, or -1.
+	 */
+	public static List<Found> find(ServerLevel level, List<Holder<Structure>> structures, BlockPos origin, int maxDistance,
+		int limit, Predicate<Found> filter, ChunkInhabitedTime inhabited) {
+		ChunkGeneratorStructureState generatorState = level.getChunkSource().getGeneratorState();
+		StructureManager structureManager = level.structureManager();
+		Map<StructurePlacement, List<Holder<Structure>>> byPlacement = new LinkedHashMap<>();
+		for (Holder<Structure> structure : structures) {
+			for (StructurePlacement placement : generatorState.getPlacementsForStructure(structure)) {
+				byPlacement.computeIfAbsent(placement, p -> new ArrayList<>()).add(structure);
+			}
+		}
+
+		List<Found> results = new ArrayList<>();
+		Set<String> seen = new HashSet<>();
+		int[] checks = {0};
+
+		for (var entry : byPlacement.entrySet()) {
+			if (entry.getKey() instanceof ConcentricRingsStructurePlacement rings) {
+				List<ChunkPos> positions = generatorState.getRingPositionsFor(rings);
+				if (positions != null) {
+					for (ChunkPos chunk : positions) {
+						check(level, structureManager, rings, entry.getValue(), chunk, origin, maxDistance, inhabited, filter, results, seen, checks);
+					}
+				}
+			}
+		}
+
+		List<Map.Entry<StructurePlacement, List<Holder<Structure>>>> spread = byPlacement.entrySet().stream()
+			.filter(e -> e.getKey() instanceof RandomSpreadStructurePlacement).toList();
+		if (!spread.isEmpty()) {
+			int originX = SectionPos.blockToSectionCoord(origin.getX());
+			int originZ = SectionPos.blockToSectionCoord(origin.getZ());
+			int minSpacing = spread.stream().mapToInt(e -> ((RandomSpreadStructurePlacement) e.getKey()).spacing()).min().orElse(1);
+			int maxRadius = Math.min(200, maxDistance / (minSpacing * 16) + 2);
+			long seed = generatorState.getLevelSeed();
+
+			for (int radius = 0; radius <= maxRadius && checks[0] < MAX_CHECKS; radius++) {
+				for (var entry : spread) {
+					RandomSpreadStructurePlacement placement = (RandomSpreadStructurePlacement) entry.getKey();
+					int spacing = placement.spacing();
+					if ((long) (radius - 1) * spacing * 16 > maxDistance) {
+						continue;
+					}
+					for (int dx = -radius; dx <= radius; dx++) {
+						for (int dz = -radius; dz <= radius; dz++) {
+							if (Math.abs(dx) != radius && Math.abs(dz) != radius) {
+								continue;
+							}
+							ChunkPos chunk = placement.getPotentialStructureChunk(seed, originX + spacing * dx, originZ + spacing * dz);
+							check(level, structureManager, placement, entry.getValue(), chunk, origin, maxDistance, inhabited, filter, results, seen, checks);
+						}
+					}
+				}
+				// Rings are ordered by distance, so once enough results are closer than anything the next ring
+				// could hold, stop.
+				if (results.size() >= limit) {
+					results.sort(Comparator.comparingDouble(Found::distance));
+					double nextRingMin = (double) radius * minSpacing * 16;
+					if (results.get(limit - 1).distance() < nextRingMin) {
+						break;
+					}
+				}
+			}
+		}
+
+		results.sort(Comparator.comparingDouble(Found::distance));
+		return results.size() > limit ? List.copyOf(results.subList(0, limit)) : results;
+	}
+
+	@FunctionalInterface
+	public interface ChunkInhabitedTime {
+		long ticks(int chunkX, int chunkZ);
+	}
+
+	private static void check(ServerLevel level, StructureManager structureManager, StructurePlacement placement,
+		List<Holder<Structure>> structures, ChunkPos chunk, BlockPos origin, int maxDistance, ChunkInhabitedTime inhabited,
+		Predicate<Found> filter, List<Found> results, Set<String> seen, int[] checks) {
+		for (Holder<Structure> structure : structures) {
+			String id = structure.unwrapKey().map(k -> k.identifier().toString()).orElse("?");
+			if (!seen.add(id + "@" + chunk.x() + "," + chunk.z()) || checks[0]++ >= MAX_CHECKS) {
+				continue;
+			}
+			BlockPos pos = placement.getLocatePos(chunk);
+			double distance = Math.sqrt(Math.pow(pos.getX() - origin.getX(), 2) + Math.pow(pos.getZ() - origin.getZ(), 2));
+			if (distance > maxDistance) {
+				continue;
+			}
+			// Same check /locate uses: decided from the seed and biomes without generating the chunk; only when the
+			// game can't tell does it load the chunk's structure starts (also what /locate does).
+			StructureCheckResult result = structureManager.checkStructurePresence(chunk, structure.value(), placement, false);
+			if (result == StructureCheckResult.START_NOT_PRESENT) {
+				continue;
+			}
+			if (result == StructureCheckResult.CHUNK_LOAD_NEEDED) {
+				ChunkAccess access = level.getChunk(chunk.x(), chunk.z(), ChunkStatus.STRUCTURE_STARTS);
+				StructureStart start = structureManager.getStartForStructure(structure.value(), access);
+				if (start == null || !start.isValid()) {
+					continue;
+				}
+			}
+			Found found = new Found(id, pos.getX(), pos.getZ(), distance, inhabited.ticks(chunk.x(), chunk.z()));
+			if (filter.test(found)) {
+				results.add(found);
+			}
+		}
+	}
+}

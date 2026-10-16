@@ -2,6 +2,9 @@ package claudechat.test;
 
 import claudechat.ClaudeChatClient;
 import claudechat.KnowledgeBase;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
 import net.minecraft.SharedConstants;
 import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.metadata.pack.PackFormat;
@@ -14,6 +17,7 @@ import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.concurrent.CompletableFuture;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import com.mojang.blaze3d.platform.InputConstants;
@@ -37,7 +41,17 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		// Recipe grids read the decompiled data, so wait for the first knowledge base build.
 		context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 600 * SECONDS);
 
-		try (TestSingleplayerContext singleplayer = context.worldBuilder().create()) {
+		boolean worldTest = "1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"));
+		var builder = context.worldBuilder();
+		if (worldTest) {
+			// The default test world is superflat with structures off; structure finding needs a normal world.
+			builder.adjustSettings(settings -> {
+				settings.setWorldType(settings.getNormalPresetList().getFirst());
+				settings.setGenerateStructures(true);
+				settings.setSeed("claudechat");
+			});
+		}
+		try (TestSingleplayerContext singleplayer = builder.create()) {
 			singleplayer.getConnection().waitForChunksRender();
 
 			// 1. The formatting preview, through the real command.
@@ -86,7 +100,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			}
 
 			// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).
-			if ("1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"))) {
+			if (worldTest) {
 				var server = singleplayer.getServer();
 				server.runCommand("execute at @p run setblock ~3 ~ ~ minecraft:chest{CustomName:\"Loot\",Items:[{Slot:0b,id:\"minecraft:diamond\",count:64},{Slot:1b,id:\"minecraft:iron_ingot\",count:12}]}");
 				server.runCommand("execute at @p run setblock ~-3 ~ ~ minecraft:barrel{Items:[{Slot:4b,id:\"minecraft:shulker_box\",count:1,components:{\"minecraft:container\":[{slot:0,item:{id:\"minecraft:emerald\",count:32}}]}}]}");
@@ -102,7 +116,28 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				server.runOnServer(s -> s.saveEverything(true, true, true));
 				context.waitTicks(40);
 
-				chat(context, "@claude where's the chest with a stack of diamonds, where did I put my netherite, and what's in my ender chest?");
+				// The world tools, called directly (what Claude gets over MCP), logged for checking.
+				logTool(context, "search_containers", "{\"query\": \"minecraft:diamond\"}");
+				logTool(context, "search_containers", "{\"query\": \"netherite\"}");
+				logTool(context, "search_containers", "{\"query\": \"emerald\"}");
+				logTool(context, "search_entities", "{\"query\": \"rex\"}");
+				logTool(context, "get_player", "{}");
+				JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
+
+				// Visit the nearest village for over a minute, come back, and check the visited filter flips.
+				var nearest = villages.getAsJsonArray("results").get(0).getAsJsonObject();
+				var home = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().position());
+				server.runCommand("spreadplayers " + nearest.get("x").getAsInt() + " " + nearest.get("z").getAsInt() + " 0 1 false @p");
+				// InhabitedTime only advances on ticks the chunk runs mob spawning, so give it margin over the 1-minute threshold.
+				context.waitTicks(100 * SECONDS);
+				server.runCommand("tp @p " + home.x() + " " + home.y() + " " + home.z());
+				context.waitTicks(5 * SECONDS);
+				server.runOnServer(s -> s.saveEverything(true, true, true));
+				context.waitTicks(40);
+				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
+				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
+
+				chat(context, "@claude where's the nearest village I haven't explored yet? and where did I put my netherite?");
 				context.waitTicks(5);
 				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
 				context.waitTicks(10);
@@ -153,6 +188,21 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				context.getInput().pressKey(KEY_ESCAPE);
 			}
 		}
+	}
+
+	/** Runs a world tool off the test thread (it waits on the server thread, which the test thread drives) and logs it. */
+	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {
+		CompletableFuture<JsonElement> result = CompletableFuture.supplyAsync(() -> {
+			try {
+				return ClaudeChatClient.worldTools().call(name, JsonParser.parseString(args).getAsJsonObject());
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+		});
+		context.waitFor(mc -> result.isDone(), 120 * SECONDS);
+		JsonElement json = result.join();
+		LOGGER.info("tool {} {} -> {}", name, args, json);
+		return json.isJsonObject() ? json.getAsJsonObject() : new JsonObject();
 	}
 
 	private static void writeTestPacks(Path datapacks) {
