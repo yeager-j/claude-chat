@@ -166,6 +166,12 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				});
 				LOGGER.info("fortress bounds: tool {}, generated {}", fortress.get("bounds").getAsString(), actualBounds);
 				check(fortress.get("bounds").getAsString().equals(actualBounds), "fortress bounds differ from generation");
+				JsonObject mostlyWarped = logTool(context, "find_structures",
+					"{\"structure\": \"fortress\", \"biome\": \"warped_forest\", \"min_biome_share\": 75, \"limit\": 5}");
+				for (JsonElement result : mostlyWarped.getAsJsonArray("results")) {
+					String share = result.getAsJsonObject().get("share_in_requested_biome").getAsString();
+					check(Integer.parseInt(share.replace("%", "")) >= 75, "min_biome_share let through " + result);
+				}
 				JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
 
 				// Visit the nearest village for over a minute, come back, and check the visited filter flips.

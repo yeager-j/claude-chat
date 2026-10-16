@@ -85,6 +85,7 @@ public final class WorldTools {
 			{"type": "object", "properties": {
 			  "structure": {"type": "string", "description": "Structure id (\\"minecraft:village_plains\\"), tag (\\"#minecraft:village\\"), or a word matched against tags and ids (\\"village\\", \\"ruined_portal\\")."},
 			  "biome": {"type": "string", "description": "Only structures with a piece in this biome: id (\\"minecraft:warped_forest\\"), tag (\\"#minecraft:is_ocean\\"), or a word (\\"warped\\")."},
+			  "min_biome_share": {"type": "integer", "description": "With biome: only structures at least this percent in it (0-100), e.g. 75 for \\"mostly in a warped forest\\". Shares of several matching biomes (a tag) add up. Default: any piece."},
 			  "dimension": {"type": "string", "description": "Default: the player's dimension, or where the structure generates if not there (a fortress asked about from the Overworld is searched in the Nether, around the player's position / 8)."},
 			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Default: any."},
 			  "min_distance": {"type": "integer"},
@@ -290,6 +291,10 @@ public final class WorldTools {
 				throw new IllegalArgumentException("No biome or biome tag matches \"" + biomeQuery + "\". Biome ids are under data/<namespace>/worldgen/biome.");
 			}
 		}
+		int minShare = Math.max(0, Math.min(100, integer(args, "min_biome_share", 0)));
+		if (minShare > 0 && biomes.isEmpty()) {
+			throw new IllegalArgumentException("min_biome_share needs a biome.");
+		}
 		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
 		String requestedDimension = string(args, "dimension", "");
 
@@ -316,7 +321,7 @@ public final class WorldTools {
 				case "unvisited" -> f.inhabitedTicks() < StructureFinder.VISITED_TICKS;
 				case "visited" -> f.inhabitedTicks() >= StructureFinder.VISITED_TICKS;
 				default -> true;
-			} && (biomes.isEmpty() || inBiome(footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, k)), biomes));
+			} && (biomes.isEmpty() || inBiome(footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, k)), biomes, minShare));
 			List<StructureFinder.Found> results = StructureFinder.find(level, structures, BlockPos.containing(origin.x(), origin.y(), origin.z()),
 				maxDistance, limit, filter, (cx, cz) -> snapshot.inhabited(dimension, cx, cz));
 			for (StructureFinder.Found f : results) {
@@ -355,6 +360,9 @@ public final class WorldTools {
 					.sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
 					.forEach(e -> shares.addProperty(e.getKey(), Math.max(1, Math.round(100f * e.getValue() / footprint.totalSamples())) + "%"));
 				r.add("biomes", shares);
+				if (!biomes.isEmpty()) {
+					r.addProperty("share_in_requested_biome", Math.round(biomeShare(footprint, biomes)) + "%");
+				}
 			}
 			results.add(r);
 		}
@@ -394,8 +402,20 @@ public final class WorldTools {
 		return otherWhereItGenerates != null ? otherWhereItGenerates : playerLevel;
 	}
 
-	private static boolean inBiome(StructureFinder.Footprint footprint, Set<String> biomes) {
-		return footprint != null && footprint.biomeSamples().keySet().stream().anyMatch(biomes::contains);
+	/** Any piece in one of the biomes, and at least {@code minShare} percent of the sampled cells in them combined. */
+	private static boolean inBiome(StructureFinder.Footprint footprint, Set<String> biomes, int minShare) {
+		double share = biomeShare(footprint, biomes);
+		return share > 0 && share >= minShare;
+	}
+
+	/** Percent of the structure's sampled cells in any of these biomes. */
+	private static double biomeShare(StructureFinder.Footprint footprint, Set<String> biomes) {
+		if (footprint == null || footprint.totalSamples() == 0) {
+			return 0;
+		}
+		int matching = footprint.biomeSamples().entrySet().stream()
+			.filter(e -> biomes.contains(e.getKey())).mapToInt(Map.Entry::getValue).sum();
+		return 100.0 * matching / footprint.totalSamples();
 	}
 
 	// --- blocks ---------------------------------------------------------------------------------------------------
