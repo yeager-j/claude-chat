@@ -76,6 +76,9 @@ public class ClaudeCli {
 		Structure template files (data/*/structure/*.nbt) are gzipped NBT, so Read can't open them. To identify a
 		structure the player describes by its blocks or shape, use search_structure_templates with those blocks; use
 		inspect_structure_template for one template's blocks, chests, spawners and layer-by-layer shape.
+		The player's schematics (Litematica .litematic, WorldEdit .schem) are also gzipped NBT: use list_schematics and
+		inspect_schematic. For "how much X do I need", use its materials, crafting and base_materials rather than
+		working out recipes yourself; to check a chest of supplies against a schematic, pass compare_with.
 		""";
 	private static final String NO_WORLD_TOOLS_PROMPT = """
 

@@ -2,6 +2,11 @@ package claudechat.test;
 
 import claudechat.ClaudeChatClient;
 import claudechat.KnowledgeBase;
+import claudechat.Schematics;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import java.util.ArrayList;
+import java.util.List;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
@@ -140,6 +145,59 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					context.waitTicks(10);
 					openChat(context);
 					context.takeScreenshot("claudechat-template-answer");
+					context.getInput().pressKey(KEY_ESCAPE);
+				}
+			}
+
+			// 4c. Optionally, schematics: copies the files in CLAUDECHAT_SCHEMATIC_TEST (a folder) into the test's schematics
+			// folder, reads their material lists, and checks a chest holding all but one redstone dust against the first.
+			String schematicSource = System.getenv("CLAUDECHAT_SCHEMATIC_TEST");
+			if (schematicSource != null && !schematicSource.isBlank()) {
+				copySchematics(Path.of(schematicSource), Schematics.directory());
+				JsonObject list = logTool(context, "list_schematics", "{}");
+				var files = list.getAsJsonArray("schematics");
+				check(!files.isEmpty(), "no schematics listed");
+				String file = files.get(0).getAsJsonObject().get("file").getAsString();
+				JsonObject schematic = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"layers\": true}");
+				JsonObject materials = schematic.getAsJsonObject("materials");
+				check(!materials.isEmpty(), "schematic has no materials");
+
+				// A chest (or two) named "Witch Farm" with every material except one redstone dust, or one of the first item.
+				String shortItem = materials.has("minecraft:redstone") ? "minecraft:redstone" : materials.keySet().iterator().next();
+				List<String> stacks = new ArrayList<>();
+				for (var entry : materials.entrySet()) {
+					int count = entry.getValue().getAsInt() - (entry.getKey().equals(shortItem) ? 1 : 0);
+					int max = BuiltInRegistries.ITEM.getValue(Identifier.parse(entry.getKey())).getDefaultMaxStackSize();
+					for (; count > 0; count -= max) {
+						stacks.add("{id:\"" + entry.getKey() + "\",count:" + Math.min(max, count) + "}");
+					}
+				}
+				var pos = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition());
+				for (int chest = 0; chest * 27 < stacks.size(); chest++) {
+					StringBuilder items = new StringBuilder();
+					for (int slot = 0; slot < 27 && chest * 27 + slot < stacks.size(); slot++) {
+						String stack = stacks.get(chest * 27 + slot);
+						items.append(slot == 0 ? "" : ",").append(stack, 0, stack.length() - 1).append(",Slot:").append(slot).append("b}");
+					}
+					singleplayer.getServer().runCommand("setblock " + (pos.getX() + 2 + chest * 2) + " " + pos.getY() + " " + (pos.getZ() + 2)
+						+ " minecraft:chest{CustomName:\"Witch Farm\",Items:[" + items + "]}");
+				}
+				context.waitTicks(10);
+				JsonObject compared = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"compare_with\": \"witch farm\"}")
+					.getAsJsonObject("comparison");
+				var stillMissing = compared.getAsJsonObject("still_missing_after_crafting_from_contents");
+				check(stillMissing.size() == 1 && stillMissing.has(shortItem) && stillMissing.get(shortItem).getAsInt() == 1,
+					"comparison should miss exactly one " + shortItem + ": " + compared);
+				check(compared.getAsJsonObject("useful_contents").has(shortItem), "comparison doesn't show what the chests hold");
+
+				String question = System.getenv("CLAUDECHAT_SCHEMATIC_QUESTION");
+				if (question != null && !question.isBlank()) {
+					chat(context, "@claude " + question);
+					context.waitTicks(5);
+					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+					context.waitTicks(10);
+					openChat(context);
+					context.takeScreenshot("claudechat-schematic-answer");
 					context.getInput().pressKey(KEY_ESCAPE);
 				}
 			}
@@ -345,6 +403,17 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				zip.write(mcmeta.formatted("Better dungeons", format.major(), format.minor(), format.major(), format.minor()).getBytes(StandardCharsets.UTF_8));
 				zip.putNextEntry(new ZipEntry("data/minecraft/loot_table/chests/simple_dungeon.json"));
 				zip.write(dungeon.getBytes(StandardCharsets.UTF_8));
+			}
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	private static void copySchematics(Path from, Path to) {
+		try (var files = Files.list(from)) {
+			Files.createDirectories(to);
+			for (Path file : files.filter(Files::isRegularFile).toList()) {
+				Files.copy(file, to.resolve(file.getFileName().toString()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 			}
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);

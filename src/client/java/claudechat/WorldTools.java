@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -43,9 +44,11 @@ import java.util.stream.Collectors;
 public final class WorldTools {
 	private final WorldIndex index;
 	private final StructureTemplates templates = new StructureTemplates();
+	private final Materials materials;
 
-	public WorldTools(WorldIndex index) {
+	public WorldTools(WorldIndex index, KnowledgeBase knowledge) {
 		this.index = index;
+		this.materials = new Materials(knowledge);
 	}
 
 	public JsonArray definitions() {
@@ -181,6 +184,35 @@ public final class WorldTools {
 			  "y_to": {"type": "integer", "description": "With layers: highest y to draw."}
 			}, "required": ["template"]}
 			"""));
+		tools.add(tool("list_schematics",
+			"List the player's schematic files (Litematica .litematic, WorldEdit .schem, structure .nbt) from their "
+				+ "schematics folder, with name, author, size and block count. The files are gzipped NBT and can't be read with "
+				+ "Read; use inspect_schematic.",
+			"""
+			{"type": "object", "properties": {
+			  "query": {"type": "string", "description": "Only files whose path or schematic name contains this text."}
+			}}
+			"""));
+		tools.add(tool("inspect_schematic",
+			"A schematic's material list and contents. \"materials\" is the items needed to place every block, counted "
+				+ "like Litematica's material list (a double slab is 2 slabs, a door is 1 item, redstone wire is redstone dust, "
+				+ "water sources are water buckets). \"crafting\" breaks crafted components (pistons, repeaters, observers, "
+				+ "torches, hoppers...) down into ingredients using the game's recipes, and \"base_materials\" is the total "
+				+ "after that, e.g. all the redstone dust including what goes into pistons. Shapes of one material (planks, "
+				+ "slabs, trapdoors, storage blocks) aren't broken down. With compare_with, also checks a container in the "
+				+ "world (a chest's custom name, x y z, or \"inventory\") including shulker boxes in it: what's missing as "
+				+ "placed, and what's still missing if the player crafts components from what's there; \"useful_contents\" is what "
+				+ "they hold of the materials and their ingredients, \"not_needed\" the rest. With layers, draws it "
+				+ "like inspect_structure_template.",
+			"""
+			{"type": "object", "properties": {
+			  "schematic": {"type": "string", "description": "File name (\\"Witch Farm.litematic\\"), part of it, or the schematic's name."},
+			  "compare_with": {"type": "string", "description": "Container to check against: custom name (\\"witch farm\\"; every container with that name counts, e.g. both halves of a double chest), \\"x y z\\", or \\"inventory\\"."},
+			  "layers": {"type": "boolean"},
+			  "y_from": {"type": "integer"},
+			  "y_to": {"type": "integer"}
+			}, "required": ["schematic"]}
+			"""));
 		return tools;
 	}
 
@@ -195,6 +227,8 @@ public final class WorldTools {
 			case "find_biomes" -> findBiomes(args);
 			case "search_structure_templates" -> searchTemplates(args);
 			case "inspect_structure_template" -> inspectTemplate(args);
+			case "list_schematics" -> listSchematics(args);
+			case "inspect_schematic" -> inspectSchematic(args);
 			default -> throw new IllegalArgumentException("Unknown tool: " + name);
 		};
 	}
@@ -773,9 +807,23 @@ public final class WorldTools {
 	private static final int MAX_LAYER_CELLS = 40_000;
 	private static final int MIN_BUILDING_BLOCKS = 8;
 
-	/** Index the world's structure templates in the background (world opened, or /reload). */
-	public void prepareTemplates(MinecraftServer server) {
+	/**
+	 * Slow first-use work, in the background when the world opens or reloads: the structure template index, the
+	 * recipes for material breakdowns, and the data fixer's block state rules for old schematics.
+	 */
+	public void prepare(MinecraftServer server) {
 		templates.prepare(server);
+		Thread thread = new Thread(() -> {
+			long start = System.nanoTime();
+			materials.prepare();
+			long recipesDone = System.nanoTime();
+			Schematics.prepare();
+			ClaudeChatClient.LOGGER.info("Prepared recipes in {} ms and the schematic data fixer in {} ms",
+				(recipesDone - start) / 1_000_000, (System.nanoTime() - recipesDone) / 1_000_000);
+		}, "Claude Chat materials");
+		thread.setDaemon(true);
+		thread.setPriority(Thread.MIN_PRIORITY);
+		thread.start();
 	}
 
 	public void clearTemplates() {
@@ -928,11 +976,20 @@ public final class WorldTools {
 		counts.entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).limit(100)
 			.forEach(e -> blocks.addProperty(StructureTemplates.id(e.getKey()), e.getValue()));
 		out.add("blocks", blocks);
+		addBlockEntities(out, t.blocks(), t.entities());
+		addTemplateUsage(out, templateIndex, id, 20);
+		if (args != null && args.has("layers") && args.get("layers").getAsBoolean()) {
+			addLayers(out, t.size(), t.blocks(), args);
+		}
+		return out;
+	}
 
+	/** "block_entities" (chests with loot tables, spawners, signs...), "entities" and "jigsaw_connectors". */
+	private static void addBlockEntities(JsonObject out, List<StructureTemplates.BlockInfo> all, List<StructureTemplates.EntityInfo> entityList) {
 		JsonArray blockEntities = new JsonArray();
 		JsonArray jigsaws = new JsonArray();
 		int moreBlockEntities = 0;
-		for (StructureTemplates.BlockInfo b : t.blocks()) {
+		for (StructureTemplates.BlockInfo b : all) {
 			if (b.nbt() == null) {
 				continue;
 			}
@@ -972,19 +1029,220 @@ public final class WorldTools {
 				out.addProperty("more_block_entities", moreBlockEntities);
 			}
 		}
-		if (!t.entities().isEmpty()) {
+		if (!entityList.isEmpty()) {
 			JsonArray entities = new JsonArray();
-			t.entities().stream().limit(30).forEach(e -> entities.add(e.type() + " at " + posText(e.pos())));
+			entityList.stream().limit(30).forEach(e -> entities.add(e.type() + " at " + posText(e.pos())));
 			out.add("entities", entities);
 		}
 		if (!jigsaws.isEmpty()) {
 			out.add("jigsaw_connectors", jigsaws);
 		}
-		addTemplateUsage(out, templateIndex, id, 20);
-		if (args != null && args.has("layers") && args.get("layers").getAsBoolean()) {
-			addLayers(out, t, args);
+	}
+
+	// --- schematics -----------------------------------------------------------------------------------------------
+
+	private JsonElement listSchematics(JsonObject args) throws Exception {
+		String query = string(args, "query", "").trim().toLowerCase(Locale.ROOT);
+		JsonObject out = new JsonObject();
+		out.addProperty("folder", Schematics.directory().toString());
+		JsonArray results = new JsonArray();
+		for (java.nio.file.Path file : Schematics.list()) {
+			JsonObject r = new JsonObject();
+			r.addProperty("file", Schematics.relativeName(file));
+			try {
+				Schematics.Schematic s = Schematics.load(file);
+				if (!query.isEmpty() && !Schematics.relativeName(file).toLowerCase(Locale.ROOT).contains(query)
+					&& !s.name().toLowerCase(Locale.ROOT).contains(query)) {
+					continue;
+				}
+				r.addProperty("name", s.name());
+				if (!s.author().isEmpty()) {
+					r.addProperty("author", s.author());
+				}
+				r.addProperty("size", sizeText(s.size()));
+				r.addProperty("blocks", s.blocks().stream().filter(b -> !b.state().isAir()).count());
+			} catch (Exception e) {
+				if (!query.isEmpty() && !Schematics.relativeName(file).toLowerCase(Locale.ROOT).contains(query)) {
+					continue;
+				}
+				r.addProperty("error", "unreadable: " + e.getMessage());
+			}
+			results.add(r);
+		}
+		out.add("schematics", results);
+		if (results.isEmpty()) {
+			out.addProperty("note", "No schematics" + (query.isEmpty() ? "" : " matching \"" + query + "\"") + " in that folder.");
 		}
 		return out;
+	}
+
+	private JsonElement inspectSchematic(JsonObject args) throws Exception {
+		String query = string(args, "schematic", "").trim();
+		java.nio.file.Path file = Schematics.find(query).orElseThrow(() -> new IllegalArgumentException(
+			"No schematic matching \"" + query + "\" in " + Schematics.directory() + ". Use list_schematics."));
+		Schematics.Schematic s = Schematics.load(file);
+
+		JsonObject out = new JsonObject();
+		out.addProperty("file", Schematics.relativeName(file));
+		out.addProperty("name", s.name());
+		if (!s.author().isEmpty()) {
+			out.addProperty("author", s.author());
+		}
+		if (!s.description().isEmpty()) {
+			out.addProperty("description", s.description());
+		}
+		out.addProperty("size", sizeText(s.size()));
+		if (s.regions().size() > 1) {
+			JsonArray regions = new JsonArray();
+			s.regions().forEach(r -> regions.add(r.name() + ": " + sizeText(r.size()) + " at " + posText(r.position())));
+			out.add("regions", regions);
+		}
+
+		Map<String, Integer> noItem = new TreeMap<>();
+		Map<String, Integer> placed = Materials.asPlaced(s.blocks().stream().map(StructureTemplates.BlockInfo::state).toList(), noItem);
+		out.add("materials", countsJson(placed));
+		out.addProperty("total_items", placed.values().stream().mapToInt(Integer::intValue).sum());
+		if (!noItem.isEmpty()) {
+			out.add("blocks_without_an_item", countsJson(noItem));
+		}
+		Materials.Breakdown full = materials.breakDown(placed, Map.of());
+		if (!full.crafts().isEmpty()) {
+			out.add("crafting", craftsJson(full.crafts()));
+			out.add("base_materials", countsJson(full.remaining()));
+		}
+
+		String compare = string(args, "compare_with", "").trim();
+		if (!compare.isEmpty()) {
+			out.add("comparison", compare(compare, placed));
+		}
+		addBlockEntities(out, s.blocks(), s.entities());
+		if (args.has("layers") && args.get("layers").getAsBoolean()) {
+			addLayers(out, s.size(), s.blocks(), args);
+		}
+		return out;
+	}
+
+	/** Checks the containers matching {@code query} against the materials; see inspect_schematic's description. */
+	private JsonObject compare(String query, Map<String, Integer> placed) throws Exception {
+		WorldIndex.Snapshot snapshot = index.snapshot();
+		if (index.server() == null || snapshot.players().isEmpty()) {
+			throw new IllegalStateException("Comparing with a container needs a single-player world.");
+		}
+		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
+		List<String> used = new ArrayList<>();
+		List<WorldIndex.Item> items = new ArrayList<>();
+		String q = query.toLowerCase(Locale.ROOT);
+		if (q.equals("inventory")) {
+			items.addAll(player.inventory());
+			used.add("inventory of " + player.name());
+		} else {
+			String[] parts = q.replace(",", " ").trim().split("\\s+");
+			Integer[] xyz = parts.length == 3 ? parseInts(parts) : null;
+			List<WorldIndex.Holder> matches = new ArrayList<>();
+			for (WorldIndex.Holder h : snapshot.holders()) {
+				if (h.kind().equals("entity") || !h.dimension().equals(player.dimension()) && xyz == null) {
+					continue;
+				}
+				boolean match = xyz != null ? h.x() == xyz[0] && h.y() == xyz[1] && h.z() == xyz[2] : h.name() != null && h.name().toLowerCase(Locale.ROOT).contains(q);
+				if (match) {
+					matches.add(h);
+				}
+			}
+			if (xyz != null && matches.size() == 1) {
+				// The other half of a double chest.
+				WorldIndex.Holder first = matches.getFirst();
+				for (WorldIndex.Holder h : snapshot.holders()) {
+					if (h != first && h.type().equals(first.type()) && h.dimension().equals(first.dimension()) && h.y() == first.y()
+						&& Math.abs(h.x() - first.x()) + Math.abs(h.z() - first.z()) == 1 && java.util.Objects.equals(h.name(), first.name())) {
+						matches.add(h);
+					}
+				}
+			}
+			if (matches.isEmpty()) {
+				List<String> named = snapshot.holders().stream().filter(h -> h.name() != null && !h.kind().equals("entity"))
+					.map(h -> "\"" + h.name() + "\" at " + h.x() + " " + h.y() + " " + h.z()).distinct().limit(20).toList();
+				throw new IllegalArgumentException("No container matching \"" + query + "\"." + (named.isEmpty()
+					? " There are no named containers; give its coordinates instead." : " Named containers: " + String.join(", ", named)));
+			}
+			for (WorldIndex.Holder h : matches) {
+				items.addAll(h.items());
+				used.add(h.type() + (h.name() != null ? " \"" + h.name() + "\"" : "") + " at " + h.x() + " " + h.y() + " " + h.z()
+					+ (h.live() ? "" : " (last save)"));
+			}
+		}
+		Map<String, Integer> stock = new TreeMap<>();
+		flatten(items, stock);
+
+		JsonObject out = new JsonObject();
+		JsonArray containers = new JsonArray();
+		used.forEach(containers::add);
+		out.add("containers", containers);
+		Map<String, Integer> missingAsPlaced = new TreeMap<>();
+		placed.forEach((item, need) -> {
+			int shortfall = need - stock.getOrDefault(item, 0);
+			if (shortfall > 0) {
+				missingAsPlaced.put(item, shortfall);
+			}
+		});
+		out.add("missing_as_placed", countsJson(missingAsPlaced));
+		Materials.Breakdown withStock = materials.breakDown(placed, stock);
+		out.add("still_missing_after_crafting_from_contents", countsJson(withStock.remaining()));
+		if (!withStock.crafts().isEmpty()) {
+			out.add("crafting_needed", craftsJson(withStock.crafts()));
+		}
+		out.addProperty("complete", withStock.remaining().isEmpty());
+		Map<String, Integer> fullNeeds = new HashMap<>(placed);
+		materials.breakDown(placed, Map.of()).crafts().forEach(c -> c.recipe().ingredients().keySet().forEach(i -> fullNeeds.putIfAbsent(i, 0)));
+		Map<String, Integer> have = new TreeMap<>();
+		Map<String, Integer> extra = new TreeMap<>();
+		stock.forEach((item, count) -> (fullNeeds.containsKey(item) ? have : extra).put(item, count));
+		out.add("useful_contents", countsJson(have));
+		if (!extra.isEmpty()) {
+			out.add("not_needed", countsJson(extra));
+		}
+		return out;
+	}
+
+	/** Item counts by id, including what's inside shulker boxes and bundles (the box itself counts too). */
+	private static void flatten(List<WorldIndex.Item> items, Map<String, Integer> into) {
+		for (WorldIndex.Item item : items) {
+			into.merge(item.id(), item.count(), Integer::sum);
+			flatten(item.contents(), into);
+		}
+	}
+
+	private static Integer[] parseInts(String[] parts) {
+		try {
+			return new Integer[] {Integer.parseInt(parts[0]), Integer.parseInt(parts[1]), Integer.parseInt(parts[2])};
+		} catch (NumberFormatException e) {
+			return null;
+		}
+	}
+
+	/** {"minecraft:redstone": 41, ...}, most first. */
+	private static JsonObject countsJson(Map<String, Integer> counts) {
+		JsonObject o = new JsonObject();
+		counts.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed()).forEach(e -> o.addProperty(e.getKey(), e.getValue()));
+		return o;
+	}
+
+	private static JsonArray craftsJson(List<Materials.Craft> crafts) {
+		JsonArray array = new JsonArray();
+		for (Materials.Craft c : crafts) {
+			JsonObject o = new JsonObject();
+			o.addProperty("item", c.item());
+			o.addProperty("needed", c.used());
+			o.addProperty("craft_times", c.crafts());
+			if (c.made() > c.used()) {
+				o.addProperty("left_over", c.made() - c.used());
+			}
+			JsonObject per = new JsonObject();
+			c.recipe().ingredients().forEach(per::addProperty);
+			o.add("ingredients_per_craft", per);
+			o.addProperty("recipe", c.recipe().file());
+			array.add(o);
+		}
+		return array;
 	}
 
 	/** "used_by_structures" (traced through pools) and "in_pools". */
@@ -1012,10 +1270,10 @@ public final class WorldTools {
 	}
 
 	/** One text grid per y level, plus the legend. Skipped with a note if it would be too long. */
-	private static void addLayers(JsonObject out, StructureTemplates.Template t, JsonObject args) {
-		int sx = t.size().getX();
-		int sy = t.size().getY();
-		int sz = t.size().getZ();
+	private static void addLayers(JsonObject out, Vec3i size, List<StructureTemplates.BlockInfo> blockList, JsonObject args) {
+		int sx = size.getX();
+		int sy = size.getY();
+		int sz = size.getZ();
 		if (sx <= 0 || sy <= 0 || sz <= 0) {
 			return;
 		}
@@ -1031,7 +1289,7 @@ public final class WorldTools {
 		}
 		BlockState[] cells = new BlockState[(int) perLayer * (yTo - yFrom + 1)];
 		Map<Block, Integer> counts = new HashMap<>();
-		for (StructureTemplates.BlockInfo b : t.blocks()) {
+		for (StructureTemplates.BlockInfo b : blockList) {
 			BlockPos p = b.pos();
 			if (p.getY() < yFrom || p.getY() > yTo || p.getX() < 0 || p.getX() >= sx || p.getZ() < 0 || p.getZ() >= sz) {
 				continue;

@@ -20,6 +20,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_MOD_QUESTION="..."` | Ask about a mod (on-demand decompile) |
 | `CLAUDECHAT_PACK_TEST=1` | Writes a folder and a zip data pack, runs `/reload`, asks about them |
 | `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
+| `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), visits a village for 100 s, asks Claude |
 
 - **Test with real mods:** `-PextraMods="<folder of jars>"`. The user's mods are in `%APPDATA%\ModrinthApp\profiles\Fabric 26.3\mods`.
@@ -43,7 +44,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `LocationInspector` | Block and biome at a position: live, from the save, or predicted from the seed (base terrain only) |
 | `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
 | `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
-| `WorldTools`, `McpServer` | The nine world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
+| `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
+| `WorldTools`, `McpServer` | The eleven world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
 
 ## Conventions
 

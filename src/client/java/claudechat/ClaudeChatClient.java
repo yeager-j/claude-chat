@@ -77,7 +77,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		config = ClaudeConfig.load();
 		knowledge = new KnowledgeBase(config);
 		worldIndex = new WorldIndex();
-		worldTools = new WorldTools(worldIndex);
+		worldTools = new WorldTools(worldIndex, knowledge);
 		mcp = new McpServer(worldTools);
 		cli = new ClaudeCli(config, knowledge, mcp);
 		formatter = new ChatFormatter(new RecipeRenderer(knowledge));
@@ -195,12 +195,12 @@ public class ClaudeChatClient implements ClientModInitializer {
 		ServerLifecycleEvents.SERVER_STARTED.register(ClaudeChatClient::updateWorldPacks);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resources, success) -> {
 			updateWorldPacks(server);
-			worldTools.prepareTemplates(server);
+			worldTools.prepare(server);
 		});
 		// ...and serve the world tools (containers, entities, player, structures) to Claude over MCP.
 		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
 			worldIndex.start(server);
-			worldTools.prepareTemplates(server);
+			worldTools.prepare(server);
 			mcp.start();
 		});
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
