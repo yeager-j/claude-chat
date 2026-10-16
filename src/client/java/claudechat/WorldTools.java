@@ -7,15 +7,23 @@ import com.google.gson.JsonParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.server.MinecraftServer;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.levelgen.structure.Structure;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 /**
  * The tools Claude gets for the player's single-player world, served over MCP by {@link McpServer}. They search the
@@ -72,6 +80,23 @@ public final class WorldTools {
 			  "limit": {"type": "integer", "description": "Max results (default 5, max 20)."}
 			}, "required": ["structure"]}
 			"""));
+		tools.add(tool("find_blocks",
+			"Find the placed blocks nearest the player, by block id or tag, optionally narrowed by block state properties "
+				+ "and by text in the block's data (its block entity). Examples: a skeleton spawner is block \"spawner\" with "
+				+ "data \"skeleton\"; a fully charged respawn anchor is block \"respawn_anchor\" with properties {\"charges\": \"4\"}. "
+				+ "Searches the player's dimension first, then the others. Covers loaded chunks live and every saved chunk; "
+				+ "it can't tell who placed a block. Block ids match the block.<namespace>.<id> keys in the lang files; "
+				+ "use search_containers for what's inside chests.",
+			"""
+			{"type": "object", "properties": {
+			  "block": {"type": "string", "description": "Block id (\\"minecraft:respawn_anchor\\"), tag (\\"#minecraft:beds\\"), or a word matched against tags and ids (\\"bed\\", \\"anchor\\")."},
+			  "properties": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Block state properties that must match, e.g. {\\"charges\\": \\"4\\"} or {\\"facing\\": \\"north\\"}."},
+			  "data": {"type": "string", "description": "Text the block entity's data must contain (case-insensitive), e.g. the mob in a spawner (\\"skeleton\\"), sign text or a custom name."},
+			  "dimension": {"type": "string", "description": "Only this dimension (overworld, the_nether, the_end, or a modded id)."},
+			  "max_distance": {"type": "integer", "description": "Only within this many blocks of the player."},
+			  "limit": {"type": "integer", "description": "Max results (default 5, max 30)."}
+			}, "required": ["block"]}
+			"""));
 		return tools;
 	}
 
@@ -81,6 +106,7 @@ public final class WorldTools {
 			case "search_entities" -> searchHolders(args, holder -> holder.kind().equals("entity"), false);
 			case "get_player" -> getPlayer();
 			case "find_structures" -> findStructures(args);
+			case "find_blocks" -> findBlocks(args);
 			default -> throw new IllegalArgumentException("Unknown tool: " + name);
 		};
 	}
@@ -268,6 +294,148 @@ public final class WorldTools {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}
 		return out;
+	}
+
+	// --- blocks ---------------------------------------------------------------------------------------------------
+
+	private JsonElement findBlocks(JsonObject args) throws Exception {
+		String blockQuery = string(args, "block", "");
+		String data = string(args, "data", "").trim().toLowerCase(Locale.ROOT);
+		String dimension = string(args, "dimension", "");
+		int maxDistance = integer(args, "max_distance", Integer.MAX_VALUE);
+		int limit = Math.max(1, Math.min(30, integer(args, "limit", 5)));
+
+		WorldIndex.Snapshot snapshot = index.snapshot();
+		MinecraftServer server = index.server();
+		if (server == null || snapshot.players().isEmpty()) {
+			throw new IllegalStateException("No player in a single-player world.");
+		}
+		List<Block> blocks = BlockFinder.resolve(server.registryAccess(), blockQuery);
+		if (blocks.isEmpty()) {
+			throw new IllegalArgumentException("No block or block tag matches \"" + blockQuery + "\".");
+		}
+		Map<String, String> properties = properties(args);
+		checkProperties(blocks, properties);
+		BlockFinder.Query query = new BlockFinder.Query(new HashSet<>(blocks), properties, data);
+		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
+
+		// The player's dimension first; other dimensions only fill the remaining slots.
+		List<ServerLevel> levels = new ArrayList<>();
+		for (ServerLevel level : server.getAllLevels()) {
+			String name = WorldIndex.dimensionName(level.dimension());
+			if (dimension.isEmpty() || name.equals(dimension)) {
+				levels.add(name.equals(player.dimension()) ? 0 : levels.size(), level);
+			}
+		}
+		if (levels.isEmpty()) {
+			throw new IllegalArgumentException("No dimension \"" + dimension + "\".");
+		}
+		JsonArray results = new JsonArray();
+		int chunksRead = 0;
+		boolean truncated = false;
+		for (ServerLevel level : levels) {
+			if (results.size() >= limit) {
+				break;
+			}
+			String name = WorldIndex.dimensionName(level.dimension());
+			BlockFinder.Result result = BlockFinder.find(index, level, query, player.x(), player.y(), player.z(), maxDistance,
+				limit - results.size());
+			chunksRead += result.savedChunksRead();
+			truncated |= result.truncated();
+			for (BlockFinder.Found found : result.found()) {
+				results.add(blockJson(found, name, player));
+			}
+		}
+
+		JsonObject out = new JsonObject();
+		out.add("player", playerPosition(player));
+		out.addProperty("searched", blocks.size() == 1 ? BuiltInRegistries.BLOCK.getKey(blocks.getFirst()).toString()
+			: blocks.size() + " block types matching \"" + blockQuery + "\"");
+		out.add("results", results);
+		out.addProperty("saved_chunks_read", chunksRead);
+		if (truncated) {
+			out.addProperty("note", "Stopped after reading the nearest saved chunks that could hold this block; farther ones weren't searched.");
+		} else if (results.isEmpty()) {
+			out.addProperty("note", "None found in any generated chunk" + (maxDistance < Integer.MAX_VALUE ? " within " + maxDistance + " blocks." : "."));
+		}
+		return out;
+	}
+
+	private static JsonObject blockJson(BlockFinder.Found found, String dimension, WorldIndex.PlayerInfo player) {
+		JsonObject r = new JsonObject();
+		r.addProperty("block", found.id());
+		Map<String, String> properties = found.properties();
+		if (!properties.isEmpty()) {
+			JsonObject props = new JsonObject();
+			properties.forEach(props::addProperty);
+			r.add("properties", props);
+		}
+		r.addProperty("dimension", dimension);
+		r.addProperty("x", found.pos().getX());
+		r.addProperty("y", found.pos().getY());
+		r.addProperty("z", found.pos().getZ());
+		addDirection(r, player, dimension, found.pos().getX(), (double) found.pos().getY(), found.pos().getZ());
+		r.addProperty("data", found.live() ? "live" : "last save");
+		CompoundTag blockEntity = found.blockEntity();
+		if (blockEntity != null) {
+			// Spawners and trial spawners keep the mob in SpawnData; say it plainly rather than leave it in the SNBT.
+			blockEntity.getCompound("SpawnData").flatMap(spawn -> spawn.getCompound("entity"))
+				.map(entity -> entity.getStringOr("id", "")).filter(id -> !id.isEmpty())
+				.ifPresent(id -> r.addProperty("spawns", id));
+			CompoundTag trimmed = blockEntity.copy();
+			for (String key : List.of("id", "x", "y", "z", "keepPacked", "components")) {
+				trimmed.remove(key);
+			}
+			if (!trimmed.isEmpty()) {
+				String snbt = trimmed.toString();
+				r.addProperty("block_entity", snbt.length() > 400 ? snbt.substring(0, 400) + "…" : snbt);
+			}
+		}
+		return r;
+	}
+
+	/** {"charges": "4"}, or the same written as "charges=4,facing=north". */
+	private static Map<String, String> properties(JsonObject args) {
+		Map<String, String> properties = new LinkedHashMap<>();
+		if (args == null || !args.has("properties")) {
+			return properties;
+		}
+		JsonElement element = args.get("properties");
+		if (element.isJsonObject()) {
+			element.getAsJsonObject().entrySet().forEach(e -> properties.put(e.getKey().trim(),
+				e.getValue().isJsonPrimitive() ? e.getValue().getAsString().trim().toLowerCase(Locale.ROOT) : e.getValue().toString()));
+		} else if (element.isJsonPrimitive()) {
+			for (String pair : element.getAsString().replaceAll("[\\[\\]{}]", "").split(",")) {
+				String[] kv = pair.split("[=:]", 2);
+				if (kv.length == 2) {
+					properties.put(kv[0].trim().replace("\"", ""), kv[1].trim().replace("\"", "").toLowerCase(Locale.ROOT));
+				}
+			}
+		}
+		return properties;
+	}
+
+	/** Fail with the valid names and values rather than silently finding nothing. */
+	private static void checkProperties(List<Block> blocks, Map<String, String> properties) {
+		for (Map.Entry<String, String> wanted : properties.entrySet()) {
+			boolean valid = blocks.stream().anyMatch(block -> {
+				Property<?> property = block.getStateDefinition().getProperty(wanted.getKey());
+				return property != null && property.getValue(wanted.getValue()).isPresent();
+			});
+			if (!valid) {
+				Block block = blocks.getFirst();
+				String available = block.getStateDefinition().getProperties().stream()
+					.map(p -> p.getName() + " (" + p.getPossibleValues().stream().map(v -> valueName(p, v)).collect(Collectors.joining("|")) + ")")
+					.collect(Collectors.joining(", "));
+				throw new IllegalArgumentException("Property " + wanted.getKey() + "=" + wanted.getValue() + " doesn't exist for "
+					+ BuiltInRegistries.BLOCK.getKey(block) + ". Its properties: " + (available.isEmpty() ? "none" : available));
+			}
+		}
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T extends Comparable<T>> String valueName(Property<T> property, Object value) {
+		return property.getName((T) value);
 	}
 
 	// --- helpers --------------------------------------------------------------------------------------------------

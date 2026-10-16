@@ -35,9 +35,10 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand) with Vineflower in a separate JVM; extracts data and lang files; world data packs; the prompt's file map |
 | `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
-| `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` |
+| `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` and block palettes |
 | `StructureFinder` | Multi-result `/locate` with visited filtering |
-| `WorldTools`, `McpServer` | The four world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
+| `BlockFinder` | Nearest blocks by id/tag, state properties and block entity text; re-reads only saved chunks whose palette has the block |
+| `WorldTools`, `McpServer` | The five world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
 
 ## Conventions
 
@@ -86,6 +87,7 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 - **Files lag the game:** saved chunks are up to an autosave (5 min) behind, so loaded chunks are captured live on the server thread and override the saved copy.
 - **"Generated" chunks:** structure searches (ours and `/locate`'s) leave `structure_starts` chunks on disk. Only `Status: minecraft:full` counts as generated.
 - **InhabitedTime:** it only advances on ticks where the chunk runs mob spawning (players within 128 blocks), so it grows slower than wall time. "Visited" is ≥ 60 s.
+- **Section palettes:** in 26.x a palette entry is a bare string (`"minecraft:spawner"`) when the block is in its default state, otherwise `{id, properties}`, no longer `{Name, Properties}`. Use `WorldIndex.paletteName`.
 - **26.x paths:** player data is in `players/data`, and dimensions are under `dimensions/<ns>/<path>/{region,entities}`. Use `DimensionType.getStorageFolder`.
 
 **Mods and data packs**

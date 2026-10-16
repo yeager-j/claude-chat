@@ -111,6 +111,10 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				server.runCommand("forceload add 2000 2000");
 				context.waitTicks(20);
 				server.runCommand("setblock 2000 100 2000 minecraft:barrel{Items:[{Slot:0b,id:\"minecraft:netherite_ingot\",count:3}]}");
+				server.runCommand("setblock 2000 100 2002 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:skeleton\"}}}");
+				server.runCommand("setblock 2002 100 2000 minecraft:respawn_anchor[charges=4]");
+				server.runCommand("execute at @p run setblock ~5 ~ ~5 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:zombie\"}}}");
+				server.runCommand("execute at @p run setblock ~-5 ~ ~5 minecraft:respawn_anchor[charges=1]");
 				server.runCommand("forceload remove 2000 2000");
 				// save-all is a dedicated-server command; this is what autosave does.
 				server.runOnServer(s -> s.saveEverything(true, true, true));
@@ -122,6 +126,12 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				logTool(context, "search_containers", "{\"query\": \"emerald\"}");
 				logTool(context, "search_entities", "{\"query\": \"rex\"}");
 				logTool(context, "get_player", "{}");
+				// Blocks: the zombie spawner and charge-1 anchor are live nearby, the skeleton spawner and full anchor only saved.
+				logTool(context, "find_blocks", "{\"block\": \"spawner\"}");
+				logTool(context, "find_blocks", "{\"block\": \"spawner\", \"data\": \"skeleton\"}");
+				logTool(context, "find_blocks", "{\"block\": \"respawn anchor\"}");
+				logTool(context, "find_blocks", "{\"block\": \"minecraft:respawn_anchor\", \"properties\": {\"charges\": \"4\"}}");
+				logTool(context, "find_blocks", "{\"block\": \"#minecraft:beds\", \"dimension\": \"the_nether\"}");
 				JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
 
 				// Visit the nearest village for over a minute, come back, and check the visited filter flips.
@@ -137,7 +147,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
 				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
 
-				chat(context, "@claude where's the nearest village I haven't explored yet? and where did I put my netherite?");
+				chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and where's the closest skeleton spawner?");
 				context.waitTicks(5);
 				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
 				context.waitTicks(10);
