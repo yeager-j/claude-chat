@@ -10,7 +10,9 @@ import net.minecraft.server.MinecraftServer;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.core.SectionPos;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
@@ -110,6 +112,23 @@ public final class WorldTools {
 			  "limit": {"type": "integer", "description": "Max results (default 5, max 30)."}
 			}, "required": ["block"]}
 			"""));
+		tools.add(tool("find_biomes",
+			"Find patches of a biome near the player, nearest first: like /locate biome, but returns several separate "
+				+ "patches. Worked out from the seed without generating anything, sampling every 32 blocks across and 64 up "
+				+ "and down, so patches smaller than that can be missed. Searches the player's dimension, or where the biome "
+				+ "exists if not there (a warped forest asked about from the Overworld is searched in the Nether, around the "
+				+ "player's position / 8). y is a height where the biome is: underground biomes like deep_dark and lush_caves "
+				+ "are found at their depth. Biome ids are under data/<namespace>/worldgen/biome in the reference files.",
+			"""
+			{"type": "object", "properties": {
+			  "biome": {"type": "string", "description": "Biome id (\\"minecraft:cherry_grove\\"), tag (\\"#minecraft:is_ocean\\"), or a word (\\"cherry\\", \\"mushroom\\")."},
+			  "dimension": {"type": "string"},
+			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Whether players spent over a minute near the spot. Default: any."},
+			  "min_spacing": {"type": "integer", "description": "Hits closer together than this many blocks count as one patch (default 256)."},
+			  "max_distance": {"type": "integer", "description": "Search radius in blocks (default 6400 like /locate, max 30000)."},
+			  "limit": {"type": "integer", "description": "Max results (default 5, max 20)."}
+			}, "required": ["biome"]}
+			"""));
 		tools.add(tool("inspect_location",
 			"What's at a position: the block, its state and data, the biome, and the column's top block. Loaded chunks are "
 				+ "read live and other generated chunks from the last save. Chunks that were never generated are predicted from "
@@ -135,6 +154,7 @@ public final class WorldTools {
 			case "find_structures" -> findStructures(args);
 			case "find_blocks" -> findBlocks(args);
 			case "inspect_location" -> inspectLocation(args);
+			case "find_biomes" -> findBiomes(args);
 			default -> throw new IllegalArgumentException("Unknown tool: " + name);
 		};
 	}
@@ -305,18 +325,7 @@ public final class WorldTools {
 		Search search = server.submit(() -> {
 			ServerLevel level = structureLevel(server, structures, requestedDimension, player.dimension());
 			String dimension = WorldIndex.dimensionName(level.dimension());
-			// From another dimension, search around the player's position translated there (x/8 into the Nether).
-			WorldIndex.PlayerInfo origin = player;
-			if (!dimension.equals(player.dimension())) {
-				ServerLevel from = level;
-				for (ServerLevel candidate : server.getAllLevels()) {
-					if (WorldIndex.dimensionName(candidate.dimension()).equals(player.dimension())) {
-						from = candidate;
-					}
-				}
-				double scale = DimensionType.getTeleportationScale(from.dimensionType(), level.dimensionType());
-				origin = new WorldIndex.PlayerInfo(player.name(), dimension, player.x() * scale, player.y(), player.z() * scale, List.of(), List.of());
-			}
+			WorldIndex.PlayerInfo origin = originIn(server, player, level);
 			Predicate<StructureFinder.Found> filter = f -> f.distance() >= minDistance && switch (visited) {
 				case "unvisited" -> f.inhabitedTicks() < StructureFinder.VISITED_TICKS;
 				case "visited" -> f.inhabitedTicks() >= StructureFinder.VISITED_TICKS;
@@ -337,10 +346,7 @@ public final class WorldTools {
 		out.addProperty("searched", structures.size() == 1 ? structures.getFirst().unwrapKey().map(k -> k.identifier().toString()).orElse(query)
 			: structures.size() + " structure types matching \"" + query + "\"");
 		out.addProperty("dimension", search.dimension());
-		if (origin != player) {
-			out.addProperty("note_on_distances", "Distances and directions are from the player's position translated to "
-				+ search.dimension() + ": " + Math.round(origin.x()) + " ~ " + Math.round(origin.z()) + ".");
-		}
+		addOriginNote(out, origin, player);
 		JsonArray results = new JsonArray();
 		for (StructureFinder.Found f : found) {
 			JsonObject r = new JsonObject();
@@ -371,6 +377,33 @@ public final class WorldTools {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}
 		return out;
+	}
+
+	/**
+	 * Where to search from in {@code level}: the player, or from another dimension the player's position translated
+	 * there (x/8 into the Nether), with the player's y.
+	 */
+	private static WorldIndex.PlayerInfo originIn(MinecraftServer server, WorldIndex.PlayerInfo player, ServerLevel level) {
+		String dimension = WorldIndex.dimensionName(level.dimension());
+		if (dimension.equals(player.dimension())) {
+			return player;
+		}
+		ServerLevel from = level;
+		for (ServerLevel candidate : server.getAllLevels()) {
+			if (WorldIndex.dimensionName(candidate.dimension()).equals(player.dimension())) {
+				from = candidate;
+			}
+		}
+		double scale = DimensionType.getTeleportationScale(from.dimensionType(), level.dimensionType());
+		return new WorldIndex.PlayerInfo(player.name(), dimension, player.x() * scale, player.y(), player.z() * scale, List.of(), List.of());
+	}
+
+	/** "Distances and directions are from ..." when searching another dimension than the player's. */
+	private static void addOriginNote(JsonObject out, WorldIndex.PlayerInfo origin, WorldIndex.PlayerInfo player) {
+		if (origin != player) {
+			out.addProperty("note_on_distances", "Distances and directions are from the player's position translated to "
+				+ origin.dimension() + ": " + Math.round(origin.x()) + " ~ " + Math.round(origin.z()) + ".");
+		}
 	}
 
 	/**
@@ -523,6 +556,85 @@ public final class WorldTools {
 				r.addProperty("block_entity", snbt.length() > 400 ? snbt.substring(0, 400) + "…" : snbt);
 			}
 		}
+	}
+
+	// --- biomes --------------------------------------------------------------------------------------------------
+
+	private JsonElement findBiomes(JsonObject args) throws Exception {
+		String query = string(args, "biome", "");
+		String visited = string(args, "visited", "any");
+		String requested = string(args, "dimension", "");
+		int minSpacing = Math.max(32, integer(args, "min_spacing", 256));
+		int maxDistance = Math.max(32, Math.min(30_000, integer(args, "max_distance", 6400)));
+		int limit = Math.max(1, Math.min(20, integer(args, "limit", 5)));
+
+		WorldIndex.Snapshot snapshot = index.snapshot();
+		MinecraftServer server = index.server();
+		if (server == null || snapshot.players().isEmpty()) {
+			throw new IllegalStateException("No player in a single-player world.");
+		}
+		Set<Holder<Biome>> biomes = new HashSet<>(RegistryQuery.resolve(server.registryAccess(), Registries.BIOME, query));
+		if (biomes.isEmpty()) {
+			throw new IllegalArgumentException("No biome or biome tag matches \"" + query + "\". Biome ids are under data/<namespace>/worldgen/biome.");
+		}
+		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
+
+		// The requested dimension, else the player's if the biome exists there, else the first one where it does.
+		ServerLevel level = null;
+		ServerLevel elsewhere = null;
+		for (ServerLevel candidate : server.getAllLevels()) {
+			String name = WorldIndex.dimensionName(candidate.dimension());
+			boolean exists = candidate.getChunkSource().getGenerator().getBiomeSource().possibleBiomes().stream().anyMatch(biomes::contains);
+			if (requested.isEmpty() ? exists && name.equals(player.dimension()) : name.equals(requested)) {
+				level = candidate;
+			} else if (exists && elsewhere == null) {
+				elsewhere = candidate;
+			}
+		}
+		if (level == null && !requested.isEmpty()) {
+			throw new IllegalArgumentException("No dimension \"" + requested + "\".");
+		}
+		if (level == null && elsewhere == null) {
+			throw new IllegalArgumentException("\"" + query + "\" doesn't generate in any dimension of this world.");
+		}
+		ServerLevel searchLevel = level != null ? level : elsewhere;
+		String dimension = WorldIndex.dimensionName(searchLevel.dimension());
+		WorldIndex.PlayerInfo origin = originIn(server, player, searchLevel);
+
+		// Visited filtering needs more candidates than the limit; the biome noise is cheap, so over-fetch.
+		int fetch = visited.equals("any") ? limit : Math.min(200, limit * 10);
+		BiomeFinder.Result result = BiomeFinder.find(searchLevel, biomes, origin.x(), origin.y(), origin.z(), maxDistance, minSpacing, fetch);
+
+		JsonObject out = new JsonObject();
+		out.add("player", playerPosition(player));
+		out.addProperty("searched", biomes.size() == 1 ? RegistryQuery.id(biomes.iterator().next())
+			: biomes.size() + " biomes matching \"" + query + "\"");
+		out.addProperty("dimension", dimension);
+		addOriginNote(out, origin, player);
+		JsonArray results = new JsonArray();
+		for (BiomeFinder.Found f : result.found()) {
+			long ticks = snapshot.inhabited(dimension, SectionPos.blockToSectionCoord(f.x()), SectionPos.blockToSectionCoord(f.z()));
+			boolean isVisited = ticks >= StructureFinder.VISITED_TICKS;
+			if ((visited.equals("visited") && !isVisited) || (visited.equals("unvisited") && isVisited) || results.size() >= limit) {
+				continue;
+			}
+			JsonObject r = new JsonObject();
+			r.addProperty("biome", f.biome());
+			r.addProperty("x", f.x());
+			r.addProperty("y", f.y());
+			r.addProperty("z", f.z());
+			addDirection(r, origin, dimension, f.x(), null, f.z());
+			r.addProperty("generated", ticks >= 0);
+			r.addProperty("visited", isVisited);
+			results.add(r);
+		}
+		out.add("results", results);
+		if (result.truncated()) {
+			out.addProperty("note", "Stopped early: the search area was too large. Narrow max_distance to search farther in parts.");
+		} else if (results.isEmpty()) {
+			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
+		}
+		return out;
 	}
 
 	// --- one position ---------------------------------------------------------------------------------------------

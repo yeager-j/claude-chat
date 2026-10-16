@@ -38,9 +38,10 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` and block palettes |
 | `StructureFinder` | Multi-result `/locate` with visited filtering; builds a structure's pieces in memory (`Structure.generate`) to sample the biomes they occupy |
 | `BlockFinder` | Nearest blocks by id/tag, state properties and block entity text; re-reads only saved chunks whose palette has the block |
+| `BiomeFinder` | Multi-result `/locate biome` from the seed, off the server thread |
 | `LocationInspector` | Block and biome at a position: live, from the save, or predicted from the seed (base terrain only) |
 | `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
-| `WorldTools`, `McpServer` | The six world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
+| `WorldTools`, `McpServer` | The seven world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
 
 ## Conventions
 

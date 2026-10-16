@@ -28,6 +28,7 @@ Client-side Fabric mod for **Minecraft 26.3**.
   - **Find mobs and things:** "Where's Rex?" finds pets, named mobs, item frames and dropped items.
   - **Find blocks:** "Where did I put my respawn anchor?" or "Find the closest skeleton spawner" searches placed blocks, including their state (anchor charges, which way a block faces) and data (what a spawner spawns, sign text).
   - **Find structures:** "Where's the nearest village I haven't explored?" finds structures like `/locate` does, but returns several and can skip the ones you've already been to. "Find me a nether fortress in a warped forest" checks which biomes each structure's pieces reach into, worked out from the seed, so nothing gets generated. Add "at least 75% warped forest" to skip ones that only touch it.
+  - **Find biomes:** "Where's the nearest cherry grove?" works like `/locate biome`, but lists several separate patches and can skip places you've been.
   - **Inspect a spot:** "What biome is 1200 64 -300?" reads the block and biome there, or predicts them from the seed if you haven't been there yet.
   - **Exact directions:** distances and directions are calculated for you, e.g. "2,832 blocks south-east, 160 up".
 - **Rich chat.**

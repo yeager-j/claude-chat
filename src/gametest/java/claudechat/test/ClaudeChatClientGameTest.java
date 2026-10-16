@@ -10,6 +10,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.metadata.pack.PackFormat;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.biome.Biomes;
 import net.minecraft.world.level.chunk.status.ChunkStatus;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.level.levelgen.structure.BuiltinStructures;
@@ -172,6 +173,23 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					String share = result.getAsJsonObject().get("share_in_requested_biome").getAsString();
 					check(Integer.parseInt(share.replace("%", "")) >= 75, "min_biome_share let through " + result);
 				}
+
+				// Biomes: from the Overworld, a warped forest is searched in the Nether. The nearest deep dark must be no
+				// farther than the one /locate biome finds on the same grid (it stops at the first hit in spiral order).
+				JsonObject warpedBiome = logTool(context, "find_biomes", "{\"biome\": \"warped_forest\"}");
+				check(warpedBiome.get("dimension").getAsString().equals("the_nether"), "warped forest not searched in the Nether");
+				logTool(context, "find_biomes", "{\"biome\": \"#minecraft:is_ocean\", \"limit\": 5}");
+				JsonObject deepDark = logTool(context, "find_biomes", "{\"biome\": \"deep_dark\", \"limit\": 3}");
+				Double locateDistance = singleplayer.getServer().computeOnServer(s -> {
+					var player = s.getPlayerList().getPlayers().getFirst();
+					var pair = s.overworld().findClosestBiome3d(b -> b.is(Biomes.DEEP_DARK), player.blockPosition(), 6400, 32, 64);
+					return pair == null ? null : Math.sqrt(Math.pow(pair.getFirst().getX() - player.getX(), 2) + Math.pow(pair.getFirst().getZ() - player.getZ(), 2));
+				});
+				var deepDarkResults = deepDark.getAsJsonArray("results");
+				LOGGER.info("deep dark: /locate {} blocks, find_biomes {}", locateDistance, deepDarkResults.isEmpty() ? "none" : deepDarkResults.get(0));
+				check(locateDistance == null || (!deepDarkResults.isEmpty()
+					&& deepDarkResults.get(0).getAsJsonObject().get("distance_blocks").getAsDouble() <= locateDistance + 2),
+					"find_biomes' nearest deep dark is farther than /locate's");
 				JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
 
 				// Visit the nearest village for over a minute, come back, and check the visited filter flips.
@@ -248,6 +266,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	}
 
 	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {
+		long start = System.nanoTime();
 		CompletableFuture<JsonElement> result = CompletableFuture.supplyAsync(() -> {
 			try {
 				return ClaudeChatClient.worldTools().call(name, JsonParser.parseString(args).getAsJsonObject());
@@ -257,7 +276,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		});
 		context.waitFor(mc -> result.isDone(), 120 * SECONDS);
 		JsonElement json = result.join();
-		LOGGER.info("tool {} {} -> {}", name, args, json);
+		LOGGER.info("tool {} {} ({} ms) -> {}", name, args, (System.nanoTime() - start) / 1_000_000, json);
 		return json.isJsonObject() ? json.getAsJsonObject() : new JsonObject();
 	}
 
