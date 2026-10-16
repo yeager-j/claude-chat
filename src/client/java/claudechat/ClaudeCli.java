@@ -72,9 +72,12 @@ public class ClaudeCli {
 	});
 	private volatile String sessionId;
 
-	public ClaudeCli(ClaudeConfig config, KnowledgeBase knowledge) {
+	private final WorldIndex worldIndex;
+
+	public ClaudeCli(ClaudeConfig config, KnowledgeBase knowledge, WorldIndex worldIndex) {
 		this.config = config;
 		this.knowledge = knowledge;
+		this.worldIndex = worldIndex;
 	}
 
 	public void resetSession() {
@@ -92,6 +95,14 @@ public class ClaudeCli {
 				for (KnowledgeBase.Source mod : knowledge.mentionedWithoutCode(mentionText)) {
 					onProgress.accept("Decompiling " + mod.label());
 					knowledge.buildCodeNow(mod, message -> { });
+				}
+				// Usually well under a second: only chunks saved since last time are re-read.
+				if (worldIndex.isActive()) {
+					try {
+						worldIndex.refresh();
+					} catch (Exception e) {
+						ClaudeChatClient.LOGGER.warn("Could not update the world index", e);
+					}
 				}
 				return run(question, gameContext, onProgress);
 			} catch (IOException e) {

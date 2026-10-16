@@ -47,6 +47,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static ClaudeCli cli;
 	private static KnowledgeBase knowledge;
 	private static ChatFormatter formatter;
+	private static WorldIndex worldIndex;
 	private static final StatusLine status = new StatusLine();
 
 	/** For the client game test: is a question still being answered? */
@@ -68,7 +69,8 @@ public class ClaudeChatClient implements ClientModInitializer {
 	public void onInitializeClient() {
 		config = ClaudeConfig.load();
 		knowledge = new KnowledgeBase(config);
-		cli = new ClaudeCli(config, knowledge);
+		worldIndex = new WorldIndex(knowledge);
+		cli = new ClaudeCli(config, knowledge, worldIndex);
 		formatter = new ChatFormatter(new RecipeRenderer(knowledge));
 
 		// Start decompiling right away so it's usually done by the time a world has loaded.
@@ -183,7 +185,12 @@ public class ClaudeChatClient implements ClientModInitializer {
 		// (On a multiplayer server its data packs live on the server and can't be read.)
 		ServerLifecycleEvents.SERVER_STARTED.register(ClaudeChatClient::updateWorldPacks);
 		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resources, success) -> updateWorldPacks(server));
-		ServerLifecycleEvents.SERVER_STOPPED.register(server -> knowledge.clearWorldPacks());
+		// ...and index what's stored where, so Claude can answer "where did I put my diamonds?".
+		ServerLifecycleEvents.SERVER_STARTED.register(worldIndex::start);
+		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+			knowledge.clearWorldPacks();
+			worldIndex.stop();
+		});
 	}
 
 	private static void updateWorldPacks(MinecraftServer server) {

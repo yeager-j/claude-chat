@@ -311,6 +311,13 @@ public class KnowledgeBase {
 		}
 	}
 
+	private volatile String worldIndexPath;
+
+	/** Path (relative to the knowledge root) of the current single-player world's index, or null. */
+	public void setWorldIndex(String relativePath) {
+		worldIndexPath = relativePath;
+	}
+
 	public void clearWorldPacks() {
 		worldPacks = List.of();
 		worldName = "";
@@ -408,6 +415,15 @@ public class KnowledgeBase {
 				sb.append("not available yet (still being prepared)");
 			}
 			sb.append('\n');
+		}
+		String index = worldIndexPath;
+		if (index != null) {
+			sb.append("The player's own world: ").append(index).append(" lists what's stored where, one line per thing:")
+				.append(" every container with its contents (items inside shulker boxes and bundles too), unopened loot chests,")
+				.append(" entities holding items or named or tamed (item frames, armor stands, chest minecarts, dropped items, pets),")
+				.append(" and the player's position, inventory and ender chest. Use it for questions about their world")
+				.append(" (\"where did I put...\", \"which chest has...\"): Grep it for item names or ids, e.g. \"Diamond\" or")
+				.append(" \"minecraft:diamond\", and give coordinates plus distance and direction from the player.\n");
 		}
 		List<WorldPack> packs = worldPacks;
 		if (!packs.isEmpty()) {

@@ -85,7 +85,33 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				context.getInput().pressKey(KEY_ESCAPE);
 			}
 
-			// 5. Optionally, a question about a data-only mod, which gets decompiled on demand first.
+			// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).
+			if ("1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"))) {
+				var server = singleplayer.getServer();
+				server.runCommand("execute at @p run setblock ~3 ~ ~ minecraft:chest{CustomName:\"Loot\",Items:[{Slot:0b,id:\"minecraft:diamond\",count:64},{Slot:1b,id:\"minecraft:iron_ingot\",count:12}]}");
+				server.runCommand("execute at @p run setblock ~-3 ~ ~ minecraft:barrel{Items:[{Slot:4b,id:\"minecraft:shulker_box\",count:1,components:{\"minecraft:container\":[{slot:0,item:{id:\"minecraft:emerald\",count:32}}]}}]}");
+				server.runCommand("execute at @p run setblock ~ ~ ~4 minecraft:chest{LootTable:\"minecraft:chests/simple_dungeon\"}");
+				server.runCommand("execute at @p run summon minecraft:wolf ~2 ~ ~2 {CustomName:\"Rex\"}");
+				server.runCommand("give @p minecraft:diamond_sword[enchantments={\"minecraft:sharpness\":5,\"minecraft:mending\":1}]");
+				server.runCommand("item replace entity @p enderchest.0 with minecraft:emerald 5");
+				server.runCommand("forceload add 2000 2000");
+				context.waitTicks(20);
+				server.runCommand("setblock 2000 100 2000 minecraft:barrel{Items:[{Slot:0b,id:\"minecraft:netherite_ingot\",count:3}]}");
+				server.runCommand("forceload remove 2000 2000");
+				// save-all is a dedicated-server command; this is what autosave does.
+				server.runOnServer(s -> s.saveEverything(true, true, true));
+				context.waitTicks(40);
+
+				chat(context, "@claude where's the chest with a stack of diamonds, where did I put my netherite, and what's in my ender chest?");
+				context.waitTicks(5);
+				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-world-answer");
+				context.getInput().pressKey(KEY_ESCAPE);
+			}
+
+			// 6. Optionally, a question about a data-only mod, which gets decompiled on demand first.
 			String modQuestion = System.getenv("CLAUDECHAT_MOD_QUESTION");
 			if (modQuestion != null && !modQuestion.isBlank()) {
 				chat(context, "@claude " + modQuestion);
@@ -98,7 +124,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				context.getInput().pressKey(KEY_ESCAPE);
 			}
 
-			// 6. Optionally, a real question. This calls the local claude CLI and uses the signed-in account.
+			// 7. Optionally, a real question. This calls the local claude CLI and uses the signed-in account.
 			if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
 				singleplayer.getServer().runCommand("give @a minecraft:crafter");
 				context.waitTicks(10);
