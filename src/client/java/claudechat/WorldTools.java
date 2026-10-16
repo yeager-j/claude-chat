@@ -8,19 +8,25 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.level.dimension.DimensionType;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.level.levelgen.structure.Structure;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -69,11 +75,17 @@ public final class WorldTools {
 		tools.add(tool("find_structures",
 			"Find structures near the player, nearest first: like /locate, but returns several and can skip ones the player "
 				+ "has already visited. \"Visited\" means players spent over a minute within 128 blocks of the structure "
-				+ "(Minecraft's per-chunk InhabitedTime); never-generated chunks are always unvisited. Positions are x/z only "
-				+ "(like /locate). Structure ids are listed under data/<namespace>/worldgen/structure in the reference files.",
+				+ "(Minecraft's per-chunk InhabitedTime); never-generated chunks are always unvisited. x/z is the /locate "
+				+ "position; each result also has the structure's bounding box and the biomes its pieces occupy (share of "
+				+ "sampled cells), worked out from the seed without generating anything. The biome filter matches a structure "
+				+ "if any of its pieces is in that biome, so a fortress that starts in a crimson forest and reaches into a "
+				+ "warped forest counts as in a warped forest. Structure ids are listed under data/<namespace>/worldgen/structure "
+				+ "in the reference files.",
 			"""
 			{"type": "object", "properties": {
 			  "structure": {"type": "string", "description": "Structure id (\\"minecraft:village_plains\\"), tag (\\"#minecraft:village\\"), or a word matched against tags and ids (\\"village\\", \\"ruined_portal\\")."},
+			  "biome": {"type": "string", "description": "Only structures with a piece in this biome: id (\\"minecraft:warped_forest\\"), tag (\\"#minecraft:is_ocean\\"), or a word (\\"warped\\")."},
+			  "dimension": {"type": "string", "description": "Default: the player's dimension, or where the structure generates if not there (a fortress asked about from the Overworld is searched in the Nether, around the player's position / 8)."},
 			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Default: any."},
 			  "min_distance": {"type": "integer"},
 			  "max_distance": {"type": "integer", "description": "Search radius in blocks (default 8000, max 30000)."},
@@ -97,6 +109,20 @@ public final class WorldTools {
 			  "limit": {"type": "integer", "description": "Max results (default 5, max 30)."}
 			}, "required": ["block"]}
 			"""));
+		tools.add(tool("inspect_location",
+			"What's at a position: the block, its state and data, the biome, and the column's top block. Loaded chunks are "
+				+ "read live and other generated chunks from the last save. Chunks that were never generated are predicted from "
+				+ "the seed without generating them: the biome is exact, but the block is only the base terrain (stone, water, "
+				+ "lava or air, before grass and other surface blocks, caves from carvers, trees, ores and structures). "
+				+ "\"source\" says which applies.",
+			"""
+			{"type": "object", "properties": {
+			  "x": {"type": "integer"},
+			  "y": {"type": "integer", "description": "Omit for the top block of the column (not allowed in the Nether, whose top is the roof)."},
+			  "z": {"type": "integer"},
+			  "dimension": {"type": "string", "description": "Default: the player's dimension."}
+			}, "required": ["x", "z"]}
+			"""));
 		return tools;
 	}
 
@@ -107,6 +133,7 @@ public final class WorldTools {
 			case "get_player" -> getPlayer();
 			case "find_structures" -> findStructures(args);
 			case "find_blocks" -> findBlocks(args);
+			case "inspect_location" -> inspectLocation(args);
 			default -> throw new IllegalArgumentException("Unknown tool: " + name);
 		};
 	}
@@ -255,38 +282,80 @@ public final class WorldTools {
 		if (structures.isEmpty()) {
 			throw new IllegalArgumentException("No structure or structure tag matches \"" + query + "\". Structure ids are under data/<namespace>/worldgen/structure.");
 		}
-		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
-		Predicate<StructureFinder.Found> filter = found -> found.distance() >= minDistance && switch (visited) {
-			case "unvisited" -> found.inhabitedTicks() < StructureFinder.VISITED_TICKS;
-			case "visited" -> found.inhabitedTicks() >= StructureFinder.VISITED_TICKS;
-			default -> true;
-		};
-
-		List<StructureFinder.Found> found = server.submit(() -> {
-			ServerLevel level = server.getAllLevels().iterator().next();
-			for (ServerLevel candidate : server.getAllLevels()) {
-				if (WorldIndex.dimensionName(candidate.dimension()).equals(player.dimension())) {
-					level = candidate;
-				}
+		String biomeQuery = string(args, "biome", "").trim();
+		Set<String> biomes = new HashSet<>();
+		if (!biomeQuery.isEmpty()) {
+			RegistryQuery.resolve(server.registryAccess(), Registries.BIOME, biomeQuery).forEach(b -> biomes.add(RegistryQuery.id(b)));
+			if (biomes.isEmpty()) {
+				throw new IllegalArgumentException("No biome or biome tag matches \"" + biomeQuery + "\". Biome ids are under data/<namespace>/worldgen/biome.");
 			}
-			return StructureFinder.find(level, structures, BlockPos.containing(player.x(), player.y(), player.z()), maxDistance, limit,
-				filter, (cx, cz) -> snapshot.inhabited(player.dimension(), cx, cz));
-		}).get(60, TimeUnit.SECONDS);
+		}
+		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
+		String requestedDimension = string(args, "dimension", "");
+
+		// Footprints are computed on the server thread (in the filter, or afterwards for the results) and cached.
+		Map<StructureFinder.Found, StructureFinder.Footprint> footprints = new HashMap<>();
+		record Search(String dimension, WorldIndex.PlayerInfo origin, List<StructureFinder.Found> found) {
+		}
+		Search search = server.submit(() -> {
+			ServerLevel level = structureLevel(server, structures, requestedDimension, player.dimension());
+			String dimension = WorldIndex.dimensionName(level.dimension());
+			// From another dimension, search around the player's position translated there (x/8 into the Nether).
+			WorldIndex.PlayerInfo origin = player;
+			if (!dimension.equals(player.dimension())) {
+				ServerLevel from = level;
+				for (ServerLevel candidate : server.getAllLevels()) {
+					if (WorldIndex.dimensionName(candidate.dimension()).equals(player.dimension())) {
+						from = candidate;
+					}
+				}
+				double scale = DimensionType.getTeleportationScale(from.dimensionType(), level.dimensionType());
+				origin = new WorldIndex.PlayerInfo(player.name(), dimension, player.x() * scale, player.y(), player.z() * scale, List.of(), List.of());
+			}
+			Predicate<StructureFinder.Found> filter = f -> f.distance() >= minDistance && switch (visited) {
+				case "unvisited" -> f.inhabitedTicks() < StructureFinder.VISITED_TICKS;
+				case "visited" -> f.inhabitedTicks() >= StructureFinder.VISITED_TICKS;
+				default -> true;
+			} && (biomes.isEmpty() || inBiome(footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, k)), biomes));
+			List<StructureFinder.Found> results = StructureFinder.find(level, structures, BlockPos.containing(origin.x(), origin.y(), origin.z()),
+				maxDistance, limit, filter, (cx, cz) -> snapshot.inhabited(dimension, cx, cz));
+			for (StructureFinder.Found f : results) {
+				footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, k));
+			}
+			return new Search(dimension, origin, results);
+		}).get(120, TimeUnit.SECONDS);
+		List<StructureFinder.Found> found = search.found();
+		WorldIndex.PlayerInfo origin = search.origin();
 
 		JsonObject out = new JsonObject();
 		out.add("player", playerPosition(player));
 		out.addProperty("searched", structures.size() == 1 ? structures.getFirst().unwrapKey().map(k -> k.identifier().toString()).orElse(query)
 			: structures.size() + " structure types matching \"" + query + "\"");
+		out.addProperty("dimension", search.dimension());
+		if (origin != player) {
+			out.addProperty("note_on_distances", "Distances and directions are from the player's position translated to "
+				+ search.dimension() + ": " + Math.round(origin.x()) + " ~ " + Math.round(origin.z()) + ".");
+		}
 		JsonArray results = new JsonArray();
 		for (StructureFinder.Found f : found) {
 			JsonObject r = new JsonObject();
 			r.addProperty("structure", f.structure());
 			r.addProperty("x", f.x());
 			r.addProperty("z", f.z());
-			addDirection(r, player, player.dimension(), f.x(), null, f.z());
+			addDirection(r, origin, search.dimension(), f.x(), null, f.z());
 			r.addProperty("generated", f.generated());
 			r.addProperty("time_players_spent_nearby_seconds", Math.max(0, f.inhabitedTicks()) / 20);
 			r.addProperty("visited", f.inhabitedTicks() >= StructureFinder.VISITED_TICKS);
+			StructureFinder.Footprint footprint = footprints.get(f);
+			if (footprint != null) {
+				BoundingBox box = footprint.bounds();
+				r.addProperty("bounds", box.minX() + " " + box.minY() + " " + box.minZ() + " to " + box.maxX() + " " + box.maxY() + " " + box.maxZ());
+				JsonObject shares = new JsonObject();
+				footprint.biomeSamples().entrySet().stream()
+					.sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+					.forEach(e -> shares.addProperty(e.getKey(), Math.max(1, Math.round(100f * e.getValue() / footprint.totalSamples())) + "%"));
+				r.add("biomes", shares);
+			}
 			results.add(r);
 		}
 		out.add("results", results);
@@ -294,6 +363,39 @@ public final class WorldTools {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}
 		return out;
+	}
+
+	/**
+	 * Server thread. The requested dimension; otherwise the player's if the structure can generate there, else the
+	 * first dimension where it can (a fortress asked about from the Overworld is in the Nether).
+	 */
+	private static ServerLevel structureLevel(MinecraftServer server, List<Holder<Structure>> structures, String requested, String playerDimension) {
+		ServerLevel playerLevel = null;
+		ServerLevel otherWhereItGenerates = null;
+		for (ServerLevel level : server.getAllLevels()) {
+			String name = WorldIndex.dimensionName(level.dimension());
+			if (name.equals(requested)) {
+				return level;
+			}
+			boolean generatesHere = structures.stream()
+				.anyMatch(s -> !level.getChunkSource().getGeneratorState().getPlacementsForStructure(s).isEmpty());
+			if (name.equals(playerDimension)) {
+				if (generatesHere) {
+					return level;
+				}
+				playerLevel = level;
+			} else if (generatesHere && otherWhereItGenerates == null) {
+				otherWhereItGenerates = level;
+			}
+		}
+		if (!requested.isEmpty()) {
+			throw new IllegalArgumentException("No dimension \"" + requested + "\".");
+		}
+		return otherWhereItGenerates != null ? otherWhereItGenerates : playerLevel;
+	}
+
+	private static boolean inBiome(StructureFinder.Footprint footprint, Set<String> biomes) {
+		return footprint != null && footprint.biomeSamples().keySet().stream().anyMatch(biomes::contains);
 	}
 
 	// --- blocks ---------------------------------------------------------------------------------------------------
@@ -363,20 +465,30 @@ public final class WorldTools {
 
 	private static JsonObject blockJson(BlockFinder.Found found, String dimension, WorldIndex.PlayerInfo player) {
 		JsonObject r = new JsonObject();
-		r.addProperty("block", found.id());
-		Map<String, String> properties = found.properties();
-		if (!properties.isEmpty()) {
-			JsonObject props = new JsonObject();
-			properties.forEach(props::addProperty);
-			r.add("properties", props);
-		}
+		addBlockState(r, found.state());
 		r.addProperty("dimension", dimension);
 		r.addProperty("x", found.pos().getX());
 		r.addProperty("y", found.pos().getY());
 		r.addProperty("z", found.pos().getZ());
 		addDirection(r, player, dimension, found.pos().getX(), (double) found.pos().getY(), found.pos().getZ());
 		r.addProperty("data", found.live() ? "live" : "last save");
-		CompoundTag blockEntity = found.blockEntity();
+		addBlockEntity(r, found.blockEntity());
+		return r;
+	}
+
+	/** "block": "minecraft:respawn_anchor", "properties": {"charges": "4"}. */
+	private static void addBlockState(JsonObject r, BlockState state) {
+		r.addProperty("block", BlockFinder.id(state));
+		Map<String, String> properties = BlockFinder.properties(state);
+		if (!properties.isEmpty()) {
+			JsonObject props = new JsonObject();
+			properties.forEach(props::addProperty);
+			r.add("properties", props);
+		}
+	}
+
+	/** The block entity's data as trimmed SNBT, plus "spawns" for spawners. */
+	private static void addBlockEntity(JsonObject r, CompoundTag blockEntity) {
 		if (blockEntity != null) {
 			// Spawners and trial spawners keep the mob in SpawnData; say it plainly rather than leave it in the SNBT.
 			blockEntity.getCompound("SpawnData").flatMap(spawn -> spawn.getCompound("entity"))
@@ -391,7 +503,50 @@ public final class WorldTools {
 				r.addProperty("block_entity", snbt.length() > 400 ? snbt.substring(0, 400) + "…" : snbt);
 			}
 		}
-		return r;
+	}
+
+	// --- one position ---------------------------------------------------------------------------------------------
+
+	private JsonElement inspectLocation(JsonObject args) throws Exception {
+		if (args == null || !args.has("x") || !args.has("z")) {
+			throw new IllegalArgumentException("x and z are required");
+		}
+		int x = integer(args, "x", 0);
+		int z = integer(args, "z", 0);
+		Integer y = args.has("y") && !args.get("y").isJsonNull() ? integer(args, "y", 0) : null;
+
+		WorldIndex.Snapshot snapshot = index.snapshot();
+		MinecraftServer server = index.server();
+		if (server == null || snapshot.players().isEmpty()) {
+			throw new IllegalStateException("No player in a single-player world.");
+		}
+		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
+		String dimension = string(args, "dimension", player.dimension());
+		ServerLevel level = null;
+		for (ServerLevel candidate : server.getAllLevels()) {
+			if (WorldIndex.dimensionName(candidate.dimension()).equals(dimension)) {
+				level = candidate;
+			}
+		}
+		if (level == null) {
+			throw new IllegalArgumentException("No dimension \"" + dimension + "\".");
+		}
+
+		LocationInspector.Inspection inspection = LocationInspector.inspect(index, snapshot, level, x, y, z);
+		JsonObject out = new JsonObject();
+		out.addProperty("dimension", dimension);
+		out.addProperty("x", x);
+		out.addProperty("y", inspection.y());
+		out.addProperty("z", z);
+		addDirection(out, player, dimension, x, (double) inspection.y(), z);
+		out.addProperty("source", inspection.source());
+		addBlockState(out, inspection.state());
+		addBlockEntity(out, inspection.blockEntity());
+		out.addProperty("biome", inspection.biome());
+		if (inspection.surfaceY() != null && !level.dimensionType().hasCeiling()) {
+			out.addProperty("top_block_y", inspection.surfaceY());
+		}
+		return out;
 	}
 
 	/** {"charges": "4"}, or the same written as "charges=4,facing=north". */

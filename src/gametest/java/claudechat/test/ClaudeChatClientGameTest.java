@@ -6,8 +6,13 @@ import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.SharedConstants;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.server.packs.PackType;
 import net.minecraft.server.packs.metadata.pack.PackFormat;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
+import net.minecraft.world.level.levelgen.structure.BuiltinStructures;
 import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -132,6 +137,35 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				logTool(context, "find_blocks", "{\"block\": \"respawn anchor\"}");
 				logTool(context, "find_blocks", "{\"block\": \"minecraft:respawn_anchor\", \"properties\": {\"charges\": \"4\"}}");
 				logTool(context, "find_blocks", "{\"block\": \"#minecraft:beds\", \"dimension\": \"the_nether\"}");
+
+				// One position three ways: saved, then predicted from the seed, then generated; the prediction's biome must hold.
+				logTool(context, "inspect_location", "{\"x\": 2000, \"y\": 100, \"z\": 2002}");
+				logTool(context, "inspect_location", "{\"x\": 20000, \"y\": 64, \"z\": 20000, \"dimension\": \"the_nether\"}");
+				JsonObject predicted = logTool(context, "inspect_location", "{\"x\": 20000, \"z\": 20000}");
+				server.runCommand("forceload add 20000 20000");
+				context.waitTicks(40);
+				JsonObject generated = logTool(context, "inspect_location", "{\"x\": 20000, \"z\": 20000}");
+				server.runCommand("forceload remove 20000 20000");
+				check(predicted.get("biome").equals(generated.get("biome")), "predicted biome " + predicted.get("biome") + " but generated " + generated.get("biome"));
+
+				// Fortresses by biome, searched in the Nether from the Overworld. The footprint is built in memory from
+				// the seed; generating the start chunk for real must give the same bounding box.
+				logTool(context, "find_structures", "{\"structure\": \"fortress\", \"limit\": 3}");
+				JsonObject warped = logTool(context, "find_structures", "{\"structure\": \"fortress\", \"biome\": \"warped_forest\", \"limit\": 3}");
+				var fortresses = warped.getAsJsonArray("results");
+				check(!fortresses.isEmpty(), "no fortress reaching into a warped forest");
+				JsonObject fortress = fortresses.get(0).getAsJsonObject();
+				check(fortress.getAsJsonObject("biomes").has("minecraft:warped_forest"), "biome filter let through " + fortress);
+				int fortressX = fortress.get("x").getAsInt();
+				int fortressZ = fortress.get("z").getAsInt();
+				String actualBounds = singleplayer.getServer().computeOnServer(s -> {
+					var start = s.getLevel(Level.NETHER).getChunk(fortressX >> 4, fortressZ >> 4, ChunkStatus.STRUCTURE_STARTS)
+						.getStartForStructure(s.registryAccess().lookupOrThrow(Registries.STRUCTURE).getOrThrow(BuiltinStructures.FORTRESS).value());
+					BoundingBox box = start.getBoundingBox();
+					return box.minX() + " " + box.minY() + " " + box.minZ() + " to " + box.maxX() + " " + box.maxY() + " " + box.maxZ();
+				});
+				LOGGER.info("fortress bounds: tool {}, generated {}", fortress.get("bounds").getAsString(), actualBounds);
+				check(fortress.get("bounds").getAsString().equals(actualBounds), "fortress bounds differ from generation");
 				JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
 
 				// Visit the nearest village for over a minute, come back, and check the visited filter flips.
@@ -147,7 +181,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
 				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
 
-				chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and where's the closest skeleton spawner?");
+				chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and find me a nether fortress in a warped forest");
 				context.waitTicks(5);
 				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
 				context.waitTicks(10);
@@ -201,6 +235,12 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	}
 
 	/** Runs a world tool off the test thread (it waits on the server thread, which the test thread drives) and logs it. */
+	private static void check(boolean condition, String message) {
+		if (!condition) {
+			throw new AssertionError(message);
+		}
+	}
+
 	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {
 		CompletableFuture<JsonElement> result = CompletableFuture.supplyAsync(() -> {
 			try {

@@ -27,7 +27,8 @@ Client-side Fabric mod for **Minecraft 26.3**.
   - **Find items:** "Where are my diamonds?" searches every chest, barrel and shulker box, including what's inside shulker boxes in chests, plus your inventory and ender chest.
   - **Find mobs and things:** "Where's Rex?" finds pets, named mobs, item frames and dropped items.
   - **Find blocks:** "Where did I put my respawn anchor?" or "Find the closest skeleton spawner" searches placed blocks, including their state (anchor charges, which way a block faces) and data (what a spawner spawns, sign text).
-  - **Find structures:** "Where's the nearest village I haven't explored?" finds structures like `/locate` does, but returns several and can skip the ones you've already been to.
+  - **Find structures:** "Where's the nearest village I haven't explored?" finds structures like `/locate` does, but returns several and can skip the ones you've already been to. "Find me a nether fortress in a warped forest" checks which biomes each structure's pieces reach into, worked out from the seed, so nothing gets generated.
+  - **Inspect a spot:** "What biome is 1200 64 -300?" reads the block and biome there, or predicts them from the seed if you haven't been there yet.
   - **Exact directions:** distances and directions are calculated for you, e.g. "2,832 blocks south-east, 160 up".
 - **Rich chat.**
   - Item icons with real tooltips, and recipe grids drawn from the game's data.
@@ -104,6 +105,7 @@ All of these tab-complete.
 - **Timing:**
   - **Saved vs. live:** chunks near you are read live. Everything else comes from the last save, which can be up to 5 minutes behind.
   - **Visited:** a structure counts as visited after about a minute within 128 blocks of it.
+- **Predictions:** for places you've never been, biomes and structure layouts come from the seed and are exact, but blocks are only the base terrain (stone, water, air), without grass, caves cut by carvers, trees or ores. Worlds started in an older Minecraft version keep their old terrain and biomes where already generated.
 - **Speed:** answers take a few seconds for simple questions and longer for deep ones, and each question starts a fresh `claude` process. `/claude model haiku` is faster but makes more mistakes.
 
 ## License

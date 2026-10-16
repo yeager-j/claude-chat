@@ -68,8 +68,9 @@ public class ClaudeCli {
 		The player's own world (single-player) is available through the mcp__minecraft__* tools: search_containers
 		("where are my diamonds?", "which chest has..."), search_entities (pets, named mobs, item frames, dropped items),
 		get_player (inventory, ender chest, position), find_blocks (nearest placed blocks: spawners, beds, respawn anchors,
-		portals, with block state and block entity filters) and find_structures (nearest structures, optionally only ones the
-		player hasn't visited yet). They return exact distances and compass directions; report those instead of working
+		portals, with block state and block entity filters), find_structures (nearest structures, optionally only ones the
+		player hasn't visited yet or ones reaching into a biome) and inspect_location (block and biome at a position, predicted
+		from the seed where nothing is generated yet). They return exact distances and compass directions; report those instead of working
 		them out yourself. Show coordinates as `x y z` (or `x ~ z` for structures).
 		""";
 	private static final String NO_WORLD_TOOLS_PROMPT = """

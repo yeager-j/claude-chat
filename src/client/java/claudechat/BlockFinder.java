@@ -2,17 +2,13 @@ package claudechat;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
-import net.minecraft.core.HolderLookup;
 import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtOps;
-import net.minecraft.resources.Identifier;
-import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.state.BlockState;
@@ -67,52 +63,33 @@ public final class BlockFinder {
 
 	public record Found(BlockPos pos, BlockState state, CompoundTag blockEntity, boolean live, double distance) {
 		public String id() {
-			return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+			return BlockFinder.id(state);
 		}
 
-		/** Every state property, e.g. {"charges": "4"}. */
 		public Map<String, String> properties() {
-			Map<String, String> out = new LinkedHashMap<>();
-			for (Property<?> property : state.getProperties()) {
-				out.put(property.getName(), valueName(state, property));
-			}
-			return out;
+			return BlockFinder.properties(state);
 		}
 	}
 
 	public record Result(List<Found> found, int savedChunksRead, boolean truncated) {
 	}
 
-	/**
-	 * Blocks matching a query: an id ("minecraft:spawner"), a tag ("#minecraft:beds"), or a word tried as a tag (also
-	 * plural), then an id, then a substring of ids ("anchor" → respawn_anchor).
-	 */
+	/** Blocks matching a query: an id, a tag, or a word ("anchor" → respawn_anchor); see {@link RegistryQuery#resolve}. */
 	public static List<Block> resolve(RegistryAccess access, String query) {
-		HolderLookup.RegistryLookup<Block> registry = access.lookupOrThrow(Registries.BLOCK);
-		String q = query.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
-		if (q.startsWith("#")) {
-			Identifier id = Identifier.tryParse(q.substring(1));
-			return id == null ? List.of() : registry.get(TagKey.create(Registries.BLOCK, id))
-				.map(set -> set.stream().map(Holder::value).toList()).orElse(List.of());
+		return RegistryQuery.resolve(access, Registries.BLOCK, query).stream().map(Holder::value).toList();
+	}
+
+	public static String id(BlockState state) {
+		return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
+	}
+
+	/** Every state property, e.g. {"charges": "4"}. */
+	public static Map<String, String> properties(BlockState state) {
+		Map<String, String> out = new LinkedHashMap<>();
+		for (Property<?> property : state.getProperties()) {
+			out.put(property.getName(), valueName(state, property));
 		}
-		Identifier asId = q.contains(":") ? Identifier.tryParse(q) : Identifier.withDefaultNamespace(q);
-		if (asId == null) {
-			return List.of();
-		}
-		var exact = registry.get(ResourceKey.create(Registries.BLOCK, asId));
-		if (exact.isPresent()) {
-			return List.of(exact.get().value());
-		}
-		for (Identifier tagId : List.of(asId, asId.withSuffix("s"))) {
-			var tag = registry.get(TagKey.create(Registries.BLOCK, tagId));
-			if (tag.isPresent() && tag.get().size() > 0) {
-				return tag.get().stream().map(Holder::value).toList();
-			}
-		}
-		if (q.contains(":")) {
-			return List.of();
-		}
-		return registry.listElements().filter(h -> h.key().identifier().getPath().contains(q)).map(Holder::value).toList();
+		return out;
 	}
 
 	/**
