@@ -19,6 +19,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_LIVE_TEST=1` | Real `@claude` questions (uses the user's Claude subscription) |
 | `CLAUDECHAT_MOD_QUESTION="..."` | Ask about a mod (on-demand decompile) |
 | `CLAUDECHAT_PACK_TEST=1` | Writes a folder and a zip data pack, runs `/reload`, asks about them |
+| `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), visits a village for 100 s, asks Claude |
 
 - **Test with real mods:** `-PextraMods="<folder of jars>"`. The user's mods are in `%APPDATA%\ModrinthApp\profiles\Fabric 26.3\mods`.
@@ -41,7 +42,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `BiomeFinder` | Multi-result `/locate biome` from the seed, off the server thread |
 | `LocationInspector` | Block and biome at a position: live, from the save, or predicted from the seed (base terrain only) |
 | `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
-| `WorldTools`, `McpServer` | The seven world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
+| `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
+| `WorldTools`, `McpServer` | The nine world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
 
 ## Conventions
 
@@ -64,6 +66,7 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 - **Stale build after moving the project:** Gradle's configuration cache stores absolute paths. After moving the folder, the build "succeeds" with old classes. Delete `.gradle\` and `build\`.
 - **Test source set config order:** `fabricApi { configureTests { … } }` must come *after* `loom { splitEnvironmentSourceSets() }`, or Gradle fails with "value … is final".
 - **Test client's mods folder:** `runClientGameTest` empties `build/run/clientGameTest/mods` on every run, which is why `-PextraMods` passes jars via `-Dfabric.addMods`.
+- **Installed copy of this mod:** the user's mods folder has a released `claudechat-*.jar`. Loaded via `-PextraMods`, it silently replaced the code under test, so `build.gradle` skips it.
 - **BOM breaks javac:** PowerShell 5.1's `Set-Content -Encoding utf8` writes a BOM, and javac then fails with "illegal character '\ufeff'". Edit Java files with the editor tools, or write with `UTF8Encoding($false)`.
 
 **Client game tests**

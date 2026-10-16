@@ -193,14 +193,19 @@ public class ClaudeChatClient implements ClientModInitializer {
 		// Single-player worlds: read the world's enabled data packs when it opens and after /reload.
 		// (On a multiplayer server its data packs live on the server and can't be read.)
 		ServerLifecycleEvents.SERVER_STARTED.register(ClaudeChatClient::updateWorldPacks);
-		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resources, success) -> updateWorldPacks(server));
+		ServerLifecycleEvents.END_DATA_PACK_RELOAD.register((server, resources, success) -> {
+			updateWorldPacks(server);
+			worldTools.prepareTemplates(server);
+		});
 		// ...and serve the world tools (containers, entities, player, structures) to Claude over MCP.
 		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
 			worldIndex.start(server);
+			worldTools.prepareTemplates(server);
 			mcp.start();
 		});
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
 			knowledge.clearWorldPacks();
+			worldTools.clearTemplates();
 			mcp.stop();
 			worldIndex.stop();
 		});

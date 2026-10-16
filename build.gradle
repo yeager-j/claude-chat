@@ -41,10 +41,11 @@ fabricApi {
 
 // Test against real mods: ./gradlew runClientGameTest -PextraMods=<folder of mod jars>
 // (the run's own mods/ folder is cleared each time, so the jars are passed to Fabric Loader instead).
+// An installed copy of this mod is skipped, or the loader would run it instead of the code being tested.
 tasks.named("runClientGameTest") {
 	def extraMods = providers.gradleProperty("extraMods")
 	if (extraMods.isPresent()) {
-		def jars = fileTree(extraMods.get()) { include "*.jar"; exclude "fabric-api-*.jar" }.files
+		def jars = fileTree(extraMods.get()) { include "*.jar"; exclude "fabric-api-*.jar", "claudechat-*.jar" }.files
 		jvmArgs("-Dfabric.addMods=" + jars.join(File.pathSeparator))
 	}
 }

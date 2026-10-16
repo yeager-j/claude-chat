@@ -46,10 +46,13 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	public void runTest(ClientGameTestContext context) {
 		// Recipe grids read the decompiled data, so wait for the first knowledge base build.
 		context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 600 * SECONDS);
+		LOGGER.info("optional steps: {}", System.getenv().keySet().stream().filter(k -> k.startsWith("CLAUDECHAT_")).sorted().toList());
 
 		boolean worldTest = "1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"));
+		boolean templateTest = "1".equals(System.getenv("CLAUDECHAT_TEMPLATE_TEST"));
 		var builder = context.worldBuilder();
-		if (worldTest) {
+		// Template questions lead Claude to look for the structure too, so give it a world that has them.
+		if (worldTest || templateTest) {
 			// The default test world is superflat with structures off; structure finding needs a normal world.
 			builder.adjustSettings(settings -> {
 				settings.setWorldType(settings.getNormalPresetList().getFirst());
@@ -103,6 +106,42 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				openChat(context);
 				context.takeScreenshot("claudechat-datapack-answer");
 				context.getInput().pressKey(KEY_ESCAPE);
+			}
+
+			// 4b. Optionally, structure templates: search by blocks, trace to structures through pools, draw layers.
+			if (templateTest) {
+				// The index is built in the background when the world opens; the first search waits for it if needed.
+				logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"limit\": 5}");
+				JsonObject trial = logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"query\": \"trial_chambers\", \"limit\": 3}");
+				check(trial.get("templates_indexed").getAsInt() > 500, "too few templates indexed");
+				check(trial.getAsJsonArray("results").get(0).getAsJsonObject().getAsJsonArray("used_by_structures")
+					.toString().contains("minecraft:trial_chambers"), "trial spawner template not traced to trial chambers");
+				JsonObject city = logTool(context, "search_structure_templates", "{\"blocks\": [\"sculk shrieker\", \"reinforced_deepslate\", \"soul lantern\"], \"limit\": 3}");
+				check(city.getAsJsonArray("results").toString().contains("minecraft:ancient_city/"),
+					"sculk shrieker search didn't find an ancient city piece");
+				logTool(context, "search_structure_templates", "{\"blocks\": [\"mossy_stone_bricks\", \"spawner\"], \"limit\": 5}");
+				logTool(context, "search_structure_templates", "{\"blocks\": [\"barrel\", \"brewing_stand\"], \"limit\": 5}");
+				JsonObject house = logTool(context, "inspect_structure_template",
+					"{\"template\": \"minecraft:village/plains/houses/plains_small_house_1\", \"layers\": true}");
+				check(house.getAsJsonArray("used_by_structures").toString().contains("minecraft:village_plains"), "house not traced to plains villages");
+				check(house.getAsJsonArray("layers").size() > 3, "house layers missing");
+				logTool(context, "inspect_structure_template", "{\"template\": \"minecraft:igloo/bottom\"}");
+				try {
+					logTool(context, "inspect_structure_template", "{\"template\": \"plains_small_house\"}");
+					check(false, "a partial template id should fail");
+				} catch (RuntimeException e) {
+					LOGGER.info("tool inspect_structure_template partial id -> {}", e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+				}
+				String question = System.getenv("CLAUDECHAT_TEMPLATE_QUESTION");
+				if (question != null && !question.isBlank()) {
+					chat(context, "@claude " + question);
+					context.waitTicks(5);
+					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+					context.waitTicks(10);
+					openChat(context);
+					context.takeScreenshot("claudechat-template-answer");
+					context.getInput().pressKey(KEY_ESCAPE);
+				}
 			}
 
 			// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).

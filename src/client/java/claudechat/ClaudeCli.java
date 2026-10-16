@@ -73,6 +73,9 @@ public class ClaudeCli {
 		inspect_location (block and biome at a position, predicted from the seed where nothing is generated yet). They
 		return exact distances and compass directions; report those instead of working them out yourself. Show
 		coordinates as `x y z` (or `x ~ z` for structures and biomes).
+		Structure template files (data/*/structure/*.nbt) are gzipped NBT, so Read can't open them. To identify a
+		structure the player describes by its blocks or shape, use search_structure_templates with those blocks; use
+		inspect_structure_template for one template's blocks, chests, spawners and layer-by-layer shape.
 		""";
 	private static final String NO_WORLD_TOOLS_PROMPT = """
 

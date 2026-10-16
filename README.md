@@ -30,6 +30,7 @@ Client-side Fabric mod for **Minecraft 26.3**.
   - **Find structures:** "Where's the nearest village I haven't explored?" finds structures like `/locate` does, but returns several and can skip the ones you've already been to. "Find me a nether fortress in a warped forest" checks which biomes each structure's pieces reach into, worked out from the seed, so nothing gets generated. Add "at least 75% warped forest" to skip ones that only touch it.
   - **Find biomes:** "Where's the nearest cherry grove?" works like `/locate biome`, but lists several separate patches and can skip places you've been.
   - **Inspect a spot:** "What biome is 1200 64 -300?" reads the block and biome there, or predicts them from the seed if you haven't been there yet.
+  - **Identify structures:** "What's this little mossy stone brick tower with a spawner?" searches the structure template files (from Minecraft, your mods and data packs) by the blocks they contain, and says which structure uses them. Claude can also see a template's chests, spawners and layer-by-layer shape.
   - **Exact directions:** distances and directions are calculated for you, e.g. "2,832 blocks south-east, 160 up".
 - **Rich chat.**
   - Item icons with real tooltips, and recipe grids drawn from the game's data.

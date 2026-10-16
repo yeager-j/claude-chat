@@ -11,6 +11,9 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.core.SectionPos;
+import net.minecraft.core.Vec3i;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
@@ -39,6 +42,7 @@ import java.util.stream.Collectors;
  */
 public final class WorldTools {
 	private final WorldIndex index;
+	private final StructureTemplates templates = new StructureTemplates();
 
 	public WorldTools(WorldIndex index) {
 		this.index = index;
@@ -143,6 +147,40 @@ public final class WorldTools {
 			  "dimension": {"type": "string", "description": "Default: the player's dimension."}
 			}, "required": ["x", "z"]}
 			"""));
+		tools.add(tool("search_structure_templates",
+			"Search structure templates, the .nbt building blocks that structures are made of (a village house, an ancient "
+				+ "city room, a modded tower), by the blocks they contain. Use it to identify a structure the player describes "
+				+ "(\"a small tower of mossy stone bricks with a spawner\"): pass the blocks they mention. Templates containing "
+				+ "the most of the requested blocks come first, then those with many of them that also make up much of the build. "
+				+ "Big buildings are often split into several templates (a main building plus add-ons), so look past small "
+				+ "pieces. Covers Minecraft, mods, the "
+				+ "world's data packs and templates saved in the world with a structure block. Each result says which structures "
+				+ "can place it (traced through template pools; structures that place templates from code, like igloos or many "
+				+ "mods' own structures, aren't traced, so that list can be empty). Template files are gzipped NBT and can't be "
+				+ "read with Read; use inspect_structure_template for one template's details.",
+			"""
+			{"type": "object", "properties": {
+			  "blocks": {"type": "array", "items": {"type": "string"}, "description": "Blocks the template should contain: ids (\\"minecraft:mossy_stone_bricks\\"), tags (\\"#minecraft:logs\\") or words (\\"spawner\\", \\"lantern\\")."},
+			  "query": {"type": "string", "description": "Only templates whose id, or the id of a structure using them, contains this text, e.g. a mod namespace (\\"dungeons_arise\\") or \\"village\\"."},
+			  "max_size": {"type": "integer", "description": "Only templates no larger than this many blocks along any side."},
+			  "limit": {"type": "integer", "description": "Max results (default 10, max 30)."}
+			}}
+			"""));
+		tools.add(tool("inspect_structure_template",
+			"One structure template in detail: size, every block with its count, chests (with loot tables), spawners and "
+				+ "other block entities, entities, jigsaw connectors (which pools it attaches to), and the structures that can "
+				+ "place it. With layers, also draws it as text, one horizontal slice per y level: rows run north to south, "
+				+ "columns west to east, '.' is air, ' ' is empty (keeps whatever was there), and a legend maps the other "
+				+ "characters to blocks. Blocks shown are before processors run, so a structure may swap some in the world "
+				+ "(cracked or mossy variants, random ores, decay).",
+			"""
+			{"type": "object", "properties": {
+			  "template": {"type": "string", "description": "Template id, e.g. \\"minecraft:village/plains/houses/plains_small_house_1\\" (the path under data/<namespace>/structure/, without .nbt)."},
+			  "layers": {"type": "boolean", "description": "Also draw it layer by layer (default false)."},
+			  "y_from": {"type": "integer", "description": "With layers: lowest y to draw, 0 = bottom of the template."},
+			  "y_to": {"type": "integer", "description": "With layers: highest y to draw."}
+			}, "required": ["template"]}
+			"""));
 		return tools;
 	}
 
@@ -155,6 +193,8 @@ public final class WorldTools {
 			case "find_blocks" -> findBlocks(args);
 			case "inspect_location" -> inspectLocation(args);
 			case "find_biomes" -> findBiomes(args);
+			case "search_structure_templates" -> searchTemplates(args);
+			case "inspect_structure_template" -> inspectTemplate(args);
 			default -> throw new IllegalArgumentException("Unknown tool: " + name);
 		};
 	}
@@ -723,6 +763,326 @@ public final class WorldTools {
 	@SuppressWarnings("unchecked")
 	private static <T extends Comparable<T>> String valueName(Property<T> property, Object value) {
 		return property.getName((T) value);
+	}
+
+	// --- structure templates --------------------------------------------------------------------------------------
+
+	/** Characters for the layer drawing, most common block first; '.' (air), ' ' (empty) and '?' (other) are reserved. */
+	private static final String LAYER_SYMBOLS = "#ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@$%&*+=!~^<>/|:;";
+	/** About 10k tokens of drawing. */
+	private static final int MAX_LAYER_CELLS = 40_000;
+	private static final int MIN_BUILDING_BLOCKS = 8;
+
+	/** Index the world's structure templates in the background (world opened, or /reload). */
+	public void prepareTemplates(MinecraftServer server) {
+		templates.prepare(server);
+	}
+
+	public void clearTemplates() {
+		templates.clear();
+	}
+
+	private JsonElement searchTemplates(JsonObject args) throws Exception {
+		MinecraftServer server = index.server();
+		if (server == null) {
+			throw new IllegalStateException("No single-player world open.");
+		}
+		List<String> terms = new ArrayList<>();
+		if (args != null && args.has("blocks")) {
+			JsonElement element = args.get("blocks");
+			if (element.isJsonArray()) {
+				element.getAsJsonArray().forEach(e -> terms.add(e.getAsString().trim()));
+			} else if (element.isJsonPrimitive()) {
+				terms.addAll(List.of(element.getAsString().split(",")));
+			}
+			terms.replaceAll(String::trim);
+			terms.removeIf(String::isEmpty);
+		}
+		String query = string(args, "query", "").trim().toLowerCase(Locale.ROOT);
+		int maxSize = integer(args, "max_size", Integer.MAX_VALUE);
+		int limit = Math.max(1, Math.min(30, integer(args, "limit", 10)));
+		if (terms.isEmpty() && query.isEmpty()) {
+			throw new IllegalArgumentException("Give blocks, a query, or both.");
+		}
+		Map<String, Set<Block>> wanted = new LinkedHashMap<>();
+		for (String term : terms) {
+			List<Block> blocks = BlockFinder.resolve(server.registryAccess(), term);
+			if (blocks.isEmpty()) {
+				throw new IllegalArgumentException("No block or block tag matches \"" + term + "\".");
+			}
+			wanted.put(term, new HashSet<>(blocks));
+		}
+		Set<Block> anyWanted = new HashSet<>();
+		wanted.values().forEach(anyWanted::addAll);
+
+		StructureTemplates.Index templateIndex = templates.index(server);
+		/** score: matching blocks × their share, so both many matches and a build mostly made of them rank high. */
+		record Hit(StructureTemplates.Summary template, Map<String, Integer> perTerm, int termsMatched, double share, double score) {
+		}
+		List<Hit> hits = new ArrayList<>();
+		for (StructureTemplates.Summary t : templateIndex.templates()) {
+			Vec3i size = t.size();
+			if (Math.max(size.getX(), Math.max(size.getY(), size.getZ())) > maxSize) {
+				continue;
+			}
+			Set<Identifier> structures = templateIndex.structures().getOrDefault(t.id(), Set.of());
+			if (!query.isEmpty() && !t.id().toString().contains(query) && structures.stream().noneMatch(s -> s.toString().contains(query))) {
+				continue;
+			}
+			Map<String, Integer> perTerm = new LinkedHashMap<>();
+			int termsMatched = 0;
+			for (Map.Entry<String, Set<Block>> term : wanted.entrySet()) {
+				int count = term.getValue().stream().mapToInt(b -> t.blockCounts().getOrDefault(b, 0)).sum();
+				perTerm.put(term.getKey(), count);
+				termsMatched += count > 0 ? 1 : 0;
+			}
+			if (!wanted.isEmpty() && termsMatched == 0) {
+				continue;
+			}
+			int matchingBlocks = anyWanted.stream().mapToInt(b -> t.blockCounts().getOrDefault(b, 0)).sum();
+			double share = t.solidBlocks() == 0 ? 0 : (double) matchingBlocks / t.solidBlocks();
+			hits.add(new Hit(t, perTerm, termsMatched, share, matchingBlocks * share));
+		}
+		// Tiny pieces (a lone spawner on a jigsaw) match a single block perfectly but rarely identify anything; rank them after real buildings.
+		hits.sort(Comparator.comparingInt(Hit::termsMatched).reversed()
+			.thenComparing(h -> h.template().solidBlocks() < MIN_BUILDING_BLOCKS)
+			.thenComparing(Comparator.comparingDouble(Hit::score).reversed())
+			.thenComparing(h -> h.template().id().toString()));
+
+		JsonObject out = new JsonObject();
+		JsonObject searched = new JsonObject();
+		wanted.forEach((term, blocks) -> searched.addProperty(term, blocks.size() == 1
+			? StructureTemplates.id(blocks.iterator().next()) : blocks.size() + " blocks"));
+		if (!wanted.isEmpty()) {
+			out.add("searched_blocks", searched);
+		}
+		out.addProperty("templates_indexed", templateIndex.templates().size());
+		out.addProperty("total_found", hits.size());
+		if (!hits.isEmpty() && wanted.size() > 1 && hits.getFirst().termsMatched() < wanted.size()) {
+			out.addProperty("note", "No template has all of these blocks; these have the most.");
+		}
+		JsonArray results = new JsonArray();
+		for (Hit hit : hits.subList(0, Math.min(limit, hits.size()))) {
+			StructureTemplates.Summary t = hit.template();
+			JsonObject r = new JsonObject();
+			r.addProperty("template", t.id().toString());
+			r.addProperty("from", t.pack());
+			r.addProperty("size", sizeText(t.size()));
+			r.addProperty("solid_blocks", t.solidBlocks());
+			if (!wanted.isEmpty()) {
+				JsonObject matching = new JsonObject();
+				hit.perTerm().forEach(matching::addProperty);
+				r.add("requested_blocks", matching);
+				r.addProperty("share_of_requested_blocks", Math.round(100 * hit.share()) + "%");
+			}
+			JsonArray main = new JsonArray();
+			t.blockCounts().entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).limit(6)
+				.forEach(e -> main.add(StructureTemplates.id(e.getKey()) + " ×" + e.getValue()));
+			r.add("main_blocks", main);
+			if (!t.entityCounts().isEmpty()) {
+				JsonObject entities = new JsonObject();
+				t.entityCounts().forEach(entities::addProperty);
+				r.add("entities", entities);
+			}
+			addTemplateUsage(r, templateIndex, t.id(), 6);
+			results.add(r);
+		}
+		out.add("results", results);
+		if (hits.size() > limit) {
+			out.addProperty("more", (hits.size() - limit) + " more not shown; add blocks, a query or max_size to narrow it.");
+		}
+		return out;
+	}
+
+	private JsonElement inspectTemplate(JsonObject args) throws Exception {
+		MinecraftServer server = index.server();
+		if (server == null) {
+			throw new IllegalStateException("No single-player world open.");
+		}
+		String name = string(args, "template", "").trim().replaceFirst("\\.nbt$", "");
+		Identifier id = Identifier.tryParse(name);
+		if (id == null) {
+			throw new IllegalArgumentException("\"" + name + "\" isn't a valid template id.");
+		}
+		StructureTemplates.Index templateIndex = templates.index(server);
+		StructureTemplates.Template t = StructureTemplates.load(server, id).orElse(null);
+		if (t == null) {
+			String last = id.getPath().substring(id.getPath().lastIndexOf('/') + 1);
+			List<String> similar = templateIndex.templates().stream().map(s -> s.id().toString())
+				.filter(s -> s.contains(last)).limit(10).toList();
+			throw new IllegalArgumentException("No structure template " + id + "."
+				+ (similar.isEmpty() ? " Use search_structure_templates to find one." : " Similar: " + String.join(", ", similar)));
+		}
+
+		JsonObject out = new JsonObject();
+		out.addProperty("template", id.toString());
+		out.addProperty("from", t.pack());
+		out.addProperty("size", sizeText(t.size()));
+		if (t.palettes() > 1) {
+			out.addProperty("palettes", t.palettes() + " block variants, one picked at random when placed; showing the first");
+		}
+		Map<Block, Integer> counts = new HashMap<>();
+		t.blocks().stream().filter(b -> !b.state().isAir() && !b.state().is(Blocks.JIGSAW)).forEach(b -> counts.merge(b.state().getBlock(), 1, Integer::sum));
+		out.addProperty("solid_blocks", counts.values().stream().mapToInt(Integer::intValue).sum());
+		JsonObject blocks = new JsonObject();
+		counts.entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).limit(100)
+			.forEach(e -> blocks.addProperty(StructureTemplates.id(e.getKey()), e.getValue()));
+		out.add("blocks", blocks);
+
+		JsonArray blockEntities = new JsonArray();
+		JsonArray jigsaws = new JsonArray();
+		int moreBlockEntities = 0;
+		for (StructureTemplates.BlockInfo b : t.blocks()) {
+			if (b.nbt() == null) {
+				continue;
+			}
+			JsonObject r = new JsonObject();
+			if (b.state().is(Blocks.JIGSAW)) {
+				r.addProperty("pos", posText(b.pos()));
+				String facing = BlockFinder.properties(b.state()).get("orientation");
+				if (facing != null) {
+					r.addProperty("facing", facing);
+				}
+				for (String key : List.of("pool", "name", "target", "final_state")) {
+					String value = b.nbt().getStringOr(key, "");
+					if (!value.isEmpty() && !value.equals("minecraft:empty")) {
+						r.addProperty(key.equals("final_state") ? "turns_into" : key, value);
+					}
+				}
+				if (jigsaws.size() < 40) {
+					jigsaws.add(r);
+				}
+				continue;
+			}
+			if (blockEntities.size() >= 40) {
+				moreBlockEntities++;
+				continue;
+			}
+			addBlockState(r, b.state());
+			r.addProperty("pos", posText(b.pos()));
+			b.nbt().getString("LootTable").ifPresent(loot -> r.addProperty("loot_table", loot));
+			CompoundTag rest = b.nbt().copy();
+			rest.remove("LootTable");
+			addBlockEntity(r, rest);
+			blockEntities.add(r);
+		}
+		if (!blockEntities.isEmpty()) {
+			out.add("block_entities", blockEntities);
+			if (moreBlockEntities > 0) {
+				out.addProperty("more_block_entities", moreBlockEntities);
+			}
+		}
+		if (!t.entities().isEmpty()) {
+			JsonArray entities = new JsonArray();
+			t.entities().stream().limit(30).forEach(e -> entities.add(e.type() + " at " + posText(e.pos())));
+			out.add("entities", entities);
+		}
+		if (!jigsaws.isEmpty()) {
+			out.add("jigsaw_connectors", jigsaws);
+		}
+		addTemplateUsage(out, templateIndex, id, 20);
+		if (args != null && args.has("layers") && args.get("layers").getAsBoolean()) {
+			addLayers(out, t, args);
+		}
+		return out;
+	}
+
+	/** "used_by_structures" (traced through pools) and "in_pools". */
+	private static void addTemplateUsage(JsonObject r, StructureTemplates.Index index, Identifier id, int max) {
+		Set<Identifier> structures = index.structures().getOrDefault(id, Set.of());
+		Set<Identifier> pools = index.pools().getOrDefault(id, Set.of());
+		if (!structures.isEmpty()) {
+			r.add("used_by_structures", idList(structures, max));
+		}
+		if (!pools.isEmpty()) {
+			r.add("in_pools", idList(pools, max));
+		}
+		if (structures.isEmpty() && pools.isEmpty()) {
+			r.addProperty("used_by_structures", "not in any template pool; probably placed by code (grep the namespace's src for the template path)");
+		}
+	}
+
+	private static JsonArray idList(Set<Identifier> ids, int max) {
+		JsonArray array = new JsonArray();
+		ids.stream().limit(max).forEach(i -> array.add(i.toString()));
+		if (ids.size() > max) {
+			array.add("and " + (ids.size() - max) + " more");
+		}
+		return array;
+	}
+
+	/** One text grid per y level, plus the legend. Skipped with a note if it would be too long. */
+	private static void addLayers(JsonObject out, StructureTemplates.Template t, JsonObject args) {
+		int sx = t.size().getX();
+		int sy = t.size().getY();
+		int sz = t.size().getZ();
+		if (sx <= 0 || sy <= 0 || sz <= 0) {
+			return;
+		}
+		int yFrom = Math.max(0, Math.min(sy - 1, integer(args, "y_from", 0)));
+		int yTo = Math.max(yFrom, Math.min(sy - 1, integer(args, "y_to", sy - 1)));
+		long perLayer = (long) sx * sz;
+		if (perLayer * (yTo - yFrom + 1) > MAX_LAYER_CELLS) {
+			long fits = MAX_LAYER_CELLS / perLayer;
+			out.addProperty("layers", fits == 0
+				? "Too wide to draw (" + sx + "×" + sz + " per layer)."
+				: "Too large to draw all at once; ask for at most " + fits + " layers with y_from/y_to (0 to " + (sy - 1) + ").");
+			return;
+		}
+		BlockState[] cells = new BlockState[(int) perLayer * (yTo - yFrom + 1)];
+		Map<Block, Integer> counts = new HashMap<>();
+		for (StructureTemplates.BlockInfo b : t.blocks()) {
+			BlockPos p = b.pos();
+			if (p.getY() < yFrom || p.getY() > yTo || p.getX() < 0 || p.getX() >= sx || p.getZ() < 0 || p.getZ() >= sz) {
+				continue;
+			}
+			cells[(p.getY() - yFrom) * (int) perLayer + p.getZ() * sx + p.getX()] = b.state();
+			if (!b.state().isAir()) {
+				counts.merge(b.state().getBlock(), 1, Integer::sum);
+			}
+		}
+		Map<Block, Character> symbols = new HashMap<>();
+		JsonObject legend = new JsonObject();
+		legend.addProperty(".", "air");
+		legend.addProperty(" ", "nothing (keeps the world's block)");
+		List<Block> byCount = counts.entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).map(Map.Entry::getKey).toList();
+		for (int i = 0; i < byCount.size(); i++) {
+			char c = i < LAYER_SYMBOLS.length() ? LAYER_SYMBOLS.charAt(i) : '?';
+			symbols.put(byCount.get(i), c);
+			if (c != '?') {
+				legend.addProperty(String.valueOf(c), StructureTemplates.id(byCount.get(i)));
+			}
+		}
+		if (byCount.size() > LAYER_SYMBOLS.length()) {
+			legend.addProperty("?", (byCount.size() - LAYER_SYMBOLS.length()) + " rarer blocks");
+		}
+		JsonArray layers = new JsonArray();
+		for (int y = yFrom; y <= yTo; y++) {
+			JsonArray rows = new JsonArray();
+			for (int z = 0; z < sz; z++) {
+				StringBuilder row = new StringBuilder(sx);
+				for (int x = 0; x < sx; x++) {
+					BlockState state = cells[(y - yFrom) * (int) perLayer + z * sx + x];
+					row.append(state == null ? ' ' : state.isAir() ? '.' : symbols.get(state.getBlock()));
+				}
+				rows.add(row.toString());
+			}
+			JsonObject layer = new JsonObject();
+			layer.addProperty("y", y);
+			layer.add("rows_north_to_south", rows);
+			layers.add(layer);
+		}
+		out.add("legend", legend);
+		out.add("layers", layers);
+	}
+
+	/** "9 wide (x) × 7 tall (y) × 11 deep (z)". */
+	private static String sizeText(Vec3i size) {
+		return size.getX() + " wide (x) × " + size.getY() + " tall (y) × " + size.getZ() + " deep (z)";
+	}
+
+	private static String posText(BlockPos pos) {
+		return pos.getX() + " " + pos.getY() + " " + pos.getZ();
 	}
 
 	// --- helpers --------------------------------------------------------------------------------------------------
