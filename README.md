@@ -36,6 +36,7 @@ Client-side Fabric mod for **Minecraft 26.3**.
 - **Rich chat.**
   - Item icons with real tooltips, and recipe grids drawn from the game's data.
   - Your actual key bindings ("press [Right Button]"), and commands you can click to put in the chat box.
+  - **Waypoints** (with Xaero's Minimap): "Find me the nearest end city I haven't visited and add a waypoint" puts a **[+ Waypoint]** button next to the coordinates. Click it, and Xaero's Add Waypoint screen opens, already filled in for the right dimension; press Confirm. The waypoint shows on Xaero's World Map too.
   - Bold, italics, lists and links.
 - **Live progress.** A status line appears as soon as you ask ("Thinking… 3s", "Checking the spawner code… 14s") and is replaced by the answer.
 
@@ -95,7 +96,7 @@ All of these tab-complete.
 
 ## Privacy and safety
 
-- **Read-only.** Claude can read the reference files, search the web, and use the world tools. It can't edit files, run commands, or change your world.
+- **Read-only.** Claude can read the reference files, search the web, and use the world tools. It can't edit files, run commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it.
 - **Local only.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
   - The world tools are served only to the `claude` process the mod starts, on `127.0.0.1` with a random token. They stop when you leave the world.

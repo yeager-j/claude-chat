@@ -15,8 +15,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Turns Claude's reply into chat components. Supports a Markdown subset plus three Minecraft tokens:
- * [[item_id]] (icon + name + tooltip), [[recipe:id]] (icon grid, on its own line) and {{key.inventory}} (the player's key).
+ * Turns Claude's reply into chat components. Supports a Markdown subset plus four Minecraft tokens:
+ * [[item_id]] (icon + name + tooltip), [[recipe:id]] (icon grid, on its own line), [[waypoint:Name|x y z|dimension]]
+ * (an add-waypoint button for Xaero's Minimap) and {{key.inventory}} (the player's key).
  */
 public final class ChatFormatter {
 	private static final Pattern HEADING = Pattern.compile("^#{1,6}\\s+(.*)$");
@@ -28,6 +29,7 @@ public final class ChatFormatter {
 	// Order matters: earlier alternatives win when two start at the same place.
 	private static final Pattern INLINE = Pattern.compile(String.join("|",
 		"\\[\\[recipe:(?<recipe>[^\\]]+)\\]\\]",
+		"\\[\\[waypoint:(?<waypoint>[^\\]]+)\\]\\]",
 		"\\[\\[(?<item>[^\\]]+)\\]\\]",
 		"\\{\\{(?<key>[\\w.]+)\\}\\}",
 		"`(?<code>[^`]+)`",
@@ -116,6 +118,9 @@ public final class ChatFormatter {
 		if (m.group("recipe") != null) {
 			// A recipe in the middle of a sentence: show what it makes instead of a grid.
 			return item(m.group("recipe"));
+		}
+		if (m.group("waypoint") != null) {
+			return Waypoints.button(m.group("waypoint"));
 		}
 		if (m.group("item") != null) {
 			return item(m.group("item"));

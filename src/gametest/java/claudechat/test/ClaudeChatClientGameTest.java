@@ -3,6 +3,15 @@ package claudechat.test;
 import claudechat.ClaudeChatClient;
 import claudechat.KnowledgeBase;
 import claudechat.Schematics;
+import claudechat.Waypoints;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.client.gui.components.AbstractWidget;
+import net.minecraft.client.gui.screens.Screen;
+import net.minecraft.client.input.MouseButtonEvent;
+import net.minecraft.client.input.MouseButtonInfo;
+import net.minecraft.client.resources.language.I18n;
+import net.minecraft.commands.Commands;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import java.util.ArrayList;
@@ -55,9 +64,11 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 
 		boolean worldTest = "1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"));
 		boolean templateTest = "1".equals(System.getenv("CLAUDECHAT_TEMPLATE_TEST"));
+		String waypointQuestion = System.getenv("CLAUDECHAT_WAYPOINT_QUESTION");
+		waypointQuestion = waypointQuestion == null || waypointQuestion.isBlank() ? null : waypointQuestion;
 		var builder = context.worldBuilder();
-		// Template questions lead Claude to look for the structure too, so give it a world that has them.
-		if (worldTest || templateTest) {
+		// Template and waypoint questions lead Claude to look for structures, so give it a world that has them.
+		if (worldTest || templateTest || waypointQuestion != null) {
 			// The default test world is superflat with structures off; structure finding needs a normal world.
 			builder.adjustSettings(settings -> {
 				settings.setWorldType(settings.getNormalPresetList().getFirst());
@@ -67,290 +78,316 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		}
 		try (TestSingleplayerContext singleplayer = builder.create()) {
 			singleplayer.getConnection().waitForChunksRender();
-
-			// 1. The formatting preview, through the real command.
-			chat(context, "/claude preview");
-			context.waitTicks(10);
-			openChat(context);
-			context.takeScreenshot("claudechat-preview");
-			context.getInput().pressKey(KEY_ESCAPE);
-
-			// 2. Tab completion for /claude effort.
-			openChat(context);
-			context.getInput().typeChars("/claude effort ");
-			context.waitTicks(10);
-			context.takeScreenshot("claudechat-autocomplete");
-			// The first Escape only closes the suggestion list; the second closes chat.
-			context.getInput().pressKey(KEY_ESCAPE);
-			context.getInput().pressKey(KEY_ESCAPE);
-			context.waitTicks(2);
-
-			// 3. How installed mods were classified (put mod jars in build/run/clientGameTest/mods to test real ones).
-			for (KnowledgeBase.Source source : ClaudeChatClient.knowledge().sources()) {
-				LOGGER.info("knowledge: {} tier={} state={} reason={} codeJars={}", source.id(),
-					ClaudeChatClient.knowledge().tier(source), ClaudeChatClient.knowledge().state(source),
-					ClaudeChatClient.knowledge().reason(source), source.codeContainers().size());
-			}
-			chat(context, "/claude knowledge");
-			context.waitTicks(10);
-			openChat(context);
-			context.takeScreenshot("claudechat-knowledge");
-			context.getInput().pressKey(KEY_ESCAPE);
-
-			// 4. Optionally, world data packs: a folder pack adding a loot table, and a zip pack overriding a vanilla one.
-			if ("1".equals(System.getenv("CLAUDECHAT_PACK_TEST"))) {
-				Path datapacks = singleplayer.getServer().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR));
-				writeTestPacks(datapacks);
-				singleplayer.getServer().runCommand("reload");
-				context.waitTicks(20);
-				context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 60 * SECONDS);
-				chat(context, "@claude what's in a secret vault chest? and what can dungeon chests have in this world?");
-				context.waitTicks(5);
-				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+			// With Xaero loaded the client hangs while closing the world, before Fabric prints the failure, so log it here.
+			try {
+				// 1. The formatting preview, through the real command.
+				chat(context, "/claude preview");
 				context.waitTicks(10);
 				openChat(context);
-				context.takeScreenshot("claudechat-datapack-answer");
+				context.takeScreenshot("claudechat-preview");
 				context.getInput().pressKey(KEY_ESCAPE);
-			}
 
-			// 4b. Optionally, structure templates: search by blocks, trace to structures through pools, draw layers.
-			if (templateTest) {
-				// The index is built in the background when the world opens; the first search waits for it if needed.
-				logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"limit\": 5}");
-				JsonObject trial = logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"query\": \"trial_chambers\", \"limit\": 3}");
-				check(trial.get("templates_indexed").getAsInt() > 500, "too few templates indexed");
-				check(trial.getAsJsonArray("results").get(0).getAsJsonObject().getAsJsonArray("used_by_structures")
-					.toString().contains("minecraft:trial_chambers"), "trial spawner template not traced to trial chambers");
-				JsonObject city = logTool(context, "search_structure_templates", "{\"blocks\": [\"sculk shrieker\", \"reinforced_deepslate\", \"soul lantern\"], \"limit\": 3}");
-				check(city.getAsJsonArray("results").toString().contains("minecraft:ancient_city/"),
-					"sculk shrieker search didn't find an ancient city piece");
-				logTool(context, "search_structure_templates", "{\"blocks\": [\"mossy_stone_bricks\", \"spawner\"], \"limit\": 5}");
-				logTool(context, "search_structure_templates", "{\"blocks\": [\"barrel\", \"brewing_stand\"], \"limit\": 5}");
-				JsonObject house = logTool(context, "inspect_structure_template",
-					"{\"template\": \"minecraft:village/plains/houses/plains_small_house_1\", \"layers\": true}");
-				check(house.getAsJsonArray("used_by_structures").toString().contains("minecraft:village_plains"), "house not traced to plains villages");
-				check(house.getAsJsonArray("layers").size() > 3, "house layers missing");
-				logTool(context, "inspect_structure_template", "{\"template\": \"minecraft:igloo/bottom\"}");
-				try {
-					logTool(context, "inspect_structure_template", "{\"template\": \"plains_small_house\"}");
-					check(false, "a partial template id should fail");
-				} catch (RuntimeException e) {
-					LOGGER.info("tool inspect_structure_template partial id -> {}", e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+				// 2. Tab completion for /claude effort.
+				openChat(context);
+				context.getInput().typeChars("/claude effort ");
+				context.waitTicks(10);
+				context.takeScreenshot("claudechat-autocomplete");
+				// The first Escape only closes the suggestion list; the second closes chat.
+				context.getInput().pressKey(KEY_ESCAPE);
+				context.getInput().pressKey(KEY_ESCAPE);
+				context.waitTicks(2);
+
+				// 3. How installed mods were classified (put mod jars in build/run/clientGameTest/mods to test real ones).
+				for (KnowledgeBase.Source source : ClaudeChatClient.knowledge().sources()) {
+					LOGGER.info("knowledge: {} tier={} state={} reason={} codeJars={}", source.id(),
+						ClaudeChatClient.knowledge().tier(source), ClaudeChatClient.knowledge().state(source),
+						ClaudeChatClient.knowledge().reason(source), source.codeContainers().size());
 				}
-				String question = System.getenv("CLAUDECHAT_TEMPLATE_QUESTION");
-				if (question != null && !question.isBlank()) {
-					chat(context, "@claude " + question);
+				chat(context, "/claude knowledge");
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-knowledge");
+				context.getInput().pressKey(KEY_ESCAPE);
+
+				// 4. Optionally, world data packs: a folder pack adding a loot table, and a zip pack overriding a vanilla one.
+				if ("1".equals(System.getenv("CLAUDECHAT_PACK_TEST"))) {
+					Path datapacks = singleplayer.getServer().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR));
+					writeTestPacks(datapacks);
+					singleplayer.getServer().runCommand("reload");
+					context.waitTicks(20);
+					context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 60 * SECONDS);
+					chat(context, "@claude what's in a secret vault chest? and what can dungeon chests have in this world?");
 					context.waitTicks(5);
 					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
 					context.waitTicks(10);
 					openChat(context);
-					context.takeScreenshot("claudechat-template-answer");
+					context.takeScreenshot("claudechat-datapack-answer");
 					context.getInput().pressKey(KEY_ESCAPE);
 				}
-			}
 
-			// 4c. Optionally, schematics: copies the files in CLAUDECHAT_SCHEMATIC_TEST (a folder) into the test's schematics
-			// folder, reads their material lists, and checks a chest holding all but one redstone dust against the first.
-			String schematicSource = System.getenv("CLAUDECHAT_SCHEMATIC_TEST");
-			if (schematicSource != null && !schematicSource.isBlank()) {
-				copySchematics(Path.of(schematicSource), Schematics.directory());
-				JsonObject list = logTool(context, "list_schematics", "{}");
-				var files = list.getAsJsonArray("schematics");
-				check(!files.isEmpty(), "no schematics listed");
-				String file = files.get(0).getAsJsonObject().get("file").getAsString();
-				JsonObject schematic = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"layers\": true}");
-				JsonObject materials = schematic.getAsJsonObject("materials");
-				check(!materials.isEmpty(), "schematic has no materials");
-
-				// A chest (or two) named "Witch Farm" with every material except one redstone dust, or one of the first item.
-				String shortItem = materials.has("minecraft:redstone") ? "minecraft:redstone" : materials.keySet().iterator().next();
-				List<String> stacks = new ArrayList<>();
-				for (var entry : materials.entrySet()) {
-					int count = entry.getValue().getAsInt() - (entry.getKey().equals(shortItem) ? 1 : 0);
-					int max = BuiltInRegistries.ITEM.getValue(Identifier.parse(entry.getKey())).getDefaultMaxStackSize();
-					for (; count > 0; count -= max) {
-						stacks.add("{id:\"" + entry.getKey() + "\",count:" + Math.min(max, count) + "}");
+				// 4b. Optionally, structure templates: search by blocks, trace to structures through pools, draw layers.
+				if (templateTest) {
+					// The index is built in the background when the world opens; the first search waits for it if needed.
+					logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"limit\": 5}");
+					JsonObject trial = logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"query\": \"trial_chambers\", \"limit\": 3}");
+					check(trial.get("templates_indexed").getAsInt() > 500, "too few templates indexed");
+					check(trial.getAsJsonArray("results").get(0).getAsJsonObject().getAsJsonArray("used_by_structures")
+						.toString().contains("minecraft:trial_chambers"), "trial spawner template not traced to trial chambers");
+					JsonObject city = logTool(context, "search_structure_templates", "{\"blocks\": [\"sculk shrieker\", \"reinforced_deepslate\", \"soul lantern\"], \"limit\": 3}");
+					check(city.getAsJsonArray("results").toString().contains("minecraft:ancient_city/"),
+						"sculk shrieker search didn't find an ancient city piece");
+					logTool(context, "search_structure_templates", "{\"blocks\": [\"mossy_stone_bricks\", \"spawner\"], \"limit\": 5}");
+					logTool(context, "search_structure_templates", "{\"blocks\": [\"barrel\", \"brewing_stand\"], \"limit\": 5}");
+					JsonObject house = logTool(context, "inspect_structure_template",
+						"{\"template\": \"minecraft:village/plains/houses/plains_small_house_1\", \"layers\": true}");
+					check(house.getAsJsonArray("used_by_structures").toString().contains("minecraft:village_plains"), "house not traced to plains villages");
+					check(house.getAsJsonArray("layers").size() > 3, "house layers missing");
+					logTool(context, "inspect_structure_template", "{\"template\": \"minecraft:igloo/bottom\"}");
+					try {
+						logTool(context, "inspect_structure_template", "{\"template\": \"plains_small_house\"}");
+						check(false, "a partial template id should fail");
+					} catch (RuntimeException e) {
+						LOGGER.info("tool inspect_structure_template partial id -> {}", e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
+					}
+					String question = System.getenv("CLAUDECHAT_TEMPLATE_QUESTION");
+					if (question != null && !question.isBlank()) {
+						chat(context, "@claude " + question);
+						context.waitTicks(5);
+						context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+						context.waitTicks(10);
+						openChat(context);
+						context.takeScreenshot("claudechat-template-answer");
+						context.getInput().pressKey(KEY_ESCAPE);
 					}
 				}
-				var pos = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition());
-				for (int chest = 0; chest * 27 < stacks.size(); chest++) {
-					StringBuilder items = new StringBuilder();
-					for (int slot = 0; slot < 27 && chest * 27 + slot < stacks.size(); slot++) {
-						String stack = stacks.get(chest * 27 + slot);
-						items.append(slot == 0 ? "" : ",").append(stack, 0, stack.length() - 1).append(",Slot:").append(slot).append("b}");
-					}
-					singleplayer.getServer().runCommand("setblock " + (pos.getX() + 2 + chest * 2) + " " + pos.getY() + " " + (pos.getZ() + 2)
-						+ " minecraft:chest{CustomName:\"Witch Farm\",Items:[" + items + "]}");
-				}
-				context.waitTicks(10);
-				JsonObject compared = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"compare_with\": \"witch farm\"}")
-					.getAsJsonObject("comparison");
-				var stillMissing = compared.getAsJsonObject("still_missing_after_crafting_from_contents");
-				check(stillMissing.size() == 1 && stillMissing.has(shortItem) && stillMissing.get(shortItem).getAsInt() == 1,
-					"comparison should miss exactly one " + shortItem + ": " + compared);
-				check(compared.getAsJsonObject("useful_contents").has(shortItem), "comparison doesn't show what the chests hold");
 
-				String question = System.getenv("CLAUDECHAT_SCHEMATIC_QUESTION");
-				if (question != null && !question.isBlank()) {
-					chat(context, "@claude " + question);
+				// 4c. Optionally, schematics: copies the files in CLAUDECHAT_SCHEMATIC_TEST (a folder) into the test's schematics
+				// folder, reads their material lists, and checks a chest holding all but one redstone dust against the first.
+				String schematicSource = System.getenv("CLAUDECHAT_SCHEMATIC_TEST");
+				if (schematicSource != null && !schematicSource.isBlank()) {
+					copySchematics(Path.of(schematicSource), Schematics.directory());
+					JsonObject list = logTool(context, "list_schematics", "{}");
+					var files = list.getAsJsonArray("schematics");
+					check(!files.isEmpty(), "no schematics listed");
+					String file = files.get(0).getAsJsonObject().get("file").getAsString();
+					JsonObject schematic = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"layers\": true}");
+					JsonObject materials = schematic.getAsJsonObject("materials");
+					check(!materials.isEmpty(), "schematic has no materials");
+
+					// A chest (or two) named "Witch Farm" with every material except one redstone dust, or one of the first item.
+					String shortItem = materials.has("minecraft:redstone") ? "minecraft:redstone" : materials.keySet().iterator().next();
+					List<String> stacks = new ArrayList<>();
+					for (var entry : materials.entrySet()) {
+						int count = entry.getValue().getAsInt() - (entry.getKey().equals(shortItem) ? 1 : 0);
+						int max = BuiltInRegistries.ITEM.getValue(Identifier.parse(entry.getKey())).getDefaultMaxStackSize();
+						for (; count > 0; count -= max) {
+							stacks.add("{id:\"" + entry.getKey() + "\",count:" + Math.min(max, count) + "}");
+						}
+					}
+					var pos = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition());
+					for (int chest = 0; chest * 27 < stacks.size(); chest++) {
+						StringBuilder items = new StringBuilder();
+						for (int slot = 0; slot < 27 && chest * 27 + slot < stacks.size(); slot++) {
+							String stack = stacks.get(chest * 27 + slot);
+							items.append(slot == 0 ? "" : ",").append(stack, 0, stack.length() - 1).append(",Slot:").append(slot).append("b}");
+						}
+						singleplayer.getServer().runCommand("setblock " + (pos.getX() + 2 + chest * 2) + " " + pos.getY() + " " + (pos.getZ() + 2)
+							+ " minecraft:chest{CustomName:\"Witch Farm\",Items:[" + items + "]}");
+					}
+					context.waitTicks(10);
+					JsonObject compared = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"compare_with\": \"witch farm\"}")
+						.getAsJsonObject("comparison");
+					var stillMissing = compared.getAsJsonObject("still_missing_after_crafting_from_contents");
+					check(stillMissing.size() == 1 && stillMissing.has(shortItem) && stillMissing.get(shortItem).getAsInt() == 1,
+						"comparison should miss exactly one " + shortItem + ": " + compared);
+					check(compared.getAsJsonObject("useful_contents").has(shortItem), "comparison doesn't show what the chests hold");
+
+					String question = System.getenv("CLAUDECHAT_SCHEMATIC_QUESTION");
+					if (question != null && !question.isBlank()) {
+						chat(context, "@claude " + question);
+						context.waitTicks(5);
+						context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+						context.waitTicks(10);
+						openChat(context);
+						context.takeScreenshot("claudechat-schematic-answer");
+						context.getInput().pressKey(KEY_ESCAPE);
+					}
+				}
+
+				// 4d. Optionally, Xaero waypoint buttons (load Xaero's Minimap with -PextraMods): run each button's click command
+				// the way a chat click does, confirm Xaero's Add Waypoint screen, and check the waypoint is saved in the right
+				// dimension. The name with a colon checks Xaero's escaping; the Nether's "dim%-1" checks the '-' handling.
+				if ("1".equals(System.getenv("CLAUDECHAT_WAYPOINT_TEST"))) {
+					if (!Waypoints.available()) {
+						throw new AssertionError("CLAUDECHAT_WAYPOINT_TEST needs Xaero's Minimap: pass -PextraMods");
+					}
+					addWaypoint(context, "Claude End City|1240 ~ -3380|the_end", "dim%1", ":1240:~:-3380:", "end");
+					addWaypoint(context, "Claude: Fortress|-210 70 400|nether", "dim%-1", ":-210:70:400:", "nether");
+					addWaypoint(context, "Claude Here|5 64 -5", "dim%0", ":5:64:-5:", "current");
+					if (waypointQuestion != null) {
+						chat(context, "@claude " + waypointQuestion);
+						context.waitTicks(5);
+						context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+						context.waitTicks(10);
+						openChat(context);
+						context.takeScreenshot("claudechat-waypoint-answer");
+						context.getInput().pressKey(KEY_ESCAPE);
+					}
+				}
+
+				// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).
+				if (worldTest) {
+					var server = singleplayer.getServer();
+					server.runCommand("execute at @p run setblock ~3 ~ ~ minecraft:chest{CustomName:\"Loot\",Items:[{Slot:0b,id:\"minecraft:diamond\",count:64},{Slot:1b,id:\"minecraft:iron_ingot\",count:12}]}");
+					server.runCommand("execute at @p run setblock ~-3 ~ ~ minecraft:barrel{Items:[{Slot:4b,id:\"minecraft:shulker_box\",count:1,components:{\"minecraft:container\":[{slot:0,item:{id:\"minecraft:emerald\",count:32}}]}}]}");
+					server.runCommand("execute at @p run setblock ~ ~ ~4 minecraft:chest{LootTable:\"minecraft:chests/simple_dungeon\"}");
+					server.runCommand("execute at @p run summon minecraft:wolf ~2 ~ ~2 {CustomName:\"Rex\"}");
+					server.runCommand("give @p minecraft:diamond_sword[enchantments={\"minecraft:sharpness\":5,\"minecraft:mending\":1}]");
+					server.runCommand("item replace entity @p enderchest.0 with minecraft:emerald 5");
+					server.runCommand("forceload add 2000 2000");
+					context.waitTicks(20);
+					server.runCommand("setblock 2000 100 2000 minecraft:barrel{Items:[{Slot:0b,id:\"minecraft:netherite_ingot\",count:3}]}");
+					server.runCommand("setblock 2000 100 2002 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:skeleton\"}}}");
+					server.runCommand("setblock 2002 100 2000 minecraft:respawn_anchor[charges=4]");
+					server.runCommand("execute at @p run setblock ~5 ~ ~5 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:zombie\"}}}");
+					server.runCommand("execute at @p run setblock ~-5 ~ ~5 minecraft:respawn_anchor[charges=1]");
+					server.runCommand("forceload remove 2000 2000");
+					// save-all is a dedicated-server command; this is what autosave does.
+					server.runOnServer(s -> s.saveEverything(true, true, true));
+					context.waitTicks(40);
+
+					// The world tools, called directly (what Claude gets over MCP), logged for checking.
+					logTool(context, "search_containers", "{\"query\": \"minecraft:diamond\"}");
+					logTool(context, "search_containers", "{\"query\": \"netherite\"}");
+					logTool(context, "search_containers", "{\"query\": \"emerald\"}");
+					logTool(context, "search_entities", "{\"query\": \"rex\"}");
+					logTool(context, "get_player", "{}");
+					// Blocks: the zombie spawner and charge-1 anchor are live nearby, the skeleton spawner and full anchor only saved.
+					logTool(context, "find_blocks", "{\"block\": \"spawner\"}");
+					logTool(context, "find_blocks", "{\"block\": \"spawner\", \"data\": \"skeleton\"}");
+					logTool(context, "find_blocks", "{\"block\": \"respawn anchor\"}");
+					logTool(context, "find_blocks", "{\"block\": \"minecraft:respawn_anchor\", \"properties\": {\"charges\": \"4\"}}");
+					logTool(context, "find_blocks", "{\"block\": \"#minecraft:beds\", \"dimension\": \"the_nether\"}");
+
+					// One position three ways: saved, then predicted from the seed, then generated; the prediction's biome must hold.
+					logTool(context, "inspect_location", "{\"x\": 2000, \"y\": 100, \"z\": 2002}");
+					logTool(context, "inspect_location", "{\"x\": 20000, \"y\": 64, \"z\": 20000, \"dimension\": \"the_nether\"}");
+					JsonObject predicted = logTool(context, "inspect_location", "{\"x\": 20000, \"z\": 20000}");
+					server.runCommand("forceload add 20000 20000");
+					context.waitTicks(40);
+					JsonObject generated = logTool(context, "inspect_location", "{\"x\": 20000, \"z\": 20000}");
+					server.runCommand("forceload remove 20000 20000");
+					check(predicted.get("biome").equals(generated.get("biome")), "predicted biome " + predicted.get("biome") + " but generated " + generated.get("biome"));
+
+					// Fortresses by biome, searched in the Nether from the Overworld. The footprint is built in memory from
+					// the seed; generating the start chunk for real must give the same bounding box.
+					logTool(context, "find_structures", "{\"structure\": \"fortress\", \"limit\": 3}");
+					JsonObject warped = logTool(context, "find_structures", "{\"structure\": \"fortress\", \"biome\": \"warped_forest\", \"limit\": 3}");
+					var fortresses = warped.getAsJsonArray("results");
+					check(!fortresses.isEmpty(), "no fortress reaching into a warped forest");
+					JsonObject fortress = fortresses.get(0).getAsJsonObject();
+					check(fortress.getAsJsonObject("biomes").has("minecraft:warped_forest"), "biome filter let through " + fortress);
+					int fortressX = fortress.get("x").getAsInt();
+					int fortressZ = fortress.get("z").getAsInt();
+					String actualBounds = singleplayer.getServer().computeOnServer(s -> {
+						var start = s.getLevel(Level.NETHER).getChunk(fortressX >> 4, fortressZ >> 4, ChunkStatus.STRUCTURE_STARTS)
+							.getStartForStructure(s.registryAccess().lookupOrThrow(Registries.STRUCTURE).getOrThrow(BuiltinStructures.FORTRESS).value());
+						BoundingBox box = start.getBoundingBox();
+						return box.minX() + " " + box.minY() + " " + box.minZ() + " to " + box.maxX() + " " + box.maxY() + " " + box.maxZ();
+					});
+					LOGGER.info("fortress bounds: tool {}, generated {}", fortress.get("bounds").getAsString(), actualBounds);
+					check(fortress.get("bounds").getAsString().equals(actualBounds), "fortress bounds differ from generation");
+					JsonObject mostlyWarped = logTool(context, "find_structures",
+						"{\"structure\": \"fortress\", \"biome\": \"warped_forest\", \"min_biome_share\": 75, \"limit\": 5}");
+					for (JsonElement result : mostlyWarped.getAsJsonArray("results")) {
+						String share = result.getAsJsonObject().get("share_in_requested_biome").getAsString();
+						check(Integer.parseInt(share.replace("%", "")) >= 75, "min_biome_share let through " + result);
+					}
+
+					// Biomes: from the Overworld, a warped forest is searched in the Nether. The nearest deep dark must be no
+					// farther than the one /locate biome finds on the same grid (it stops at the first hit in spiral order).
+					JsonObject warpedBiome = logTool(context, "find_biomes", "{\"biome\": \"warped_forest\"}");
+					check(warpedBiome.get("dimension").getAsString().equals("the_nether"), "warped forest not searched in the Nether");
+					logTool(context, "find_biomes", "{\"biome\": \"#minecraft:is_ocean\", \"limit\": 5}");
+					JsonObject deepDark = logTool(context, "find_biomes", "{\"biome\": \"deep_dark\", \"limit\": 3}");
+					Double locateDistance = singleplayer.getServer().computeOnServer(s -> {
+						var player = s.getPlayerList().getPlayers().getFirst();
+						var pair = s.overworld().findClosestBiome3d(b -> b.is(Biomes.DEEP_DARK), player.blockPosition(), 6400, 32, 64);
+						return pair == null ? null : Math.sqrt(Math.pow(pair.getFirst().getX() - player.getX(), 2) + Math.pow(pair.getFirst().getZ() - player.getZ(), 2));
+					});
+					var deepDarkResults = deepDark.getAsJsonArray("results");
+					LOGGER.info("deep dark: /locate {} blocks, find_biomes {}", locateDistance, deepDarkResults.isEmpty() ? "none" : deepDarkResults.get(0));
+					check(locateDistance == null || (!deepDarkResults.isEmpty()
+						&& deepDarkResults.get(0).getAsJsonObject().get("distance_blocks").getAsDouble() <= locateDistance + 2),
+						"find_biomes' nearest deep dark is farther than /locate's");
+					JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
+
+					// Visit the nearest village for over a minute, come back, and check the visited filter flips.
+					var nearest = villages.getAsJsonArray("results").get(0).getAsJsonObject();
+					var home = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().position());
+					server.runCommand("spreadplayers " + nearest.get("x").getAsInt() + " " + nearest.get("z").getAsInt() + " 0 1 false @p");
+					// InhabitedTime only advances on ticks the chunk runs mob spawning, so give it margin over the 1-minute threshold.
+					context.waitTicks(100 * SECONDS);
+					server.runCommand("tp @p " + home.x() + " " + home.y() + " " + home.z());
+					context.waitTicks(5 * SECONDS);
+					server.runOnServer(s -> s.saveEverything(true, true, true));
+					context.waitTicks(40);
+					logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
+					logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
+
+					chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and find me a nether fortress in a warped forest");
 					context.waitTicks(5);
 					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
 					context.waitTicks(10);
 					openChat(context);
-					context.takeScreenshot("claudechat-schematic-answer");
+					context.takeScreenshot("claudechat-world-answer");
 					context.getInput().pressKey(KEY_ESCAPE);
 				}
-			}
 
-			// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).
-			if (worldTest) {
-				var server = singleplayer.getServer();
-				server.runCommand("execute at @p run setblock ~3 ~ ~ minecraft:chest{CustomName:\"Loot\",Items:[{Slot:0b,id:\"minecraft:diamond\",count:64},{Slot:1b,id:\"minecraft:iron_ingot\",count:12}]}");
-				server.runCommand("execute at @p run setblock ~-3 ~ ~ minecraft:barrel{Items:[{Slot:4b,id:\"minecraft:shulker_box\",count:1,components:{\"minecraft:container\":[{slot:0,item:{id:\"minecraft:emerald\",count:32}}]}}]}");
-				server.runCommand("execute at @p run setblock ~ ~ ~4 minecraft:chest{LootTable:\"minecraft:chests/simple_dungeon\"}");
-				server.runCommand("execute at @p run summon minecraft:wolf ~2 ~ ~2 {CustomName:\"Rex\"}");
-				server.runCommand("give @p minecraft:diamond_sword[enchantments={\"minecraft:sharpness\":5,\"minecraft:mending\":1}]");
-				server.runCommand("item replace entity @p enderchest.0 with minecraft:emerald 5");
-				server.runCommand("forceload add 2000 2000");
-				context.waitTicks(20);
-				server.runCommand("setblock 2000 100 2000 minecraft:barrel{Items:[{Slot:0b,id:\"minecraft:netherite_ingot\",count:3}]}");
-				server.runCommand("setblock 2000 100 2002 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:skeleton\"}}}");
-				server.runCommand("setblock 2002 100 2000 minecraft:respawn_anchor[charges=4]");
-				server.runCommand("execute at @p run setblock ~5 ~ ~5 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:zombie\"}}}");
-				server.runCommand("execute at @p run setblock ~-5 ~ ~5 minecraft:respawn_anchor[charges=1]");
-				server.runCommand("forceload remove 2000 2000");
-				// save-all is a dedicated-server command; this is what autosave does.
-				server.runOnServer(s -> s.saveEverything(true, true, true));
-				context.waitTicks(40);
-
-				// The world tools, called directly (what Claude gets over MCP), logged for checking.
-				logTool(context, "search_containers", "{\"query\": \"minecraft:diamond\"}");
-				logTool(context, "search_containers", "{\"query\": \"netherite\"}");
-				logTool(context, "search_containers", "{\"query\": \"emerald\"}");
-				logTool(context, "search_entities", "{\"query\": \"rex\"}");
-				logTool(context, "get_player", "{}");
-				// Blocks: the zombie spawner and charge-1 anchor are live nearby, the skeleton spawner and full anchor only saved.
-				logTool(context, "find_blocks", "{\"block\": \"spawner\"}");
-				logTool(context, "find_blocks", "{\"block\": \"spawner\", \"data\": \"skeleton\"}");
-				logTool(context, "find_blocks", "{\"block\": \"respawn anchor\"}");
-				logTool(context, "find_blocks", "{\"block\": \"minecraft:respawn_anchor\", \"properties\": {\"charges\": \"4\"}}");
-				logTool(context, "find_blocks", "{\"block\": \"#minecraft:beds\", \"dimension\": \"the_nether\"}");
-
-				// One position three ways: saved, then predicted from the seed, then generated; the prediction's biome must hold.
-				logTool(context, "inspect_location", "{\"x\": 2000, \"y\": 100, \"z\": 2002}");
-				logTool(context, "inspect_location", "{\"x\": 20000, \"y\": 64, \"z\": 20000, \"dimension\": \"the_nether\"}");
-				JsonObject predicted = logTool(context, "inspect_location", "{\"x\": 20000, \"z\": 20000}");
-				server.runCommand("forceload add 20000 20000");
-				context.waitTicks(40);
-				JsonObject generated = logTool(context, "inspect_location", "{\"x\": 20000, \"z\": 20000}");
-				server.runCommand("forceload remove 20000 20000");
-				check(predicted.get("biome").equals(generated.get("biome")), "predicted biome " + predicted.get("biome") + " but generated " + generated.get("biome"));
-
-				// Fortresses by biome, searched in the Nether from the Overworld. The footprint is built in memory from
-				// the seed; generating the start chunk for real must give the same bounding box.
-				logTool(context, "find_structures", "{\"structure\": \"fortress\", \"limit\": 3}");
-				JsonObject warped = logTool(context, "find_structures", "{\"structure\": \"fortress\", \"biome\": \"warped_forest\", \"limit\": 3}");
-				var fortresses = warped.getAsJsonArray("results");
-				check(!fortresses.isEmpty(), "no fortress reaching into a warped forest");
-				JsonObject fortress = fortresses.get(0).getAsJsonObject();
-				check(fortress.getAsJsonObject("biomes").has("minecraft:warped_forest"), "biome filter let through " + fortress);
-				int fortressX = fortress.get("x").getAsInt();
-				int fortressZ = fortress.get("z").getAsInt();
-				String actualBounds = singleplayer.getServer().computeOnServer(s -> {
-					var start = s.getLevel(Level.NETHER).getChunk(fortressX >> 4, fortressZ >> 4, ChunkStatus.STRUCTURE_STARTS)
-						.getStartForStructure(s.registryAccess().lookupOrThrow(Registries.STRUCTURE).getOrThrow(BuiltinStructures.FORTRESS).value());
-					BoundingBox box = start.getBoundingBox();
-					return box.minX() + " " + box.minY() + " " + box.minZ() + " to " + box.maxX() + " " + box.maxY() + " " + box.maxZ();
-				});
-				LOGGER.info("fortress bounds: tool {}, generated {}", fortress.get("bounds").getAsString(), actualBounds);
-				check(fortress.get("bounds").getAsString().equals(actualBounds), "fortress bounds differ from generation");
-				JsonObject mostlyWarped = logTool(context, "find_structures",
-					"{\"structure\": \"fortress\", \"biome\": \"warped_forest\", \"min_biome_share\": 75, \"limit\": 5}");
-				for (JsonElement result : mostlyWarped.getAsJsonArray("results")) {
-					String share = result.getAsJsonObject().get("share_in_requested_biome").getAsString();
-					check(Integer.parseInt(share.replace("%", "")) >= 75, "min_biome_share let through " + result);
+				// 6. Optionally, a question about a data-only mod, which gets decompiled on demand first.
+				String modQuestion = System.getenv("CLAUDECHAT_MOD_QUESTION");
+				if (modQuestion != null && !modQuestion.isBlank()) {
+					chat(context, "@claude " + modQuestion);
+					context.waitTicks(5 * SECONDS);
+					context.takeScreenshot("claudechat-mod-status");
+					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+					context.waitTicks(10);
+					openChat(context);
+					context.takeScreenshot("claudechat-mod-answer");
+					context.getInput().pressKey(KEY_ESCAPE);
 				}
 
-				// Biomes: from the Overworld, a warped forest is searched in the Nether. The nearest deep dark must be no
-				// farther than the one /locate biome finds on the same grid (it stops at the first hit in spiral order).
-				JsonObject warpedBiome = logTool(context, "find_biomes", "{\"biome\": \"warped_forest\"}");
-				check(warpedBiome.get("dimension").getAsString().equals("the_nether"), "warped forest not searched in the Nether");
-				logTool(context, "find_biomes", "{\"biome\": \"#minecraft:is_ocean\", \"limit\": 5}");
-				JsonObject deepDark = logTool(context, "find_biomes", "{\"biome\": \"deep_dark\", \"limit\": 3}");
-				Double locateDistance = singleplayer.getServer().computeOnServer(s -> {
-					var player = s.getPlayerList().getPlayers().getFirst();
-					var pair = s.overworld().findClosestBiome3d(b -> b.is(Biomes.DEEP_DARK), player.blockPosition(), 6400, 32, 64);
-					return pair == null ? null : Math.sqrt(Math.pow(pair.getFirst().getX() - player.getX(), 2) + Math.pow(pair.getFirst().getZ() - player.getZ(), 2));
-				});
-				var deepDarkResults = deepDark.getAsJsonArray("results");
-				LOGGER.info("deep dark: /locate {} blocks, find_biomes {}", locateDistance, deepDarkResults.isEmpty() ? "none" : deepDarkResults.get(0));
-				check(locateDistance == null || (!deepDarkResults.isEmpty()
-					&& deepDarkResults.get(0).getAsJsonObject().get("distance_blocks").getAsDouble() <= locateDistance + 2),
-					"find_biomes' nearest deep dark is farther than /locate's");
-				JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
+				// 7. Optionally, a real question. This calls the local claude CLI and uses the signed-in account.
+				if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
+					singleplayer.getServer().runCommand("give @a minecraft:crafter");
+					context.waitTicks(10);
+					chat(context, "@claude how do I craft this? show the recipe");
+					context.waitTicks(5);
+					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
+					context.waitTicks(10);
+					openChat(context);
+					context.takeScreenshot("claudechat-live-answer");
+					context.getInput().pressKey(KEY_ESCAPE);
 
-				// Visit the nearest village for over a minute, come back, and check the visited filter flips.
-				var nearest = villages.getAsJsonArray("results").get(0).getAsJsonObject();
-				var home = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().position());
-				server.runCommand("spreadplayers " + nearest.get("x").getAsInt() + " " + nearest.get("z").getAsInt() + " 0 1 false @p");
-				// InhabitedTime only advances on ticks the chunk runs mob spawning, so give it margin over the 1-minute threshold.
-				context.waitTicks(100 * SECONDS);
-				server.runCommand("tp @p " + home.x() + " " + home.y() + " " + home.z());
-				context.waitTicks(5 * SECONDS);
-				server.runOnServer(s -> s.saveEverything(true, true, true));
-				context.waitTicks(40);
-				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
-				logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
-
-				chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and find me a nether fortress in a warped forest");
-				context.waitTicks(5);
-				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
-				context.waitTicks(10);
-				openChat(context);
-				context.takeScreenshot("claudechat-world-answer");
-				context.getInput().pressKey(KEY_ESCAPE);
-			}
-
-			// 6. Optionally, a question about a data-only mod, which gets decompiled on demand first.
-			String modQuestion = System.getenv("CLAUDECHAT_MOD_QUESTION");
-			if (modQuestion != null && !modQuestion.isBlank()) {
-				chat(context, "@claude " + modQuestion);
-				context.waitTicks(5 * SECONDS);
-				context.takeScreenshot("claudechat-mod-status");
-				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
-				context.waitTicks(10);
-				openChat(context);
-				context.takeScreenshot("claudechat-mod-answer");
-				context.getInput().pressKey(KEY_ESCAPE);
-			}
-
-			// 7. Optionally, a real question. This calls the local claude CLI and uses the signed-in account.
-			if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
-				singleplayer.getServer().runCommand("give @a minecraft:crafter");
-				context.waitTicks(10);
-				chat(context, "@claude how do I craft this? show the recipe");
-				context.waitTicks(5);
-				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
-				context.waitTicks(10);
-				openChat(context);
-				context.takeScreenshot("claudechat-live-answer");
-				context.getInput().pressKey(KEY_ESCAPE);
-
-				// A question that needs research, so Claude streams progress notes between tool calls.
-				chat(context, "/claude reset");
-				chat(context, "@claude how does the crafter decide which slot a hopper fills?");
-				// The live status line: right away, then once a progress note has likely arrived.
-				context.waitTicks(2 * SECONDS);
-				context.takeScreenshot("claudechat-status-2s");
-				context.waitTicks(10 * SECONDS);
-				if (ClaudeChatClient.isBusy()) {
-					context.takeScreenshot("claudechat-status-12s");
+					// A question that needs research, so Claude streams progress notes between tool calls.
+					chat(context, "/claude reset");
+					chat(context, "@claude how does the crafter decide which slot a hopper fills?");
+					// The live status line: right away, then once a progress note has likely arrived.
+					context.waitTicks(2 * SECONDS);
+					context.takeScreenshot("claudechat-status-2s");
+					context.waitTicks(10 * SECONDS);
+					if (ClaudeChatClient.isBusy()) {
+						context.takeScreenshot("claudechat-status-12s");
+					}
+					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
+					context.waitTicks(10);
+					openChat(context);
+					context.takeScreenshot("claudechat-live-research");
+					context.getInput().pressKey(KEY_ESCAPE);
 				}
-				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
-				context.waitTicks(10);
-				openChat(context);
-				context.takeScreenshot("claudechat-live-research");
-				context.getInput().pressKey(KEY_ESCAPE);
+			} catch (Throwable t) {
+				LOGGER.error("test step failed", t);
+				throw t;
 			}
 		}
 	}
@@ -375,6 +412,59 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		JsonElement json = result.join();
 		LOGGER.info("tool {} {} ({} ms) -> {}", name, args, (System.nanoTime() - start) / 1_000_000, json);
 		return json.isJsonObject() ? json.getAsJsonObject() : new JsonObject();
+	}
+
+	/**
+	 * Clicks a [[waypoint:...]] button without the mouse: runs its command as Screen.clickCommandAction does, presses
+	 * Confirm in Xaero's screen, then waits for a new waypoint line containing {@code coords} in Xaero's {@code folder}.
+	 * The test client's xaero folder survives between runs, so lines from earlier runs are counted first.
+	 */
+	private static void addWaypoint(ClientGameTestContext context, String tag, String folder, String coords, String label) {
+		Path minimap = FabricLoader.getInstance().getGameDir().resolve("xaero/minimap");
+		int before = savedWaypoints(minimap, folder, coords).size();
+		// A tag without a dimension reads the player's, and Minecraft.getInstance() is off limits on the test thread.
+		ClickEvent click = context.computeOnClient(mc -> Waypoints.button(tag)).getStyle().getClickEvent();
+		check(click instanceof ClickEvent.RunCommand, "no click command for " + tag);
+		String command = ((ClickEvent.RunCommand) click).command();
+		LOGGER.info("waypoint {} -> {}", tag, command);
+		context.runOnClient(mc -> mc.player.connection.sendUnattendedCommand(Commands.trimOptionalPrefix(command), null));
+		context.waitFor(mc -> isXaeroAddScreen(mc.gui.screen()), 5 * SECONDS);
+		context.waitTicks(5);
+		context.takeScreenshot("claudechat-waypoint-" + label);
+		context.runOnClient(mc -> {
+			String confirm = I18n.get("gui.xaero_confirm");
+			AbstractWidget button = mc.gui.screen().children().stream()
+				.filter(w -> w instanceof AbstractWidget widget && widget.getMessage().getString().equals(confirm))
+				.map(AbstractWidget.class::cast)
+				.findFirst().orElseThrow(() -> new AssertionError("no Confirm button in Xaero's screen"));
+			button.onClick(new MouseButtonEvent(0, 0, new MouseButtonInfo(0, 0)), false);
+		});
+		context.waitFor(mc -> !isXaeroAddScreen(mc.gui.screen()), 5 * SECONDS);
+		context.waitFor(mc -> savedWaypoints(minimap, folder, coords).size() > before, 10 * SECONDS);
+		LOGGER.info("waypoint saved in {}: {}", folder, savedWaypoints(minimap, folder, coords).getLast());
+	}
+
+	private static boolean isXaeroAddScreen(Screen screen) {
+		return screen != null && screen.getClass().getName().equals("xaero.common.gui.GuiAddWaypoint");
+	}
+
+	private static List<String> savedWaypoints(Path minimap, String folder, String coords) {
+		List<String> found = new ArrayList<>();
+		if (!Files.isDirectory(minimap)) {
+			return found;
+		}
+		try (var files = Files.walk(minimap)) {
+			for (Path file : files.filter(f -> f.getParent().getFileName().toString().equals(folder) && f.toString().endsWith(".txt")).toList()) {
+				for (String line : Files.readAllLines(file)) {
+					if (line.startsWith("waypoint:") && line.contains(coords)) {
+						found.add(line);
+					}
+				}
+			}
+		} catch (IOException e) {
+			// Xaero may be writing the file; the caller polls again.
+		}
+		return found;
 	}
 
 	private static void writeTestPacks(Path datapacks) {

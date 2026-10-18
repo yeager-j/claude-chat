@@ -39,6 +39,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		- Smelt [[raw_iron]] for ingots:
 		[[recipe:minecraft:iron_ingot_from_smelting_raw_iron]]
 		1. Try `/give @s minecraft:crafter` or see the [wiki page](https://minecraft.wiki/w/Crafter)
+		2. Nearest end city: `1240 ~ -3380` [[waypoint:End City|1240 ~ -3380|the_end]]
 		[[recipe:minecraft:torch]]
 		""";
 

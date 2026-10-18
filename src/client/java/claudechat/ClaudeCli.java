@@ -63,6 +63,14 @@ public class ClaudeCli {
 		- Commands go in backticks and become click-to-insert, e.g. `/gamerule keepInventory true`.
 		""";
 
+	private static final String WAYPOINT_PROMPT = """
+		- Xaero's Minimap is installed. When the player asks for a waypoint, or you give them a place to travel to, put
+		  [[waypoint:<name>|<x> <y> <z>|<dimension>]] right after the coordinates, e.g.
+		  `1240 ~ -3380` [[waypoint:End City|1240 ~ -3380|the_end]]. Use ~ for an unknown y, a short name (32 characters
+		  at most) and the dimension the place is in. It shows a button that opens Xaero's Add Waypoint screen filled in.
+		  You can't add waypoints yourself, so never say one was added; tell the player to click [+ Waypoint].
+		""";
+
 	private static final String WORLD_TOOLS_PROMPT = """
 
 		The player's own world (single-player) is available through the mcp__minecraft__* tools: search_containers
@@ -178,6 +186,7 @@ public class ClaudeCli {
 	private Path writeSystemPrompt(String gameContext) throws IOException {
 		Path promptFile = ClaudeConfig.dir().resolve("system-prompt.txt");
 		String systemPrompt = SYSTEM_PROMPT
+			+ (Waypoints.available() ? WAYPOINT_PROMPT : "")
 			+ "\nCurrent game state:\n" + gameContext
 			+ (worldTools.isRunning() ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
 			+ "\n" + knowledge.describeForPrompt()
