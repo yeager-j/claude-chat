@@ -42,6 +42,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -67,10 +68,16 @@ import java.util.stream.Stream;
  * Saved chunks are read straight from the region files (read-only; only chunks whose save timestamp changed are
  * re-read). Chunks that are loaded right now are captured live from the server instead, since the save on disk can be
  * up to an autosave (5 minutes) behind.
+ * <p>
+ * InhabitedTime needs more: the game writes a chunk only when something in it changes, and its time going up doesn't
+ * count, so a chunk the player only walked through keeps the time from its last save, often 0. The index records
+ * each chunk's time as it unloads (and every few seconds near players) and keeps the ones newer than the save in
+ * {@value #VISITS_FILE} in the world folder, so they survive restarts.
  */
 public class WorldIndex {
 	private static final Pattern REGION_NAME = Pattern.compile("r\\.(-?\\d+)\\.(-?\\d+)\\.mca");
 	private static final int MAX_NESTING = 2;
+	private static final String VISITS_FILE = "claudechat-visits.txt";
 
 	/** One chunk of one dimension; block entities and entities are stored in separate region folders. */
 	public record ChunkKey(String dimension, int x, int z, boolean entities) {
@@ -101,6 +108,8 @@ public class WorldIndex {
 	private final Map<ChunkKey, Integer> timestamps = new ConcurrentHashMap<>();
 	private final Map<ChunkKey, List<Holder>> savedHolders = new ConcurrentHashMap<>();
 	private final Map<ChunkKey, Long> savedInhabited = new ConcurrentHashMap<>();
+	/** InhabitedTime recorded from loaded chunks, which the save may lack (see the class comment). */
+	private final Map<ChunkKey, Long> trackedInhabited = new ConcurrentHashMap<>();
 	/**
 	 * Which blocks each saved chunk may contain (the union of its sections' palettes, as sorted ids from
 	 * {@link #blockIds}), so block searches only re-read chunks that can hold a match. Ints rather than strings keep
@@ -117,8 +126,11 @@ public class WorldIndex {
 		timestamps.clear();
 		savedHolders.clear();
 		savedInhabited.clear();
+		trackedInhabited.clear();
 		savedBlocks.clear();
 		dimensionDirs.clear();
+		// Before anything can save it again, or the next save would drop what earlier sessions recorded.
+		loadVisits(server);
 		Thread thread = new Thread(() -> {
 			try {
 				snapshot();
@@ -168,11 +180,79 @@ public class WorldIndex {
 		});
 		holders.addAll(live.holders());
 		Map<ChunkKey, Long> inhabited = new HashMap<>(savedInhabited);
-		inhabited.putAll(live.inhabited());
+		trackedInhabited.forEach((key, ticks) -> inhabited.merge(key, ticks, Math::max));
+		live.inhabited().forEach((key, ticks) -> inhabited.merge(key, ticks, Math::max));
 
 		ClaudeChatClient.LOGGER.debug("World snapshot: {} saved chunks re-read, {} holders, {} ms",
 			changed, holders.size(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
 		return new Snapshot(holders, live.players(), inhabited);
+	}
+
+	// --- time spent near chunks ----------------------------------------------------------------------------------
+
+	/** Server thread: a chunk is unloading. Remember its time, which the game may not write. */
+	public void chunkUnloaded(ServerLevel level, LevelChunk chunk) {
+		if (server != null && chunk.getInhabitedTime() > 0) {
+			ChunkKey key = new ChunkKey(dimensionName(level.dimension()), chunk.getPos().x(), chunk.getPos().z(), false);
+			trackedInhabited.merge(key, chunk.getInhabitedTime(), Math::max);
+		}
+	}
+
+	/** Server thread: records the time of the chunks around players, which don't unload while the world is closing. */
+	public void recordLoadedChunks(MinecraftServer server) {
+		if (this.server != server) {
+			return;
+		}
+		for (ServerLevel level : server.getAllLevels()) {
+			for (LevelChunk chunk : loadedChunks(server, level)) {
+				chunkUnloaded(level, chunk);
+			}
+		}
+	}
+
+	/** Server thread, after a save: writes the recorded times the saved chunks lack. Small: one line per chunk. */
+	public void saveVisits(MinecraftServer server) {
+		if (this.server != server) {
+			return;
+		}
+		recordLoadedChunks(server);
+		StringBuilder out = new StringBuilder("# Claude Chat: time players spent near chunks, which Minecraft doesn't always save.\n"
+			+ "# dimension chunkX chunkZ ticks\n");
+		trackedInhabited.forEach((key, ticks) -> {
+			if (ticks > savedInhabited.getOrDefault(key, -1L)) {
+				out.append(key.dimension()).append(' ').append(key.x()).append(' ').append(key.z()).append(' ').append(ticks).append('\n');
+			}
+		});
+		Path file = server.getWorldPath(LevelResource.ROOT).resolve(VISITS_FILE);
+		Path temp = file.resolveSibling(VISITS_FILE + ".tmp");
+		try {
+			Files.writeString(temp, out);
+			Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+		} catch (IOException e) {
+			ClaudeChatClient.LOGGER.warn("Could not save {}", file, e);
+		}
+	}
+
+	private void loadVisits(MinecraftServer server) {
+		Path file = server.getWorldPath(LevelResource.ROOT).resolve(VISITS_FILE);
+		if (!Files.isRegularFile(file)) {
+			return;
+		}
+		try (Stream<String> lines = Files.lines(file)) {
+			lines.filter(line -> !line.startsWith("#")).forEach(line -> {
+				String[] parts = line.trim().split(" ");
+				if (parts.length == 4) {
+					try {
+						ChunkKey key = new ChunkKey(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), false);
+						trackedInhabited.merge(key, Long.parseLong(parts[3]), Math::max);
+					} catch (NumberFormatException e) {
+						// a hand-edited line; skip it
+					}
+				}
+			});
+		} catch (IOException e) {
+			ClaudeChatClient.LOGGER.warn("Could not read {}", file, e);
+		}
 	}
 
 	// --- saved chunks ---------------------------------------------------------------------------------------------
@@ -204,8 +284,10 @@ public class WorldIndex {
 					ChunkKey key = new ChunkKey(dimension, regionX * 32 + (i & 31), regionZ * 32 + (i >> 5), entities);
 					if (location == 0) {
 						if (timestamps.remove(key) != null) {
+							// Deleted (trimmed with a world editor, say): it will generate afresh, unvisited.
 							savedHolders.remove(key);
 							savedInhabited.remove(key);
+							trackedInhabited.remove(key);
 							savedBlocks.remove(key);
 						}
 						continue;

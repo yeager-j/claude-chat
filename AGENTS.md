@@ -22,7 +22,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WAYPOINT_TEST=1` | Needs Xaero's Minimap via `-PextraMods`. Runs `[[waypoint:…]]` button commands, confirms Xaero's screen, checks `waypoints.txt` per dimension; `CLAUDECHAT_WAYPOINT_QUESTION="..."` also asks Claude |
-| `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), visits a village for 100 s, asks Claude |
+| `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), visits a village and a far chunk (checks the visited filter and `claudechat-visits.txt`), asks Claude |
 
 - **Test with real mods:** `-PextraMods="<folder of jars>"`. The user's mods are in `%APPDATA%\ModrinthApp\profiles\Fabric 26.3\mods`.
 - **Hang on exit:** with those mods, the client hangs after "Xaero hud session finalized". Run the test in the background, wait for the last screenshot, then stop only the java process whose command line matches `clientGameTest`. Other `claude` and `java` processes belong to the user.
@@ -39,7 +39,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while Xaero's Minimap is loaded) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
-| `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` and block palettes |
+| `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes |
 | `StructureFinder` | Multi-result `/locate` with visited filtering; builds a structure's pieces in memory (`Structure.generate`) to sample the biomes they occupy |
 | `BlockFinder` | Nearest blocks by id/tag, state properties and block entity text; re-reads only saved chunks whose palette has the block |
 | `BiomeFinder` | Multi-result `/locate biome` from the seed, off the server thread |
@@ -96,7 +96,10 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 - **Region files mid-game:** they aren't padded to whole sectors until closed. Read a chunk by its own length field, not `sectors * 4096`.
 - **Files lag the game:** saved chunks are up to an autosave (5 min) behind, so loaded chunks are captured live on the server thread and override the saved copy.
 - **"Generated" chunks:** structure searches (ours and `/locate`'s) leave `structure_starts` chunks on disk. Only `Status: minecraft:full` counts as generated.
-- **InhabitedTime:** it only advances on ticks where the chunk runs mob spawning (players within 128 blocks), so it grows slower than wall time. "Visited" is ≥ 60 s.
+- **InhabitedTime:**
+  - It advances only while a player is within 128 blocks of the chunk and the chunk is within simulation distance (`ServerChunkCache.tickSpawningChunk`). So a structure's time is the most of any chunk its pieces cover: an end city in the user's world had 0 s at its start chunk and 101 s in its pieces.
+  - It doesn't mark the chunk unsaved, so the game writes it only when something else in the chunk changes. `WorldIndex` records it on chunk unload (and every 10 s near players) and keeps what the save lacks in `<world>/claudechat-visits.txt`.
+  - "Visited" is ≥ 1 s.
 - **Section palettes:** in 26.x a palette entry is a bare string (`"minecraft:spawner"`) when the block is in its default state, otherwise `{id, properties}`, no longer `{Name, Properties}`. Use `WorldIndex.paletteName`.
 - **26.x paths:** player data is in `players/data`, and dimensions are under `dimensions/<ns>/<path>/{region,entities}`. Use `DimensionType.getStorageFolder`.
 

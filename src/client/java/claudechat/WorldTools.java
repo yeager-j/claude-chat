@@ -83,8 +83,9 @@ public final class WorldTools {
 			"""));
 		tools.add(tool("find_structures",
 			"Find structures near the player, nearest first: like /locate, but returns several and can skip ones the player "
-				+ "has already visited. \"Visited\" means players spent over a minute within 128 blocks of the structure "
-				+ "(Minecraft's per-chunk InhabitedTime); never-generated chunks are always unvisited. x/z is the /locate "
+				+ "has already visited. \"Visited\" means players spent at least a second within 128 blocks of some part of "
+				+ "the structure (Minecraft's per-chunk InhabitedTime, at most of any chunk its pieces cover); structures in "
+				+ "never-generated land are always unvisited. x/z is the /locate "
 				+ "position; each result also has the structure's bounding box and the biomes its pieces occupy (share of "
 				+ "sampled cells), worked out from the seed without generating anything. The biome filter matches a structure "
 				+ "if any of its pieces is in that biome, so a fortress that starts in a crimson forest and reaches into a "
@@ -130,7 +131,7 @@ public final class WorldTools {
 			{"type": "object", "properties": {
 			  "biome": {"type": "string", "description": "Biome id (\\"minecraft:cherry_grove\\"), tag (\\"#minecraft:is_ocean\\"), or a word (\\"cherry\\", \\"mushroom\\")."},
 			  "dimension": {"type": "string"},
-			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Whether players spent over a minute near the spot. Default: any."},
+			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Whether players spent at least a second within 128 blocks of the spot. Default: any."},
 			  "min_spacing": {"type": "integer", "description": "Hits closer together than this many blocks count as one patch (default 256)."},
 			  "max_distance": {"type": "integer", "description": "Search radius in blocks (default 6400 like /locate, max 30000)."},
 			  "limit": {"type": "integer", "description": "Max results (default 5, max 20)."}

@@ -47,7 +47,7 @@ import java.util.function.Predicate;
  * callers can skip structures the player has already visited.
  */
 public final class StructureFinder {
-	/** A structure start. {@code inhabitedTicks} is -1 if its chunk has never been generated. */
+	/** A structure start. {@code inhabitedTicks} is the most of any chunk it covers, or -1 if none has been generated. */
 	public record Found(String structure, int x, int z, double distance, long inhabitedTicks, Holder<Structure> holder, ChunkPos chunk) {
 		public boolean generated() {
 			return inhabitedTicks >= 0;
@@ -73,19 +73,13 @@ public final class StructureFinder {
 	 * structure turns out not to fit there after all.
 	 */
 	public static Footprint footprint(ServerLevel level, Found found) {
-		ChunkGeneratorStructureState generatorState = level.getChunkSource().getGeneratorState();
-		ChunkGenerator generator = level.getChunkSource().getGenerator();
-		RandomState randomState = generatorState.randomState();
-		Structure structure = found.holder().value();
-		StructureStart start = structure.generate(found.holder(), level.dimension(), level.registryAccess(), generator,
-			generator.getBiomeSource(), randomState.createClimateSampler(SamplerContext.builder().enableCaches().build()), randomState,
-			level.getServer().getStructureTemplateManager(), generatorState.getLevelSeed(), found.chunk(), 0, level,
-			structure.biomes()::contains);
-		if (!start.isValid()) {
+		StructureStart start = generateStart(level, found.holder(), found.chunk());
+		if (start == null) {
 			return null;
 		}
 
-		BiomeResolver biomes = generator.getBiomeSource().createCachingResolver(randomState);
+		ChunkGenerator generator = level.getChunkSource().getGenerator();
+		BiomeResolver biomes = generator.getBiomeSource().createCachingResolver(level.getChunkSource().getGeneratorState().randomState());
 		Map<String, Integer> counts = new HashMap<>();
 		Set<Long> sampled = new HashSet<>();
 		for (StructurePiece piece : start.getPieces()) {
@@ -106,6 +100,19 @@ public final class StructureFinder {
 		return new Footprint(start.getBoundingBox(), counts, sampled.size());
 	}
 
+	/** Server thread. The structure's start and pieces as generation builds them, in memory; null if it doesn't fit. */
+	private static StructureStart generateStart(ServerLevel level, Holder<Structure> holder, ChunkPos chunk) {
+		ChunkGeneratorStructureState generatorState = level.getChunkSource().getGeneratorState();
+		ChunkGenerator generator = level.getChunkSource().getGenerator();
+		RandomState randomState = generatorState.randomState();
+		Structure structure = holder.value();
+		StructureStart start = structure.generate(holder, level.dimension(), level.registryAccess(), generator,
+			generator.getBiomeSource(), randomState.createClimateSampler(SamplerContext.builder().enableCaches().build()), randomState,
+			level.getServer().getStructureTemplateManager(), generatorState.getLevelSeed(), chunk, 0, level,
+			structure.biomes()::contains);
+		return start.isValid() ? start : null;
+	}
+
 	/** min, min + step, ..., and always max, so a piece's corners are always sampled. */
 	private static int[] steps(int min, int max) {
 		int count = (max - min) / SAMPLE_STEP + 1;
@@ -117,8 +124,13 @@ public final class StructureFinder {
 		return steps;
 	}
 
-	/** How long players must have been within 128 blocks for a structure to count as visited. */
-	public static final long VISITED_TICKS = 20 * 60;
+	/** How long players must have been within 128 blocks of a structure's pieces for it to count as visited. */
+	public static final long VISITED_TICKS = 20;
+	/**
+	 * How far (in chunks) a structure's pieces can reach from its start chunk: jigsaw structures are capped at 128
+	 * blocks from the start. Beyond that, nothing generated around a start means nobody has been there.
+	 */
+	private static final int PIECE_REACH = 8;
 	private static final int MAX_CHECKS = 60_000;
 
 	private StructureFinder() {
@@ -266,10 +278,42 @@ public final class StructureFinder {
 					continue;
 				}
 			}
-			Found found = new Found(id, pos.getX(), pos.getZ(), distance, inhabited.ticks(chunk.x(), chunk.z()), structure, chunk);
+			Found found = new Found(id, pos.getX(), pos.getZ(), distance, timeNearby(level, structure, chunk, inhabited), structure, chunk);
 			if (filter.test(found)) {
 				results.add(found);
 			}
 		}
+	}
+
+	/**
+	 * How long players have spent near the structure: the most InhabitedTime of any chunk its pieces cover, or -1 if
+	 * none is generated. The start chunk alone isn't enough: a chunk only gains time while a player is within 128
+	 * blocks of it, and an end city's ship or a fortress's far bridges can be farther than that from its start.
+	 */
+	private static long timeNearby(ServerLevel level, Holder<Structure> structure, ChunkPos chunk, ChunkInhabitedTime inhabited) {
+		// Most candidates lie outside explored land; only build the pieces if something around the start is generated.
+		boolean explored = false;
+		for (int dx = -PIECE_REACH; dx <= PIECE_REACH && !explored; dx++) {
+			for (int dz = -PIECE_REACH; dz <= PIECE_REACH && !explored; dz++) {
+				explored = inhabited.ticks(chunk.x() + dx, chunk.z() + dz) >= 0;
+			}
+		}
+		long best = inhabited.ticks(chunk.x(), chunk.z());
+		StructureStart start = explored ? generateStart(level, structure, chunk) : null;
+		if (start == null) {
+			return best;
+		}
+		Set<Long> counted = new HashSet<>();
+		for (StructurePiece piece : start.getPieces()) {
+			BoundingBox box = piece.getBoundingBox();
+			for (int cx = SectionPos.blockToSectionCoord(box.minX()); cx <= SectionPos.blockToSectionCoord(box.maxX()); cx++) {
+				for (int cz = SectionPos.blockToSectionCoord(box.minZ()); cz <= SectionPos.blockToSectionCoord(box.maxZ()); cz++) {
+					if (counted.add(((long) cx << 32) | (cz & 0xFFFFFFFFL))) {
+						best = Math.max(best, inhabited.ticks(cx, cz));
+					}
+				}
+			}
+		}
+		return best;
 	}
 }

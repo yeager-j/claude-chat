@@ -6,7 +6,9 @@ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallba
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.world.level.storage.LevelResource;
 import net.fabricmc.fabric.api.client.message.v1.ClientSendMessageEvents;
@@ -204,6 +206,15 @@ public class ClaudeChatClient implements ClientModInitializer {
 			worldTools.prepare(server);
 			mcp.start();
 		});
+		// Time spent near chunks, which the game doesn't reliably save (see WorldIndex).
+		ServerChunkEvents.CHUNK_UNLOAD.register(worldIndex::chunkUnloaded);
+		ServerTickEvents.END_SERVER_TICK.register(server -> {
+			if (server.getTickCount() % 200 == 0) {
+				worldIndex.recordLoadedChunks(server);
+			}
+		});
+		ServerLifecycleEvents.AFTER_SAVE.register((server, flush, force) -> worldIndex.saveVisits(server));
+		ServerLifecycleEvents.SERVER_STOPPING.register(worldIndex::saveVisits);
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
 			knowledge.clearWorldPacks();
 			worldTools.clearTemplates();

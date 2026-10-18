@@ -96,7 +96,7 @@ All of these tab-complete.
 
 ## Privacy and safety
 
-- **Read-only.** Claude can read the reference files, search the web, and use the world tools. It can't edit files, run commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it.
+- **Read-only.** Claude can read the reference files, search the web, and use the world tools. It can't edit files, run commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
 - **Local only.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
   - The world tools are served only to the `claude` process the mod starts, on `127.0.0.1` with a random token. They stop when you leave the world.
@@ -108,7 +108,7 @@ All of these tab-complete.
 - **Multiplayer:** world questions only work in single-player. On a server, the world's contents and the server's data packs aren't available on your computer. Questions about the game and your mods still work.
 - **Timing:**
   - **Saved vs. live:** chunks near you are read live. Everything else comes from the last save, which can be up to 5 minutes behind.
-  - **Visited:** a structure counts as visited after about a minute within 128 blocks of it.
+  - **Visited:** a structure counts as visited once you've spent a second within 128 blocks of any part of it. Minecraft doesn't always save how long you've spent somewhere, so the mod keeps its own record in `claudechat-visits.txt` in the world folder. Time spent before you installed this version only counts where the game happened to save it.
 - **Predictions:** for places you've never been, biomes and structure layouts come from the seed and are exact, but blocks are only the base terrain (stone, water, air), without grass, caves cut by carvers, trees or ores. Worlds started in an older Minecraft version keep their old terrain and biomes where already generated.
 - **Speed:** answers take a few seconds for simple questions and longer for deep ones, and each question starts a fresh `claude` process. `/claude model haiku` is faster but makes more mistakes.
 

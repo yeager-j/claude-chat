@@ -322,18 +322,35 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 						"find_biomes' nearest deep dark is farther than /locate's");
 					JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
 
-					// Visit the nearest village for over a minute, come back, and check the visited filter flips.
+					// Visit the nearest village for a few seconds, come back, and check the visited filter flips.
 					var nearest = villages.getAsJsonArray("results").get(0).getAsJsonObject();
 					var home = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().position());
 					server.runCommand("spreadplayers " + nearest.get("x").getAsInt() + " " + nearest.get("z").getAsInt() + " 0 1 false @p");
-					// InhabitedTime only advances on ticks the chunk runs mob spawning, so give it margin over the 1-minute threshold.
-					context.waitTicks(100 * SECONDS);
-					server.runCommand("tp @p " + home.x() + " " + home.y() + " " + home.z());
+					context.waitTicks(10 * SECONDS);
+					// Generate and save land far away with nobody near, then stand in it. Nothing in the chunk changes,
+					// so the game doesn't write its new time; the visits file must have it.
+					server.runCommand("forceload add 3000 3000");
+					context.waitTicks(40);
+					server.runCommand("forceload remove 3000 3000");
+					context.waitTicks(40);
+					server.runOnServer(s -> s.saveEverything(true, true, true));
+					server.runCommand("spreadplayers 3000 3000 0 1 false @p");
 					context.waitTicks(5 * SECONDS);
+					server.runCommand("tp @p " + home.x() + " " + home.y() + " " + home.z());
+					context.waitTicks(10 * SECONDS);
 					server.runOnServer(s -> s.saveEverything(true, true, true));
 					context.waitTicks(40);
-					logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
-					logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
+					JsonObject unvisited = logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"unvisited\", \"limit\": 3}");
+					JsonObject visited = logTool(context, "find_structures", "{\"structure\": \"village\", \"visited\": \"visited\", \"limit\": 3}");
+					String villageAt = "\"x\":" + nearest.get("x").getAsInt() + ",\"z\":" + nearest.get("z").getAsInt();
+					check(visited.getAsJsonArray("results").toString().contains(villageAt), "visited village not listed as visited");
+					check(!unvisited.getAsJsonArray("results").toString().contains(villageAt), "visited village listed as unvisited");
+					Path visits = singleplayer.getServer().computeOnServer(s -> s.getWorldPath(LevelResource.ROOT)).resolve("claudechat-visits.txt");
+					List<String> lines = readLines(visits);
+					List<String> farChunk = lines.stream().filter(l -> l.startsWith("overworld 187 187 ")).toList();
+					LOGGER.info("visits file: {} lines, far chunk {}", lines.size(), farChunk);
+					// 5 seconds there is 100 ticks; leave margin for the teleports.
+					check(!farChunk.isEmpty() && Long.parseLong(farChunk.getFirst().split(" ")[3]) >= 60, "time in the far chunk wasn't recorded");
 
 					chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and find me a nether fortress in a warped forest");
 					context.waitTicks(5);
@@ -465,6 +482,14 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			// Xaero may be writing the file; the caller polls again.
 		}
 		return found;
+	}
+
+	private static List<String> readLines(Path file) {
+		try {
+			return Files.readAllLines(file);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	private static void writeTestPacks(Path datapacks) {
