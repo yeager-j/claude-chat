@@ -1392,7 +1392,7 @@ public final class WorldTools {
 	}
 
 	/** Minecraft compass: north is -Z, east is +X. */
-	private static String compass(double dx, double dz) {
+	static String compass(double dx, double dz) {
 		if (Math.abs(dx) < 2 && Math.abs(dz) < 2) {
 			return "here";
 		}

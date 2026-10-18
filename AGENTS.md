@@ -23,6 +23,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WAYPOINT_TEST=1` | Needs Xaero's Minimap via `-PextraMods`. Runs `[[waypoint:…]]` button commands, confirms Xaero's screen, checks `waypoints.txt` per dimension; `CLAUDECHAT_WAYPOINT_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_PERMISSION_TEST=1` | World with cheats off. Calls `run_command` in each tier with cheats off and on, clicks the chat Allow/Deny buttons (screenshots `claudechat-approval-*`), calls the `approve` tool over MCP; with `CLAUDECHAT_LIVE_TEST=1` Claude also creates a file and runs a command, and the test clicks Allow |
+| `CLAUDECHAT_LOOK_TEST=1` | Builds a wall with a glass window in front of the player, calls `look` and checks what it sees (diamonds through the glass, sign text, the near pig) and doesn't (a gold block and a pig behind the wall); saves the tool's screenshot as `claudechat-look-tool.png`. `CLAUDECHAT_LOOK_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), checks structure pieces against real generation, visits a village and a far chunk (checks the visited filter and `claudechat-visits.txt`), asks Claude |
 
 - **Test with real mods:** `-PextraMods="<folder of jars>"`. The user's mods are in `%APPDATA%\ModrinthApp\profiles\Fabric 26.3\mods`.
@@ -49,6 +50,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
 | `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
 | `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` and `approve` always, the eleven world tools and `run_command` only while a single-player world is open |
+| `ViewSnapshot` | `look`, in any world (multiplayer too): rays through the screen grid (refined on edges) plus an entity line-of-sight pass, reporting what's visible with image positions, and a screenshot of the same frame as MCP image content |
 | `GameCommands` | `run_command`: parses with the server's dispatcher, follows `execute … run`, and checks the words against its read-only list (runs in every tier) and destructive list (red warning). Player's own source, or GAMEMASTER level with cheats on |
 | `Approvals`, `ChatActions` | Ask for approval: chat request with [Allow]/[Deny], the `approve` tool for `--permission-prompt-tool`. Buttons run `/claude action <random id>` so no chat message can carry a working copy |
 

@@ -14,6 +14,7 @@ import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.Locale;
@@ -23,7 +24,8 @@ import java.util.concurrent.Executors;
 
 /**
  * A minimal MCP server ("Streamable HTTP" transport, JSON responses only) that gives Claude Code the mod's tools for
- * the whole game session: {@link ModTools} always, {@link WorldTools} only while a single-player world is open. Each
+ * the whole game session: {@link ModTools} always, {@link ViewSnapshot} while any world is open, {@link WorldTools}
+ * only while a single-player world is open. Each
  * question starts a new claude process, which lists the tools afresh. Listens on 127.0.0.1 on a random port and
  * requires a random bearer token, so only the claude process this mod starts can use it. Plain sockets rather than the
  * JDK's HTTP server, which some launchers' trimmed Java runtimes don't include.
@@ -34,14 +36,16 @@ public class McpServer {
 	private final ModTools modTools;
 	private final WorldTools worldTools;
 	private final GameCommands gameCommands;
+	private final ViewSnapshot view;
 	private final String token = newToken();
 	private volatile ServerSocket socket;
 	private ExecutorService workers;
 
-	public McpServer(ModTools modTools, WorldTools worldTools, GameCommands gameCommands) {
+	public McpServer(ModTools modTools, WorldTools worldTools, GameCommands gameCommands, ViewSnapshot view) {
 		this.modTools = modTools;
 		this.worldTools = worldTools;
 		this.gameCommands = gameCommands;
+		this.view = view;
 	}
 
 	/** Are the world tools offered right now? */
@@ -257,7 +261,8 @@ public class McpServer {
 				result.add("serverInfo", info);
 				result.addProperty("instructions", "Tools for the player's Minecraft game: decompile a mod's code on demand, and "
 					+ "while a single-player world is open, the player's world: what's stored where, entities, the player's "
-					+ "inventory, and structure locations. They compute distances and directions.");
+					+ "inventory, and structure locations. They compute distances and directions. In any world, look describes what "
+					+ "the player sees right now.");
 				response.add("result", result);
 			}
 			case "ping" -> response.add("result", new JsonObject());
@@ -265,6 +270,9 @@ public class McpServer {
 				JsonArray tools = modTools.definitions();
 				// Always listed so --permission-prompt-tool finds it; --disallowedTools hides it from Claude itself.
 				tools.add(Approvals.definition());
+				if (view.available()) {
+					tools.add(view.definition());
+				}
 				if (worldTools.available()) {
 					tools.addAll(worldTools.definitions());
 				}
@@ -293,12 +301,22 @@ public class McpServer {
 		JsonArray content = new JsonArray();
 		JsonObject text = new JsonObject();
 		text.addProperty("type", "text");
+		JsonObject image = null;
 		try {
 			JsonElement output;
 			if (name.equals(Approvals.TOOL)) {
 				output = Approvals.handlePrompt(args);
 			} else if (modTools.has(name)) {
 				output = modTools.call(name, args);
+			} else if (name.equals(ViewSnapshot.TOOL) && view.available()) {
+				ViewSnapshot.Result look = view.call(args);
+				output = look.data();
+				if (look.png() != null) {
+					image = new JsonObject();
+					image.addProperty("type", "image");
+					image.addProperty("data", Base64.getEncoder().encodeToString(look.png()));
+					image.addProperty("mimeType", "image/png");
+				}
 			} else if (name.equals(GameCommands.TOOL) && gameCommands.available()) {
 				output = gameCommands.call(args);
 			} else if (worldTools.available()) {
@@ -314,6 +332,9 @@ public class McpServer {
 			result.addProperty("isError", true);
 		}
 		content.add(text);
+		if (image != null) {
+			content.add(image);
+		}
 		result.add("content", content);
 		return result;
 	}

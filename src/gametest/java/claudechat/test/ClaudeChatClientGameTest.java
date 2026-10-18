@@ -13,6 +13,7 @@ import claudechat.StructureFinder;
 import net.minecraft.resources.ResourceKey;
 import java.util.Map;
 import java.util.TreeMap;
+import claudechat.ViewSnapshot;
 import claudechat.Waypoints;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -274,6 +275,13 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				// buttons clicked the way chat does (sendUnattendedCommand, which Fabric hands to client commands).
 				if (permissionTest) {
 					testPermissions(context, singleplayer);
+				}
+
+				// 4f. Optionally, the look tool: a scene in front of the player with a stone wall and a glass window. The
+				// diamond blocks behind the window must be seen through glass; the gold block and the pig behind the
+				// wall must not be seen at all.
+				if ("1".equals(System.getenv("CLAUDECHAT_LOOK_TEST"))) {
+					testLook(context, singleplayer);
 				}
 
 				// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).
@@ -616,6 +624,76 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	private static void check(boolean condition, String message) {
 		if (!condition) {
 			throw new AssertionError(message);
+		}
+	}
+
+	/**
+	 * Builds a scene facing north from the player's position, calls look and checks what it saw and didn't see. Relative
+	 * to the player, so it works in the superflat and the normal test world.
+	 */
+	private static void testLook(ClientGameTestContext context, TestSingleplayerContext singleplayer) {
+		var p = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition());
+		int x = p.getX();
+		int y = p.getY();
+		int z = p.getZ();
+		List<String> commands = List.of(
+			"fill " + (x - 6) + " " + y + " " + (z - 9) + " " + (x + 6) + " " + (y + 8) + " " + (z + 2) + " air",
+			"fill " + (x - 6) + " " + (y - 1) + " " + (z - 9) + " " + (x + 6) + " " + (y - 1) + " " + (z + 2) + " grass_block",
+			"kill @e[type=!player]",
+			"fill " + (x - 3) + " " + y + " " + (z - 4) + " " + (x + 3) + " " + (y + 4) + " " + (z - 4) + " stone",
+			"fill " + (x + 1) + " " + (y + 1) + " " + (z - 4) + " " + (x + 2) + " " + (y + 2) + " " + (z - 4) + " glass",
+			"fill " + (x + 1) + " " + (y + 1) + " " + (z - 6) + " " + (x + 2) + " " + (y + 2) + " " + (z - 6) + " diamond_block",
+			"setblock " + (x - 2) + " " + (y + 2) + " " + (z - 6) + " gold_block",
+			"setblock " + (x - 2) + " " + y + " " + (z - 2) + " oak_sign[rotation=8]{front_text:{messages:[\"Hello\",\"Claude\",\"\",\"\"]}}",
+			"setblock " + (x + 2) + " " + y + " " + (z - 3) + " torch",
+			"summon pig " + (x - 1 + 0.5) + " " + y + " " + (z - 2 + 0.5) + " {NoAI:1b,CustomName:\"Visible\"}",
+			"summon pig " + (x + 0.5) + " " + y + " " + (z - 7 + 0.5) + " {NoAI:1b,CustomName:\"Hidden\"}",
+			"tp @p " + (x + 0.5) + " " + y + " " + (z + 0.5) + " 180 0");
+		commands.forEach(singleplayer.getServer()::runCommand);
+		context.waitTicks(20);
+		singleplayer.getConnection().waitForChunksRender();
+		context.takeScreenshot("claudechat-look");
+
+		// Called directly rather than through logTool, to keep the screenshot; it's saved next to the test's own.
+		long start = System.nanoTime();
+		CompletableFuture<ViewSnapshot.Result> result = CompletableFuture.supplyAsync(() -> {
+			try {
+				return ClaudeChatClient.viewSnapshot().call(new JsonObject());
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+		});
+		context.waitFor(mc -> result.isDone(), 60 * SECONDS);
+		JsonObject look = result.join().data();
+		LOGGER.info("tool look ({} ms) -> {}", (System.nanoTime() - start) / 1_000_000, look);
+		byte[] png = result.join().png();
+		check(png != null && png.length > 1000, "no screenshot: " + look.get("screenshot"));
+		try {
+			Files.write(FabricLoader.getInstance().getGameDir().resolve("screenshots/claudechat-look-tool.png"), png);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+		String blocks = look.getAsJsonArray("blocks").toString();
+		String entities = look.getAsJsonArray("entities").toString();
+		check("stone".equals(look.getAsJsonObject("crosshair").has("block") ? look.getAsJsonObject("crosshair").get("block").getAsString() : null),
+			"crosshair isn't on the stone wall: " + look.get("crosshair"));
+		check(blocks.contains("\"diamond_block\"") && blocks.matches(".*\"diamond_block\"[^}]*\"seen_through\":\"glass.*"),
+			"diamond blocks not seen through the glass: " + blocks);
+		check(!blocks.contains("gold_block"), "saw the gold block behind the wall");
+		check(blocks.contains("\"torch\""), "missed the torch");
+		check(look.has("block_details") && look.get("block_details").toString().contains("Hello / Claude"), "sign text missing");
+		check(entities.contains("Visible") && !entities.contains("Hidden"), "wrong pigs: " + entities);
+		check(entities.contains("\"in_image\"") && blocks.matches(".*\"diamond_block\"[^}]*\"in_image\".*"), "image positions missing");
+
+		String question = System.getenv("CLAUDECHAT_LOOK_QUESTION");
+		if (question != null && !question.isBlank()) {
+			chat(context, "@claude " + question);
+			context.waitTicks(5);
+			context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+			context.waitTicks(10);
+			openChat(context);
+			context.takeScreenshot("claudechat-look-answer");
+			context.getInput().pressKey(KEY_ESCAPE);
 		}
 	}
 

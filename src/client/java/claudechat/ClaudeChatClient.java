@@ -55,6 +55,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static WorldTools worldTools;
 	private static ModTools modTools;
 	private static GameCommands gameCommands;
+	private static ViewSnapshot viewSnapshot;
 	private static final StatusLine status = new StatusLine();
 
 	/** For the client game test: is a question still being answered? */
@@ -75,6 +76,11 @@ public class ClaudeChatClient implements ClientModInitializer {
 	/** For the client game test: call the world tools directly, without Claude. */
 	public static WorldTools worldTools() {
 		return worldTools;
+	}
+
+	/** For the client game test: the look tool, called directly without Claude. */
+	public static ViewSnapshot viewSnapshot() {
+		return viewSnapshot;
 	}
 
 	/** For the client game test: run_command, called directly without Claude. */
@@ -101,7 +107,8 @@ public class ClaudeChatClient implements ClientModInitializer {
 		modTools = new ModTools(knowledge);
 		gameCommands = new GameCommands(config, worldIndex);
 		// Serves Claude the mod tools for the whole session, plus the world tools while a single-player world is open.
-		mcp = new McpServer(modTools, worldTools, gameCommands);
+		viewSnapshot = new ViewSnapshot();
+		mcp = new McpServer(modTools, worldTools, gameCommands, viewSnapshot);
 		mcp.start();
 		cli = new ClaudeCli(config, knowledge, mcp);
 		formatter = new ChatFormatter(new RecipeRenderer(knowledge));

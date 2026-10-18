@@ -92,6 +92,13 @@ public class ClaudeCli {
 
 		The player is on a multiplayer server, so their world's contents and structure locations aren't available.
 		""";
+	private static final String LOOK_PROMPT = """
+		mcp__minecraft__look shows what the player sees right now: a screenshot, plus the block or entity under the
+		crosshair and the visible blocks and entities with their positions and where they are in the image. Use it when
+		the player says "this", "that" or "here", asks what they're looking at, or wants help with what's in front of
+		them. Shaders and resource packs can make the screenshot misleading, so name things from the data. It reports
+		only what's in view, so for anything else use the other tools.
+		""";
 
 	private static final String READ_ONLY_PROMPT = """
 
@@ -176,6 +183,7 @@ public class ClaudeCli {
 			+ (Waypoints.available() ? WAYPOINT_PROMPT : "")
 			+ "\nCurrent game state:\n" + gameContext
 			+ (mcp.worldOpen() ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
+			+ LOOK_PROMPT
 			+ permissionsPrompt()
 			+ "\n" + knowledge.describeForPrompt()
 			+ (config.extraInstructions.isEmpty() ? "" : "\n" + config.extraInstructions + "\n");
