@@ -96,16 +96,10 @@ public final class Approvals {
 		if (warning != null) {
 			send(Component.literal("  " + warning).withStyle(ChatFormatting.RED));
 		}
-		Component allow = ChatActions.button("Allow", ChatFormatting.GREEN, Component.literal("Let Claude " + action), () -> {
-			if (!answer.complete(true)) {
-				info("Too late: that request was already answered or timed out.");
-			}
-		});
-		Component deny = ChatActions.button("Deny", ChatFormatting.RED, Component.literal("Claude is told no"), () -> {
-			if (!answer.complete(false)) {
-				info("Too late: that request was already answered or timed out.");
-			}
-		});
+		Component allow = ChatActions.button("Allow", ChatFormatting.GREEN, Component.literal("Let Claude " + action), () ->
+			info(answer.complete(true) ? "Allowed." : "Too late: that request was already answered or timed out."));
+		Component deny = ChatActions.button("Deny", ChatFormatting.RED, Component.literal("Claude is told no"), () ->
+			info(answer.complete(false) ? "Denied." : "Too late: that request was already answered or timed out."));
 		lastAllow = allow;
 		lastDeny = deny;
 		send(Component.empty().append("  ").append(allow).append(" ").append(deny));
@@ -142,7 +136,7 @@ public final class Approvals {
 				String content = string(input, "content");
 				boolean exists = !path.isEmpty() && Files.exists(Path.of(path));
 				yield ask((exists ? "overwrite " : "create ") + displayPath(path),
-					hoverable(Component.literal(content.lines().count() + " lines").withStyle(ChatFormatting.GRAY), content), null);
+					hoverable(Component.literal(lines(content.lines().count())).withStyle(ChatFormatting.GRAY), content), null);
 			}
 			default -> ask("use " + tool, code(input.toString(), null), null);
 		};
@@ -167,7 +161,7 @@ public final class Approvals {
 	private static Component diff(String oldText, String newText) {
 		MutableComponent line = Component.empty()
 			.append(Component.literal("-" + oldText.lines().count() + " ").withStyle(ChatFormatting.RED))
-			.append(Component.literal("+" + newText.lines().count() + " lines").withStyle(ChatFormatting.GREEN));
+			.append(Component.literal("+" + lines(newText.lines().count())).withStyle(ChatFormatting.GREEN));
 		return hoverable(line, "Replace:\n" + shorten(oldText, HOVER_CHARS / 2) + "\n\nWith:\n" + shorten(newText, HOVER_CHARS / 2));
 	}
 
@@ -183,6 +177,10 @@ public final class Approvals {
 		Path gameDir = FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
 		Path p = Path.of(path).toAbsolutePath().normalize();
 		return p.startsWith(gameDir) ? gameDir.relativize(p).toString().replace('\\', '/') : p.toString();
+	}
+
+	private static String lines(long count) {
+		return count + (count == 1 ? " line" : " lines");
 	}
 
 	private static String shorten(String text, int max) {

@@ -71,6 +71,8 @@ Questions in the same world continue one conversation, so follow-ups work.
 | `/claude model <haiku\|sonnet\|opus\|fable\|id>` | Choose the model (default: Sonnet) |
 | `/claude effort <low\|medium\|high\|xhigh\|max\|default>` | How hard Claude thinks |
 | `/claude reset` | Start a new conversation |
+| `/claude permissions <read_only\|ask\|full>` | What Claude may do beyond reading (see [Permissions](#permissions)) |
+| `/claude cheats <on\|off>` | Whether Claude's game commands may cheat where you can't |
 | `/claude knowledge` | What's decompiled and what's data-only (hover a mod for details) |
 | `/claude knowledge include <mod>` | Always decompile a mod's code |
 | `/claude knowledge exclude <mod>` | Never decompile a mod (its data stays searchable) |
@@ -93,10 +95,26 @@ All of these tab-complete.
 | `buildKnowledge` | `true` | Decompile Minecraft at startup |
 | `knowledgeInclude`, `knowledgeExclude` | | Mod ids, comma-separated |
 | `extraInstructions` | | Added to Claude's instructions, e.g. `Answer like a pirate.` |
+| `permissions` | `read_only` | `read_only`, `ask` or `full` |
+| `cheats` | `false` | |
+
+## Permissions
+
+| `/claude permissions` | Files and shell | Game commands (single-player) |
+| --- | --- | --- |
+| `read_only` (default) | Read and search only | Only ones that change nothing: `time query`, `data get`, `gamerule <name>`, `execute if …` |
+| `ask` | Edits, new files and shell commands each wait for you to click **[Allow]** or **[Deny]** in chat. Commands that only read run straight away | The same: read-only ones run, every other one asks. Destructive ones (`clear`, `kill`, `fill`…) are marked in red, with the block count for `fill` and `clone` |
+| `full` | Anything, without asking | Anything, without asking |
+
+- The mod decides which game commands need your OK; Claude Code's own judgment isn't used for them. Commands added by mods always ask.
+- No answer within 2 minutes counts as Deny. A sound plays and the status line says so, since chat fades while closed.
+- Every game command Claude runs is shown in chat, with the game's response on hover.
+- `/claude cheats` decides *what* is possible. Off: Claude's commands run with your own permissions, so in a world without cheats it can't `/give` or `/gamemode` either. On: they run at command block level, as you. The world list still shows cheats off.
+- Turning on `full` or cheats needs a click on a confirm button.
 
 ## Privacy and safety
 
-- **Read-only.** Claude can read the reference files, search the web, and use the world tools. It can't edit files, run commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
+- **Read-only by default.** Claude can read the reference files, search the web, and use the world tools. Unless you change `/claude permissions`, it can't edit files, run shell commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
 - **Local only.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
   - The mod's tools are served only to the `claude` process the mod starts, on `127.0.0.1` with a random token. The world tools are offered only while a single-player world is open.

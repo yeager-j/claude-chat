@@ -21,6 +21,7 @@ import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.server.permissions.LevelBasedPermissionSet;
+import net.minecraft.server.permissions.PermissionLevel;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -45,10 +46,10 @@ public class GameCommands {
 
 	/**
 	 * Commands that change nothing. Words are literal parts of the command, "*" is any one part, and a trailing "$"
-	 * means nothing may follow (so "gamerule keepInventory" reads, "gamerule keepInventory true" doesn't).
+	 * means nothing may follow (so "gamerule keep_inventory" reads, "gamerule keep_inventory true" doesn't).
 	 */
 	static final List<String> READ_ONLY = List.of(
-		"help", "list", "seed", "locate", "version", "time query", "data get", "tick query", "team list",
+		"help", "list", "seed", "locate", "version", "time query", "time of * query", "data get", "tick query", "team list",
 		"bossbar list", "bossbar get", "forceload query", "datapack list", "worldborder get", "experience query", "xp query",
 		"scoreboard objectives list", "scoreboard players list", "scoreboard players get",
 		"attribute * * get", "attribute * * base get", "attribute * * modifier value get",
@@ -149,7 +150,7 @@ public class GameCommands {
 			String hint = "";
 			if (!config.cheats) {
 				ParseResults<CommandSourceStack> elevated = server.getCommands().getDispatcher()
-					.parse(command, own.withMaximumPermission(LevelBasedPermissionSet.GAMEMASTER));
+					.parse(command, atLeastGamemaster(own));
 				if (Commands.getParseException(elevated) == null) {
 					hint = " This command needs cheats, which this world doesn't allow for the player, and Claude's cheats"
 						+ " setting is off. Tell the player instead; they can allow it with /claude cheats on.";
@@ -229,7 +230,17 @@ public class GameCommands {
 
 	private CommandSourceStack source(ServerPlayer player) {
 		CommandSourceStack own = player.createCommandSourceStack();
-		return config.cheats ? own.withMaximumPermission(LevelBasedPermissionSet.GAMEMASTER) : own;
+		return config.cheats ? atLeastGamemaster(own) : own;
+	}
+
+	/**
+	 * Not withMaximumPermission: in 26.3 LevelBasedPermissionSet.union keeps the lower of two levels, so a player at
+	 * level ALL stayed at ALL. A player who already has more (cheats on, or op) keeps it.
+	 */
+	private static CommandSourceStack atLeastGamemaster(CommandSourceStack source) {
+		boolean enough = source.permissions() instanceof LevelBasedPermissionSet level
+			&& level.level().isEqualOrHigherThan(PermissionLevel.GAMEMASTERS);
+		return enough ? source : source.withPermission(LevelBasedPermissionSet.GAMEMASTER);
 	}
 
 	private MinecraftServer server() {

@@ -1,7 +1,13 @@
 package claudechat.test;
 
+import claudechat.Approvals;
+import claudechat.ChatActions;
 import claudechat.ClaudeChatClient;
+import claudechat.ClaudeConfig;
 import claudechat.KnowledgeBase;
+import net.minecraft.network.chat.Component;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
 import claudechat.Schematics;
 import claudechat.StructureFinder;
 import net.minecraft.resources.ResourceKey;
@@ -87,7 +93,12 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		boolean templateTest = "1".equals(System.getenv("CLAUDECHAT_TEMPLATE_TEST"));
 		String waypointQuestion = System.getenv("CLAUDECHAT_WAYPOINT_QUESTION");
 		waypointQuestion = waypointQuestion == null || waypointQuestion.isBlank() ? null : waypointQuestion;
+		boolean permissionTest = "1".equals(System.getenv("CLAUDECHAT_PERMISSION_TEST"));
 		var builder = context.worldBuilder();
+		if (permissionTest) {
+			// Cheats off, so the cheats setting decides whether Claude's /give works.
+			builder.adjustSettings(settings -> settings.setAllowCommands(false));
+		}
 		// Template and waypoint questions lead Claude to look for structures, so give it a world that has them.
 		if (worldTest || templateTest || waypointQuestion != null) {
 			// The default test world is superflat with structures off; structure finding needs a normal world.
@@ -257,6 +268,12 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 						context.takeScreenshot("claudechat-waypoint-answer");
 						context.getInput().pressKey(KEY_ESCAPE);
 					}
+				}
+
+				// 4e. Optionally, permissions: run_command in each tier, with cheats off and on, and the chat approval
+				// buttons clicked the way chat does (sendUnattendedCommand, which Fabric hands to client commands).
+				if (permissionTest) {
+					testPermissions(context, singleplayer);
 				}
 
 				// 5. Optionally, the world index: things placed near the player (live) and far away (only in the save file).
@@ -443,6 +460,156 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				throw t;
 			}
 		}
+	}
+
+	private static void testPermissions(ClientGameTestContext context, TestSingleplayerContext singleplayer) {
+		ClaudeConfig config = ClaudeChatClient.config();
+		ClaudeConfig.Permissions savedPermissions = config.permissions;
+		boolean savedCheats = config.cheats;
+		var server = singleplayer.getServer();
+		try {
+			check(mcpToolNames().contains("run_command") && mcpToolNames().contains("approve"), "run_command or approve not offered");
+
+			// Read only, cheats on: commands that change nothing run, the rest are refused.
+			config.permissions = ClaudeConfig.Permissions.READ_ONLY;
+			config.cheats = true;
+			for (String command : List.of("time query time", "/execute if entity @s", "gamerule keep_inventory",
+				"scoreboard objectives list", "execute as @s at @s if block ~ ~-1 ~ minecraft:air")) {
+				JsonObject r = runCommand(context, command);
+				check(!r.has("error"), "read-only command refused: " + command + " -> " + r);
+			}
+			for (String command : List.of("gamerule keep_inventory true", "execute as @s run kill @s", "give @s minecraft:diamond",
+				"execute store result score @s x if entity @s", "time set night")) {
+				JsonObject r = runCommand(context, command);
+				check(r.has("error") && r.get("error").getAsString().contains("Read only"), "changing command not refused: " + command + " -> " + r);
+			}
+
+			// Cheats off: the player's own permissions, which in this world can't run cheat commands at all.
+			config.cheats = false;
+			config.permissions = ClaudeConfig.Permissions.FULL;
+			JsonObject noCheats = runCommand(context, "give @s minecraft:diamond");
+			check(noCheats.has("error") && noCheats.get("error").getAsString().contains("/claude cheats on"), "give ran without cheats: " + noCheats);
+			check(!hasDiamond(server), "diamond given without cheats");
+			// Cheats on: the same command at command block level, still as the player.
+			config.cheats = true;
+			JsonObject cheated = runCommand(context, "give @s minecraft:diamond");
+			check(cheated.has("success") && cheated.get("success").getAsBoolean() && cheated.has("note"), "give with cheats failed: " + cheated);
+			check(hasDiamond(server), "no diamond after give with cheats");
+
+			// Ask for approval: read-only commands don't ask; others wait for a click.
+			config.permissions = ClaudeConfig.Permissions.ASK;
+			Component before = Approvals.lastAllow;
+			check(!runCommand(context, "time query time").has("error") && Approvals.lastAllow == before, "a read-only command asked");
+			var below = server.computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition().below());
+			JsonObject denied = withApproval(context, "setblock ~ ~-1 ~ minecraft:gold_block", false, "claudechat-approval-setblock");
+			check(denied.has("error") && denied.get("error").getAsString().contains("denied"), "denied setblock ran: " + denied);
+			check(!server.computeOnServer(s -> s.overworld().getBlockState(below).is(Blocks.GOLD_BLOCK)), "block placed after Deny");
+			JsonObject allowed = withApproval(context, "fill ~-2 ~-1 ~-2 ~2 ~-1 ~2 minecraft:gold_block", true, "claudechat-approval-fill");
+			check(allowed.has("success") && allowed.get("success").getAsBoolean(), "allowed fill failed: " + allowed);
+			check(server.computeOnServer(s -> s.overworld().getBlockState(below).is(Blocks.GOLD_BLOCK)), "no gold block after Allow");
+			// A used button does nothing: "That button has expired."
+			click(context, Approvals.lastAllow);
+
+			// Claude Code's own permission prompts, through the MCP tool as claude calls it.
+			CompletableFuture<JsonObject> prompt = CompletableFuture.supplyAsync(() -> mcpCall("tools/call",
+				"{\"name\": \"approve\", \"arguments\": {\"tool_name\": \"Write\", \"input\": {\"file_path\": \"config/x.txt\", \"content\": \"hi\\nthere\"}}}"));
+			answer(context, true, "claudechat-approval-write");
+			context.waitFor(mc -> prompt.isDone(), 10 * SECONDS);
+			JsonObject decision = JsonParser.parseString(prompt.join().getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString()).getAsJsonObject();
+			LOGGER.info("approve Write -> {}", decision);
+			check(decision.get("behavior").getAsString().equals("allow") && decision.getAsJsonObject("updatedInput").get("content").getAsString().equals("hi\nthere"),
+				"approve tool didn't allow with the input: " + decision);
+
+			// Live: Claude asks, the test clicks Allow, and the change happens.
+			if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
+				Path file = FabricLoader.getInstance().getGameDir().resolve("config/claude-permission-test.txt");
+				try {
+					Files.deleteIfExists(file);
+				} catch (IOException e) {
+					throw new UncheckedIOException(e);
+				}
+				Component last = Approvals.lastAllow;
+				chat(context, "@claude create the file config/claude-permission-test.txt in the game folder containing the word hello,"
+					+ " then set the time to midnight with a command");
+				for (int i = 0; i < 4 && !(Files.exists(file) && !ClaudeChatClient.isBusy()); i++) {
+					Component seen = last;
+					context.waitFor(mc -> Approvals.lastAllow != seen || !ClaudeChatClient.isBusy(), 180 * SECONDS);
+					if (Approvals.lastAllow == seen) {
+						break;
+					}
+					last = Approvals.lastAllow;
+					context.waitTicks(10);
+					openChat(context);
+					context.takeScreenshot("claudechat-live-approval-" + i);
+					context.getInput().pressKey(KEY_ESCAPE);
+					click(context, last);
+				}
+				context.waitFor(mc -> !ClaudeChatClient.isBusy(), 180 * SECONDS);
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-live-permissions-answer");
+				context.getInput().pressKey(KEY_ESCAPE);
+				check(Files.exists(file), "Claude didn't create the file after Allow");
+			}
+		} finally {
+			config.permissions = savedPermissions;
+			config.cheats = savedCheats;
+			config.save();
+			// The live crafter question expects the crafter in the first hotbar slot.
+			server.runCommand("clear @a minecraft:diamond");
+		}
+	}
+
+	/** Runs the command through run_command, waits for the request in chat, screenshots it and clicks Allow or Deny. */
+	private static JsonObject withApproval(ClientGameTestContext context, String command, boolean allow, String screenshot) {
+		CompletableFuture<JsonObject> result = CompletableFuture.supplyAsync(() -> callRunCommand(command));
+		answer(context, allow, screenshot);
+		context.waitFor(mc -> result.isDone(), 30 * SECONDS);
+		JsonObject r = result.join();
+		LOGGER.info("run_command {} ({}) -> {}", command, allow ? "allowed" : "denied", r);
+		return r;
+	}
+
+	/** Waits for a new approval request, screenshots it and clicks. */
+	private static void answer(ClientGameTestContext context, boolean allow, String screenshot) {
+		Component before = Approvals.lastAllow;
+		context.waitFor(mc -> Approvals.lastAllow != before, 10 * SECONDS);
+		context.waitTicks(5);
+		openChat(context);
+		context.takeScreenshot(screenshot);
+		context.getInput().pressKey(KEY_ESCAPE);
+		click(context, allow ? Approvals.lastAllow : Approvals.lastDeny);
+	}
+
+	/** Clicks a ChatActions button as chat does. Without Fabric's client command hook this would go to the server. */
+	private static void click(ClientGameTestContext context, Component button) {
+		String id = ChatActions.idOf(button);
+		context.runOnClient(mc -> mc.player.connection.sendUnattendedCommand("claude action " + id, null));
+	}
+
+	private static JsonObject runCommand(ClientGameTestContext context, String command) {
+		CompletableFuture<JsonObject> result = CompletableFuture.supplyAsync(() -> callRunCommand(command));
+		context.waitFor(mc -> result.isDone(), 30 * SECONDS);
+		JsonObject r = result.join();
+		LOGGER.info("run_command {} -> {}", command, r);
+		return r;
+	}
+
+	/** run_command's result, or {"error": message} as Claude would see it. */
+	private static JsonObject callRunCommand(String command) {
+		JsonObject args = new JsonObject();
+		args.addProperty("command", command);
+		try {
+			return ClaudeChatClient.gameCommands().call(args).getAsJsonObject();
+		} catch (Exception e) {
+			JsonObject error = new JsonObject();
+			error.addProperty("error", String.valueOf(e.getMessage()));
+			return error;
+		}
+	}
+
+	private static boolean hasDiamond(net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext server) {
+		return server.computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().getInventory().contains(stack -> stack.is(Items.DIAMOND)));
 	}
 
 	/** Runs a world tool off the test thread (it waits on the server thread, which the test thread drives) and logs it. */

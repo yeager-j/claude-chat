@@ -22,6 +22,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WAYPOINT_TEST=1` | Needs Xaero's Minimap via `-PextraMods`. Runs `[[waypoint:…]]` button commands, confirms Xaero's screen, checks `waypoints.txt` per dimension; `CLAUDECHAT_WAYPOINT_QUESTION="..."` also asks Claude |
+| `CLAUDECHAT_PERMISSION_TEST=1` | World with cheats off. Calls `run_command` in each tier with cheats off and on, clicks the chat Allow/Deny buttons (screenshots `claudechat-approval-*`), calls the `approve` tool over MCP; with `CLAUDECHAT_LIVE_TEST=1` Claude also creates a file and runs a command, and the test clicks Allow |
 | `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), checks structure pieces against real generation, visits a village and a far chunk (checks the visited filter and `claudechat-visits.txt`), asks Claude |
 
 - **Test with real mods:** `-PextraMods="<folder of jars>"`. The user's mods are in `%APPDATA%\ModrinthApp\profiles\Fabric 26.3\mods`.
@@ -47,14 +48,16 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
 | `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
 | `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
-| `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` always, the eleven world tools only while a single-player world is open |
+| `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` and `approve` always, the eleven world tools and `run_command` only while a single-player world is open |
+| `GameCommands` | `run_command`: parses with the server's dispatcher, follows `execute … run`, and checks the words against its read-only list (runs in every tier) and destructive list (red warning). Player's own source, or GAMEMASTER level with cheats on |
+| `Approvals`, `ChatActions` | Ask for approval: chat request with [Allow]/[Deny], the `approve` tool for `--permission-prompt-tool`. Buttons run `/claude action <random id>` so no chat message can carry a working copy |
 
 ## Conventions
 
 - Tabs for indentation. Javadoc on classes and on non-obvious methods; comments explain *why*.
 - No new runtime dependencies. Vineflower is the only bundled jar. The MCP server uses plain sockets on purpose: some launchers' trimmed Java runtimes lack `jdk.httpserver`.
 - Everything is client-side (`"environment": "client"`). World access goes through the integrated server only, so multiplayer gets no world tools.
-- Claude gets read-only tools only: `Read,Grep,Glob,WebSearch,WebFetch` plus `mcp__minecraft`. Never add Edit, Write or Bash.
+- **Read only by default.** `Read,Grep,Glob,WebSearch,WebFetch` plus `mcp__minecraft`. Edit, Write, Bash and PowerShell come only from `/claude permissions ask` or `full` (`ClaudeCli.permissionFlags`), never by default and never from a migration. Anything that changes the world goes through `run_command`'s own rules; don't pre-approve it in Claude Code.
 - **Never commit decompiled Minecraft or mod code.** It lives under `run/` and `build/`, which are gitignored.
 
 ## Looking up Minecraft APIs
@@ -90,6 +93,9 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 - **stream-json events:** `--output-format stream-json` needs `--verbose`. Each content block is its own `assistant` event, so text is only known to be a progress note once a later tool call arrives (`readStream`).
 - **Windows argument quoting:** this breaks JSON and long strings. The system prompt and MCP config go in files (`--append-system-prompt-file`, `--mcp-config <file>`), and the question goes over stdin.
 - **Tool flags:** `--tools` limits built-in tools. MCP tools are allowed with `--allowedTools mcp__minecraft`, and `--strict-mcp-config` keeps the user's other MCP servers out.
+- **Permission prompts under `-p`:** there's no terminal to ask in. `--permission-prompt-tool mcp__minecraft__approve` sends each prompt to our MCP tool as `{tool_name, input, tool_use_id}`. It answers `{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`. `--disallowedTools` hides the tool from Claude but it still handles prompts. Shell commands that only read never prompt. A 150 s wait in the tool was fine.
+- **Auto mode doesn't judge game commands:** `--permission-mode auto` works under `-p`, but its classifier let a 41×38×41 `/fill … air` and `/clear` through when the player asked vaguely. That's why there's no "Approve for me" tier and why `run_command` classifies commands itself.
+- **Empty arguments in PowerShell 5.1:** `--tools ""` is dropped when calling a native command, which shifts every flag after it. Pass a real value.
 - **Model choice:** Haiku made up recipe details around correct grids, so the default is Sonnet. Keep the prompt rule that a `[[recipe:…]]` grid stands alone.
 
 **World data**
@@ -102,6 +108,9 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
   - "Visited" is ≥ 1 s.
 - **Section palettes:** in 26.x a palette entry is a bare string (`"minecraft:spawner"`) when the block is in its default state, otherwise `{id, properties}`, no longer `{Name, Properties}`. Use `WorldIndex.paletteName`.
 - **26.x paths:** player data is in `players/data`, and dimensions are under `dimensions/<ns>/<path>/{region,entities}`. Use `DimensionType.getStorageFolder`.
+
+**Game commands**
+- **Raising permissions:** `CommandSourceStack.withMaximumPermission` doesn't raise anything in 26.3: `LevelBasedPermissionSet.union` keeps the *lower* level. `GameCommands.atLeastGamemaster` compares levels itself and uses `withPermission`.
 
 **Xaero waypoints**
 - **No Xaero dependency:** the button's `RunCommand` goes through `sendUnattendedCommand`, which Xaero's mixin cancels at HEAD for `xaero_waypoint_add:` and answers with its Add Waypoint screen. Without Xaero the command would reach the server, so `Waypoints.button` renders nothing then.
