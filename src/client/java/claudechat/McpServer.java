@@ -261,6 +261,8 @@ public class McpServer {
 			case "ping" -> response.add("result", new JsonObject());
 			case "tools/list" -> {
 				JsonArray tools = modTools.definitions();
+				// Always listed so --permission-prompt-tool finds it; --disallowedTools hides it from Claude itself.
+				tools.add(Approvals.definition());
 				if (worldTools.available()) {
 					tools.addAll(worldTools.definitions());
 				}
@@ -288,7 +290,9 @@ public class McpServer {
 		text.addProperty("type", "text");
 		try {
 			JsonElement output;
-			if (modTools.has(name)) {
+			if (name.equals(Approvals.TOOL)) {
+				output = Approvals.handlePrompt(args);
+			} else if (modTools.has(name)) {
 				output = modTools.call(name, args);
 			} else if (worldTools.available()) {
 				output = worldTools.call(name, args);

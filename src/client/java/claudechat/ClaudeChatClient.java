@@ -236,8 +236,10 @@ public class ClaudeChatClient implements ClientModInitializer {
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
 			cli.resetSession();
 			status.reset();
+			Approvals.cancelAll();
 			ChatActions.clear();
 		});
+		Approvals.onStatus = note -> Minecraft.getInstance().execute(() -> status.setNote(note));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> status.tick());
 

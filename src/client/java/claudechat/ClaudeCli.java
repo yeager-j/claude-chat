@@ -214,9 +214,19 @@ public class ClaudeCli {
 		StreamResult stream = new StreamResult();
 		CompletableFuture<Void> reader = CompletableFuture.runAsync(() -> readStream(process.getInputStream(), onProgress, stream));
 
-		if (!process.waitFor(config.timeoutSeconds, TimeUnit.SECONDS)) {
-			process.destroyForcibly();
-			throw new IOException("Claude took longer than " + config.timeoutSeconds + "s and was stopped.");
+		// Time spent waiting for the player to Allow or Deny doesn't count towards the timeout.
+		long started = System.currentTimeMillis();
+		long waitedBefore = Approvals.waitedMillis();
+		try {
+			while (!process.waitFor(1, TimeUnit.SECONDS)) {
+				long working = System.currentTimeMillis() - started - (Approvals.waitedMillis() - waitedBefore);
+				if (!Approvals.isWaiting() && working > config.timeoutSeconds * 1000L) {
+					process.destroyForcibly();
+					throw new IOException("Claude took longer than " + config.timeoutSeconds + "s and was stopped.");
+				}
+			}
+		} finally {
+			Approvals.cancelAll();
 		}
 		reader.join();
 		if (stream.result != null) {
@@ -236,12 +246,18 @@ public class ClaudeCli {
 		String allowed = mcp.isRunning() ? TOOLS + ",mcp__minecraft" : TOOLS;
 		// Edits and shell commands may reach the whole game folder (config, saves, mods), not just the knowledge folder.
 		String gameDir = FabricLoader.getInstance().getGameDir().toString();
+		String approve = "mcp__minecraft__" + Approvals.TOOL;
 		return switch (config.permissions) {
-			case READ_ONLY -> List.of("--tools", TOOLS, "--allowedTools", allowed);
-			case ASK -> List.of("--tools", TOOLS + "," + WRITE_TOOLS, "--allowedTools", allowed, "--add-dir", gameDir,
-				"--permission-prompts", "none");
+			case READ_ONLY -> List.of("--tools", TOOLS, "--allowedTools", allowed, "--disallowedTools", approve);
+			// Anything not pre-approved goes to the approve tool, which asks in chat. Without the tools server
+			// nobody could answer, so it's denied.
+			case ASK -> mcp.isRunning()
+				? List.of("--tools", TOOLS + "," + WRITE_TOOLS, "--allowedTools", allowed, "--disallowedTools", approve,
+					"--add-dir", gameDir, "--permission-prompt-tool", approve)
+				: List.of("--tools", TOOLS + "," + WRITE_TOOLS, "--allowedTools", allowed, "--add-dir", gameDir,
+					"--permission-prompts", "none");
 			case FULL -> List.of("--tools", TOOLS + "," + WRITE_TOOLS, "--permission-mode", "bypassPermissions",
-				"--add-dir", gameDir);
+				"--disallowedTools", approve, "--add-dir", gameDir);
 		};
 	}
 
