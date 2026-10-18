@@ -148,6 +148,44 @@ public class ClaudeChatClient implements ClientModInitializer {
 				info("Started a new conversation.");
 				return 1;
 			}))
+			.then(ClientCommands.literal("permissions")
+				.executes(ctx -> {
+					showPermissions();
+					return 1;
+				})
+				.then(ClientCommands.argument("mode", StringArgumentType.word())
+					.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(
+						Stream.of(ClaudeConfig.Permissions.values()).map(p -> p.id), builder))
+					.executes(ctx -> {
+						ClaudeConfig.Permissions mode = ClaudeConfig.Permissions.parse(StringArgumentType.getString(ctx, "mode"));
+						if (mode == null) {
+							ctx.getSource().sendError(Component.literal("Permissions must be one of: read_only, ask, full"));
+							return 0;
+						}
+						setPermissions(mode);
+						return 1;
+					})))
+			.then(ClientCommands.literal("cheats")
+				.executes(ctx -> {
+					showPermissions();
+					return 1;
+				})
+				.then(ClientCommands.literal("on").executes(ctx -> {
+					setCheats(true);
+					return 1;
+				}))
+				.then(ClientCommands.literal("off").executes(ctx -> {
+					setCheats(false);
+					return 1;
+				})))
+			// Target of ChatActions buttons; not meant to be typed.
+			.then(ClientCommands.literal("action")
+				.then(ClientCommands.argument("id", StringArgumentType.word()).executes(ctx -> {
+					if (!ChatActions.run(StringArgumentType.getString(ctx, "id"))) {
+						info("That button has expired.");
+					}
+					return 1;
+				})))
 			.then(ClientCommands.literal("knowledge")
 				.executes(ctx -> {
 					showKnowledgeStatus();
@@ -198,6 +236,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
 			cli.resetSession();
 			status.reset();
+			ChatActions.clear();
 		});
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> status.tick());
@@ -307,7 +346,56 @@ public class ClaudeChatClient implements ClientModInitializer {
 
 	private static void showStatus() {
 		info("Ask in chat with " + config.chatPrefix + " <question>. Model: " + config.model + ", effort: " + effortLabel() + ".");
-		info("/claude model <name>, /claude effort <level>, /claude reset (new conversation), /claude knowledge, /claude preview.");
+		info("/claude model <name>, /claude effort <level>, /claude permissions, /claude reset (new conversation), /claude knowledge, /claude preview.");
+	}
+
+	private static void showPermissions() {
+		info("Permissions: " + config.permissions.label + ". Cheats: " + (config.cheats ? "on" : "off") + ".");
+		info("/claude permissions <read_only|ask|full>: read only; ask before each change (edits, shell and game commands);"
+			+ " or do anything without asking. /claude cheats <on|off>: whether Claude's game commands may cheat"
+			+ " where you can't.");
+	}
+
+	/** Full access only after a click on a confirm button, so neither a typo nor a link in chat can turn it on. */
+	private static void setPermissions(ClaudeConfig.Permissions mode) {
+		if (mode == config.permissions) {
+			info("Permissions are already " + mode.label + ".");
+			return;
+		}
+		Runnable apply = () -> {
+			config.permissions = mode;
+			config.save();
+			info("Permissions set to " + mode.label + ".");
+		};
+		if (mode != ClaudeConfig.Permissions.FULL) {
+			apply.run();
+			return;
+		}
+		send(prefix().append(Component.literal("Full access lets Claude run any shell command, edit any file and run any game"
+			+ " command without asking you. Text it reads (signs, books, mod files, web pages) could try to talk it into"
+			+ " something harmful. ").withStyle(ChatFormatting.YELLOW))
+			.append(ChatActions.button("Turn on Full access", ChatFormatting.RED,
+				Component.literal("Claude stops asking before it changes anything"), apply)));
+	}
+
+	private static void setCheats(boolean on) {
+		if (on == config.cheats) {
+			info("Cheats are already " + (on ? "on" : "off") + ".");
+			return;
+		}
+		Runnable apply = () -> {
+			config.cheats = on;
+			config.save();
+			info("Cheats " + (on ? "on: Claude's game commands run at command block level." : "off: Claude's game commands run with your permissions."));
+		};
+		if (!on) {
+			apply.run();
+			return;
+		}
+		send(prefix().append(Component.literal("With cheats on, Claude can run commands like /give, /gamemode and /fill even in"
+			+ " worlds where you can't. The world list will still show cheats off. ").withStyle(ChatFormatting.YELLOW))
+			.append(ChatActions.button("Turn on cheats", ChatFormatting.RED,
+				Component.literal("Claude's game commands run at command block level"), apply)));
 	}
 
 	private static String effortLabel() {

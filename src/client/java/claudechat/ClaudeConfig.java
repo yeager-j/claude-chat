@@ -18,6 +18,33 @@ public class ClaudeConfig {
 	public static final List<String> MODEL_SUGGESTIONS = List.of("haiku", "sonnet", "opus", "fable");
 	public static final List<String> EFFORT_LEVELS = List.of("low", "medium", "high", "xhigh", "max");
 
+	/** What Claude may do beyond reading. Each tier's claude flags are in {@link ClaudeCli}. */
+	public enum Permissions {
+		/** Read and search only; game commands only if they change nothing. */
+		READ_ONLY("read_only", "Read only"),
+		/** Also edits files, runs shell and game commands, each after the player clicks Allow in chat. */
+		ASK("ask", "Ask for approval"),
+		/** Everything, without asking. */
+		FULL("full", "Full access");
+
+		public final String id;
+		public final String label;
+
+		Permissions(String id, String label) {
+			this.id = id;
+			this.label = label;
+		}
+
+		public static Permissions parse(String id) {
+			for (Permissions p : values()) {
+				if (p.id.equalsIgnoreCase(id.trim())) {
+					return p;
+				}
+			}
+			return null;
+		}
+	}
+
 	/** Full path to claude.exe. Empty = look on PATH, then in the Claude desktop app's bundled copy. */
 	public String claudePath = "";
 	/** A model alias (haiku, sonnet, opus, fable) or a full model ID. */
@@ -34,6 +61,13 @@ public class ClaudeConfig {
 	public final Set<String> knowledgeExclude = new TreeSet<>();
 	/** Extra instructions appended to the system prompt, e.g. "Answer like a pirate." */
 	public String extraInstructions = "";
+	/** Set with /claude permissions; turning on Full access needs a click on a confirm button. */
+	public Permissions permissions = Permissions.READ_ONLY;
+	/**
+	 * Off: Claude's game commands run with the player's own permission level, so in a world without cheats it can't
+	 * run cheat commands. On: they run at command-block level (still as the player), whatever the world allows.
+	 */
+	public boolean cheats = false;
 
 	public static Path dir() {
 		return FabricLoader.getInstance().getConfigDir().resolve(ClaudeChatClient.MOD_ID);
@@ -69,6 +103,10 @@ public class ClaudeConfig {
 		config.extraInstructions = props.getProperty("extraInstructions", config.extraInstructions).trim();
 		config.knowledgeInclude.addAll(parseList(props.getProperty("knowledgeInclude", "")));
 		config.knowledgeExclude.addAll(parseList(props.getProperty("knowledgeExclude", "")));
+		// Version 2 added these. A missing or unknown value is read only, so nobody gets more access by accident.
+		Permissions permissions = Permissions.parse(props.getProperty("permissions", ""));
+		config.permissions = permissions != null ? permissions : Permissions.READ_ONLY;
+		config.cheats = Boolean.parseBoolean(props.getProperty("cheats", "false").trim());
 		if (config.chatPrefix.isEmpty()) {
 			config.chatPrefix = "@claude";
 		}
@@ -80,7 +118,7 @@ public class ClaudeConfig {
 
 	public void save() {
 		Properties props = new Properties();
-		props.setProperty("configVersion", "1");
+		props.setProperty("configVersion", "2");
 		props.setProperty("claudePath", claudePath);
 		props.setProperty("model", model);
 		props.setProperty("effort", effort);
@@ -90,9 +128,12 @@ public class ClaudeConfig {
 		props.setProperty("extraInstructions", extraInstructions);
 		props.setProperty("knowledgeInclude", String.join(",", knowledgeInclude));
 		props.setProperty("knowledgeExclude", String.join(",", knowledgeExclude));
+		props.setProperty("permissions", permissions.id);
+		props.setProperty("cheats", "" + cheats);
 		try (Writer writer = Files.newBufferedWriter(file())) {
 			props.store(writer, "Claude Chat settings. claudePath empty = auto-detect. model: haiku, sonnet, opus, fable, or a full model ID."
-				+ " effort: low, medium, high, xhigh, max, or empty for the default.");
+				+ " effort: low, medium, high, xhigh, max, or empty for the default. permissions: read_only, ask or full."
+				+ " cheats: true lets Claude run cheat commands even where you can't.");
 		} catch (IOException e) {
 			ClaudeChatClient.LOGGER.warn("Could not write {}", file(), e);
 		}

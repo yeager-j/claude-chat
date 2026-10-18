@@ -4,6 +4,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import net.fabricmc.loader.api.FabricLoader;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -27,8 +28,11 @@ import java.util.stream.Stream;
 
 /** Answers questions by running the local Claude Code CLI ("claude -p"), which uses whatever account it is signed in to. */
 public class ClaudeCli {
-	// Read-only: Claude can search the knowledge folder and the web, but never edit files or run commands.
+	// Always offered and never asked about: Claude can search the knowledge folder and the web.
 	private static final String TOOLS = "Read,Grep,Glob,WebSearch,WebFetch";
+	// Added for Ask for approval and Full access. Shell commands that only read are still allowed without asking.
+	private static final String WRITE_TOOLS = "Bash,Edit,Write"
+		+ (System.getProperty("os.name").toLowerCase().contains("win") ? ",PowerShell" : "");
 	private static final String SYSTEM_PROMPT = """
 		You are answering a question typed into Minecraft chat by the player. Your reply is shown in the game's chat box.
 		- Answer for the exact game version and mods listed below. Mechanics change between versions, so don't trust memory
@@ -181,15 +185,13 @@ public class ClaudeCli {
 		// Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON.
 		Path mcpConfig = ClaudeConfig.dir().resolve("mcp.json");
 		Files.writeString(mcpConfig, mcp.claudeConfig(), StandardCharsets.UTF_8);
-		String allowed = mcp.isRunning() ? TOOLS + ",mcp__minecraft" : TOOLS;
 		List<String> command = new ArrayList<>(List.of(exe, "-p",
 			"--output-format", "stream-json", "--verbose",
 			"--model", config.model,
-			"--tools", TOOLS,
-			"--allowedTools", allowed,
 			"--mcp-config", mcpConfig.toString(),
 			"--strict-mcp-config",
 			"--append-system-prompt-file", promptFile.toString()));
+		command.addAll(permissionFlags());
 		if (!config.effort.isEmpty()) {
 			command.add("--effort");
 			command.add(config.effort);
@@ -224,6 +226,23 @@ public class ClaudeCli {
 		String detail = !err.isEmpty() ? err : stream.raw.toString().strip();
 		throw new IOException("Claude Code failed (exit " + process.exitValue() + "): "
 			+ (detail.length() > 300 ? detail.substring(0, 300) + "..." : detail));
+	}
+
+	/**
+	 * The tools and permission handling for the player's tier. Our own MCP tools are always pre-approved: run_command
+	 * decides for itself which game commands need the player's OK (see GameCommands).
+	 */
+	private List<String> permissionFlags() {
+		String allowed = mcp.isRunning() ? TOOLS + ",mcp__minecraft" : TOOLS;
+		// Edits and shell commands may reach the whole game folder (config, saves, mods), not just the knowledge folder.
+		String gameDir = FabricLoader.getInstance().getGameDir().toString();
+		return switch (config.permissions) {
+			case READ_ONLY -> List.of("--tools", TOOLS, "--allowedTools", allowed);
+			case ASK -> List.of("--tools", TOOLS + "," + WRITE_TOOLS, "--allowedTools", allowed, "--add-dir", gameDir,
+				"--permission-prompts", "none");
+			case FULL -> List.of("--tools", TOOLS + "," + WRITE_TOOLS, "--permission-mode", "bypassPermissions",
+				"--add-dir", gameDir);
+		};
 	}
 
 	private static final class StreamResult {
