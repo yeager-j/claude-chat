@@ -33,13 +33,15 @@ public class McpServer {
 
 	private final ModTools modTools;
 	private final WorldTools worldTools;
+	private final GameCommands gameCommands;
 	private final String token = newToken();
 	private volatile ServerSocket socket;
 	private ExecutorService workers;
 
-	public McpServer(ModTools modTools, WorldTools worldTools) {
+	public McpServer(ModTools modTools, WorldTools worldTools, GameCommands gameCommands) {
 		this.modTools = modTools;
 		this.worldTools = worldTools;
+		this.gameCommands = gameCommands;
 	}
 
 	/** Are the world tools offered right now? */
@@ -266,6 +268,9 @@ public class McpServer {
 				if (worldTools.available()) {
 					tools.addAll(worldTools.definitions());
 				}
+				if (gameCommands.available()) {
+					tools.add(gameCommands.definition());
+				}
 				JsonObject result = new JsonObject();
 				result.add("tools", tools);
 				response.add("result", result);
@@ -294,6 +299,8 @@ public class McpServer {
 				output = Approvals.handlePrompt(args);
 			} else if (modTools.has(name)) {
 				output = modTools.call(name, args);
+			} else if (name.equals(GameCommands.TOOL) && gameCommands.available()) {
+				output = gameCommands.call(args);
 			} else if (worldTools.available()) {
 				output = worldTools.call(name, args);
 			} else {

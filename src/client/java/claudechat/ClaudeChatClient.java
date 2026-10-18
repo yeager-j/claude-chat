@@ -54,6 +54,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static McpServer mcp;
 	private static WorldTools worldTools;
 	private static ModTools modTools;
+	private static GameCommands gameCommands;
 	private static final StatusLine status = new StatusLine();
 
 	/** For the client game test: is a question still being answered? */
@@ -76,6 +77,16 @@ public class ClaudeChatClient implements ClientModInitializer {
 		return worldTools;
 	}
 
+	/** For the client game test: run_command, called directly without Claude. */
+	public static GameCommands gameCommands() {
+		return gameCommands;
+	}
+
+	/** For the client game test: switch tiers and cheats without the confirm buttons. */
+	public static ClaudeConfig config() {
+		return config;
+	}
+
 	/** For the client game test: the MCP server, to check what Claude is offered. */
 	public static McpServer mcp() {
 		return mcp;
@@ -88,8 +99,9 @@ public class ClaudeChatClient implements ClientModInitializer {
 		worldIndex = new WorldIndex();
 		worldTools = new WorldTools(worldIndex, knowledge);
 		modTools = new ModTools(knowledge);
+		gameCommands = new GameCommands(config, worldIndex);
 		// Serves Claude the mod tools for the whole session, plus the world tools while a single-player world is open.
-		mcp = new McpServer(modTools, worldTools);
+		mcp = new McpServer(modTools, worldTools, gameCommands);
 		mcp.start();
 		cli = new ClaudeCli(config, knowledge, mcp);
 		formatter = new ChatFormatter(new RecipeRenderer(knowledge));
