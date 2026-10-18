@@ -223,6 +223,11 @@ public final class WorldTools {
 		return tools;
 	}
 
+	/** Is a single-player world open? The world tools need its integrated server. */
+	public boolean available() {
+		return index.server() != null;
+	}
+
 	public JsonElement call(String name, JsonObject args) throws Exception {
 		return switch (name) {
 			case "search_containers" -> searchHolders(args, holder -> !holder.kind().equals("entity") || !holder.items().isEmpty(), true);
@@ -1429,7 +1434,7 @@ public final class WorldTools {
 		return haystack != null && haystack.toLowerCase(Locale.ROOT).contains(needle);
 	}
 
-	private static JsonObject tool(String name, String description, String schema) {
+	static JsonObject tool(String name, String description, String schema) {
 		JsonObject tool = new JsonObject();
 		tool.addProperty("name", name);
 		tool.addProperty("description", description);

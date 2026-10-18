@@ -23,14 +23,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /** Answers questions by running the local Claude Code CLI ("claude -p"), which uses whatever account it is signed in to. */
 public class ClaudeCli {
-	private static final Pattern DECOMPILE_REQUEST = Pattern.compile("\\[\\[decompile:([^\\]\\s]+)\\]\\]");
-	private static final int MAX_DECOMPILE_ROUNDS = 2;
 	// Read-only: Claude can search the knowledge folder and the web, but never edit files or run commands.
 	private static final String TOOLS = "Read,Grep,Glob,WebSearch,WebFetch";
 	private static final String SYSTEM_PROMPT = """
@@ -41,9 +37,9 @@ public class ClaudeCli {
 		- Simple questions (recipes, drops, what something does): 1-3 short sentences.
 		- Mechanics questions (spawning, AI, redstone timing, formulas): research the source until you are confident,
 		  then explain in up to about 10 short lines and name the key class or data file so the player can check it.
-		- If answering needs a mod's code and the list below says it isn't decompiled yet, reply with only
-		  [[decompile:<mod id>]] (one per line if you need several) and nothing else. It takes a few seconds; then you'll be
-		  asked to continue. Only request code that will actually help; recipes and other data are already available.
+		- If answering needs a mod's code and the list below says it isn't decompiled yet, call
+		  mcp__minecraft__decompile_mod with its id, then search the source it returns. It takes a few seconds. Only
+		  decompile code that will actually help; recipes and other data are already available.
 		- The player waits while you research and sees only your text, not your tool calls. So every time you are about
 		  to call tools (including your first call), first write one status line under 8 words saying what you're doing,
 		  e.g. "Searching the crafter code" or "Found it, checking hopper logic". It is shown live in chat.
@@ -102,12 +98,12 @@ public class ClaudeCli {
 	});
 	private volatile String sessionId;
 
-	private final McpServer worldTools;
+	private final McpServer mcp;
 
-	public ClaudeCli(ClaudeConfig config, KnowledgeBase knowledge, McpServer worldTools) {
+	public ClaudeCli(ClaudeConfig config, KnowledgeBase knowledge, McpServer mcp) {
 		this.config = config;
 		this.knowledge = knowledge;
-		this.worldTools = worldTools;
+		this.mcp = mcp;
 	}
 
 	public void resetSession() {
@@ -152,34 +148,6 @@ public class ClaudeCli {
 			result = invoke(exe, workDir, promptFile, question, null, onProgress);
 		}
 		String text = resultText(result);
-
-		// Claude can ask for a mod's code with [[decompile:<id>]]. Decompile it, then continue the same conversation.
-		for (int round = 0; round < MAX_DECOMPILE_ROUNDS; round++) {
-			Matcher m = DECOMPILE_REQUEST.matcher(text);
-			List<String> done = new ArrayList<>();
-			List<String> refused = new ArrayList<>();
-			while (m.find()) {
-				String id = m.group(1);
-				Optional<KnowledgeBase.Source> mod = knowledge.source(id);
-				if (mod.isPresent() && knowledge.canDecompile(mod.get())) {
-					onProgress.accept("Decompiling " + mod.get().label());
-					knowledge.buildCodeNow(mod.get(), message -> { });
-				}
-				if (mod.isPresent() && knowledge.hasCode(mod.get())) {
-					done.add(id + " (" + mod.get().dir() + "/src)");
-				} else {
-					refused.add(id);
-				}
-			}
-			if (done.isEmpty() && refused.isEmpty()) {
-				break;
-			}
-			promptFile = writeSystemPrompt(gameContext);
-			String followUp = (done.isEmpty() ? "" : "Decompiled: " + String.join(", ", done) + ". ")
-				+ (refused.isEmpty() ? "" : "Not available (no code, excluded by the player, or unknown id): " + String.join(", ", refused) + ". ")
-				+ "Now answer my question.";
-			text = resultText(invoke(exe, workDir, promptFile, followUp, sessionId, onProgress));
-		}
 		return text.isBlank() ? "(no answer)" : text;
 	}
 
@@ -188,7 +156,7 @@ public class ClaudeCli {
 		String systemPrompt = SYSTEM_PROMPT
 			+ (Waypoints.available() ? WAYPOINT_PROMPT : "")
 			+ "\nCurrent game state:\n" + gameContext
-			+ (worldTools.isRunning() ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
+			+ (mcp.worldOpen() ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
 			+ "\n" + knowledge.describeForPrompt()
 			+ (config.extraInstructions.isEmpty() ? "" : "\n" + config.extraInstructions + "\n");
 		Files.writeString(promptFile, systemPrompt, StandardCharsets.UTF_8);
@@ -209,11 +177,11 @@ public class ClaudeCli {
 
 	private JsonObject invoke(String exe, Path workDir, Path promptFile, String question, String resume,
 		Consumer<String> onProgress) throws IOException, InterruptedException {
-		// Only this mod's MCP server (none on multiplayer): --strict-mcp-config also keeps the player's other MCP servers,
-		// configured for Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON.
+		// Only this mod's MCP server: --strict-mcp-config also keeps the player's other MCP servers, configured for
+		// Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON.
 		Path mcpConfig = ClaudeConfig.dir().resolve("mcp.json");
-		Files.writeString(mcpConfig, worldTools.claudeConfig(), StandardCharsets.UTF_8);
-		String allowed = worldTools.isRunning() ? TOOLS + ",mcp__minecraft" : TOOLS;
+		Files.writeString(mcpConfig, mcp.claudeConfig(), StandardCharsets.UTF_8);
+		String allowed = mcp.isRunning() ? TOOLS + ",mcp__minecraft" : TOOLS;
 		List<String> command = new ArrayList<>(List.of(exe, "-p",
 			"--output-format", "stream-json", "--verbose",
 			"--model", config.model,

@@ -33,7 +33,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | File | Role |
 | --- | --- |
 | `ClaudeChatClient` | Entry point: `/claude` commands, `@claude` chat hook, lifecycle events |
-| `ClaudeCli` | Runs `claude -p`: system prompt, stream-json parsing, progress notes, `[[decompile:id]]` follow-up loop, MCP config |
+| `ClaudeCli` | Runs `claude -p`: system prompt, stream-json parsing, progress notes, MCP config |
 | `ClaudeConfig` | `config/claudechat.properties`; `configVersion` drives migrations |
 | `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand) with Vineflower in a separate JVM; extracts data and lang files; world data packs; the prompt's file map |
 | `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
@@ -47,7 +47,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
 | `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
 | `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
-| `WorldTools`, `McpServer` | The eleven world tools, served over MCP on 127.0.0.1 with a random port and bearer token while a single-player world is open |
+| `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` always, the eleven world tools only while a single-player world is open |
 
 ## Conventions
 

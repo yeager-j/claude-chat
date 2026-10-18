@@ -22,7 +22,7 @@ Client-side Fabric mod for **Minecraft 26.3**.
   - For questions like "how does spawn potential work?" it reads the actual source.
 - **Your mods too.**
   - Every mod's data (recipes, loot, structures) is searchable from the start.
-  - A mod's code is decompiled only when it's needed: when you mention the mod, when you're holding or looking at something from it, when Claude asks for it, or when you add it yourself. Mods that never come up are never decompiled.
+  - A mod's code is decompiled only when it's needed: when you mention the mod, when you're holding or looking at something from it, when Claude decides it needs it (on servers too), or when you add it yourself. Mods that never come up are never decompiled.
 - **Your world** (single-player):
   - **Find items:** "Where are my diamonds?" searches every chest, barrel and shulker box, including what's inside shulker boxes in chests, plus your inventory and ender chest.
   - **Find mobs and things:** "Where's Rex?" finds pets, named mobs, item frames and dropped items.
@@ -99,7 +99,7 @@ All of these tab-complete.
 - **Read-only.** Claude can read the reference files, search the web, and use the world tools. It can't edit files, run commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
 - **Local only.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
-  - The world tools are served only to the `claude` process the mod starts, on `127.0.0.1` with a random token. They stop when you leave the world.
+  - The mod's tools are served only to the `claude` process the mod starts, on `127.0.0.1` with a random token. The world tools are offered only while a single-player world is open.
 - **Your own MCP servers stay out.** Other MCP servers you've set up for Claude Code aren't loaded for Minecraft questions.
 - **What gets sent:** your question and the game details above go to Claude, the same as any Claude Code session.
 

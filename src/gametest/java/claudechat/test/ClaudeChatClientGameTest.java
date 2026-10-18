@@ -37,6 +37,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -66,6 +70,19 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 600 * SECONDS);
 		LOGGER.info("optional steps: {}", System.getenv().keySet().stream().filter(k -> k.startsWith("CLAUDECHAT_")).sorted().toList());
 
+		// 0. The MCP server Claude talks to, over HTTP like claude does. With no world open (as on a server) it offers
+		// only decompile_mod; the test mod itself is a data-only mod it can decompile.
+		List<String> noWorldTools = mcpToolNames();
+		LOGGER.info("MCP tools without a world: {}", noWorldTools);
+		check(noWorldTools.contains("decompile_mod") && !noWorldTools.contains("find_structures"), "wrong tools without a world: " + noWorldTools);
+		JsonObject unknown = mcpCall("tools/call", "{\"name\": \"decompile_mod\", \"arguments\": {\"mod\": \"no_such_mod\"}}");
+		check(unknown.has("isError") && unknown.get("isError").getAsBoolean(), "unknown mod id didn't fail: " + unknown);
+		long decompileStart = System.nanoTime();
+		JsonObject decompiled = mcpCall("tools/call", "{\"name\": \"decompile_mod\", \"arguments\": {\"mod\": \"claudechat-test\"}}");
+		LOGGER.info("decompile_mod claudechat-test ({} ms) -> {}", (System.nanoTime() - decompileStart) / 1_000_000, decompiled);
+		check(!decompiled.has("isError") && ClaudeChatClient.knowledge().source("claudechat-test")
+			.map(ClaudeChatClient.knowledge()::hasCode).orElse(false), "decompile_mod didn't decompile the test mod: " + decompiled);
+
 		boolean worldTest = "1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"));
 		boolean templateTest = "1".equals(System.getenv("CLAUDECHAT_TEMPLATE_TEST"));
 		String waypointQuestion = System.getenv("CLAUDECHAT_WAYPOINT_QUESTION");
@@ -84,6 +101,9 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			singleplayer.getConnection().waitForChunksRender();
 			// With Xaero loaded the client hangs while closing the world, before Fabric prints the failure, so log it here.
 			try {
+				List<String> worldTools = mcpToolNames();
+				check(worldTools.contains("decompile_mod") && worldTools.contains("find_structures"), "wrong tools in a world: " + worldTools);
+
 				// 1. The formatting preview, through the real command.
 				chat(context, "/claude preview");
 				context.waitTicks(10);
@@ -498,6 +518,32 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			// Xaero may be writing the file; the caller polls again.
 		}
 		return found;
+	}
+
+	/** One JSON-RPC request to the mod's MCP server, with the URL and token claude gets; returns its result. */
+	private static JsonObject mcpCall(String method, String params) {
+		JsonObject server = JsonParser.parseString(ClaudeChatClient.mcp().claudeConfig()).getAsJsonObject()
+			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
+		String body = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
+		try {
+			HttpResponse<String> response = HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(server.get("url").getAsString()))
+				.header("Authorization", server.getAsJsonObject("headers").get("Authorization").getAsString())
+				.header("Content-Type", "application/json")
+				.POST(HttpRequest.BodyPublishers.ofString(body))
+				.build(), HttpResponse.BodyHandlers.ofString());
+			return JsonParser.parseString(response.body()).getAsJsonObject().getAsJsonObject("result");
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException(e);
+		}
+	}
+
+	private static List<String> mcpToolNames() {
+		List<String> names = new ArrayList<>();
+		mcpCall("tools/list", "{}").getAsJsonArray("tools").forEach(t -> names.add(t.getAsJsonObject().get("name").getAsString()));
+		return names;
 	}
 
 	/** A find_structures result's pieces must be what generating its start chunk for real produces. */

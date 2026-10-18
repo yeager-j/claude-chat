@@ -146,9 +146,6 @@ public final class ChatFormatter {
 	}
 
 	private static MutableComponent item(String id) {
-		if (id.startsWith("decompile:")) {
-			return Component.empty(); // a leftover request for mod code, not meant for the player
-		}
 		String clean = id.replaceFirst("^\\s*#", "");
 		return ItemIcons.find(clean)
 			.map(ItemIcons::named)

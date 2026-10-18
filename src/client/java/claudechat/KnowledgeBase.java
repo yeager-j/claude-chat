@@ -400,8 +400,7 @@ public class KnowledgeBase {
 			if (hasCode(source)) {
 				sb.append(source.dir()).append("/{src,data,lang}");
 			} else if (hasData(source) && canDecompile(source)) {
-				sb.append(source.dir()).append("/{data,lang}; code not decompiled yet, request it with [[decompile:")
-					.append(source.id()).append("]]");
+				sb.append(source.dir()).append("/{data,lang}; code not decompiled yet (decompile_mod)");
 			} else if (hasData(source)) {
 				sb.append(source.dir()).append("/{data,lang}; no code available (").append(reason(source)).append(")");
 			} else {
