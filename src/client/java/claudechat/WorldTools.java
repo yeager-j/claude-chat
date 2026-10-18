@@ -22,6 +22,7 @@ import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.level.levelgen.structure.Structure;
+import net.minecraft.world.level.levelgen.structure.StructureStart;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -34,6 +35,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
@@ -86,8 +88,11 @@ public final class WorldTools {
 				+ "has already visited. \"Visited\" means players spent at least a second within 128 blocks of some part of "
 				+ "the structure (Minecraft's per-chunk InhabitedTime, at most of any chunk its pieces cover); structures in "
 				+ "never-generated land are always unvisited. x/z is the /locate "
-				+ "position; each result also has the structure's bounding box and the biomes its pieces occupy (share of "
-				+ "sampled cells), worked out from the seed without generating anything. The biome filter matches a structure "
+				+ "position; each result also has the structure's bounding box, its pieces (rooms and parts, by template "
+				+ "or class name, with counts, e.g. \"end_city/ship\", \"village/plains/houses/plains_temple_3\", "
+				+ "\"stronghold/library\") and the biomes they occupy (share of sampled cells), all worked out from the seed "
+				+ "exactly as generation would, without generating anything. Pieces say what generates, not what's still "
+				+ "there (looted chests, a taken elytra). The biome filter matches a structure "
 				+ "if any of its pieces is in that biome, so a fortress that starts in a crimson forest and reaches into a "
 				+ "warped forest counts as in a warped forest. Structure ids are listed under data/<namespace>/worldgen/structure "
 				+ "in the reference files.",
@@ -98,6 +103,7 @@ public final class WorldTools {
 			  "min_biome_share": {"type": "integer", "description": "With biome: only structures at least this percent in it (0-100), e.g. 75 for \\"mostly in a warped forest\\". Shares of several matching biomes (a tag) add up. Default: any piece."},
 			  "dimension": {"type": "string", "description": "Default: the player's dimension, or where the structure generates if not there (a fortress asked about from the Overworld is searched in the Nether, around the player's position / 8)."},
 			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Default: any."},
+			  "with_pieces": {"type": "array", "items": {"type": "string"}, "description": "Only structures that have a piece whose name contains each of these, e.g. [\\"ship\\"] for an end city with a ship, [\\"temple\\"] for a village with a temple, [\\"library\\"] for a stronghold with a library. To learn the names, search without it and read the pieces."},
 			  "min_distance": {"type": "integer"},
 			  "max_distance": {"type": "integer", "description": "Search radius in blocks (default 8000, max 30000)."},
 			  "limit": {"type": "integer", "description": "Max results (default 5, max 20)."}
@@ -390,10 +396,14 @@ public final class WorldTools {
 		if (minShare > 0 && biomes.isEmpty()) {
 			throw new IllegalArgumentException("min_biome_share needs a biome.");
 		}
+		// "ship" or "temple" → matched against piece names like "end_city/ship" or "village/plains/houses/plains_temple_3".
+		List<String> pieceTerms = strings(args, "with_pieces").stream()
+			.map(t -> t.toLowerCase(Locale.ROOT).replace(' ', '_')).toList();
 		WorldIndex.PlayerInfo player = snapshot.players().getFirst();
 		String requestedDimension = string(args, "dimension", "");
 
-		// Footprints are computed on the server thread (in the filter, or afterwards for the results) and cached.
+		// Pieces and footprints are built on the server thread (in the filter, or afterwards for the results) and cached.
+		Map<StructureFinder.Found, StructureStart> starts = new HashMap<>();
 		Map<StructureFinder.Found, StructureFinder.Footprint> footprints = new HashMap<>();
 		record Search(String dimension, WorldIndex.PlayerInfo origin, List<StructureFinder.Found> found) {
 		}
@@ -401,15 +411,20 @@ public final class WorldTools {
 			ServerLevel level = structureLevel(server, structures, requestedDimension, player.dimension());
 			String dimension = WorldIndex.dimensionName(level.dimension());
 			WorldIndex.PlayerInfo origin = originIn(server, player, level);
+			Function<StructureFinder.Found, StructureStart> start = f -> starts.computeIfAbsent(f, k -> StructureFinder.start(level, k));
+			Function<StructureFinder.Found, StructureFinder.Footprint> footprint =
+				f -> footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, start.apply(k)));
+			// Cheapest checks first: pieces are built only for candidates that pass the distance and visited checks.
 			Predicate<StructureFinder.Found> filter = f -> f.distance() >= minDistance && switch (visited) {
 				case "unvisited" -> f.inhabitedTicks() < StructureFinder.VISITED_TICKS;
 				case "visited" -> f.inhabitedTicks() >= StructureFinder.VISITED_TICKS;
 				default -> true;
-			} && (biomes.isEmpty() || inBiome(footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, k)), biomes, minShare));
+			} && (pieceTerms.isEmpty() || hasPieces(StructureFinder.pieces(start.apply(f)).keySet(), pieceTerms))
+				&& (biomes.isEmpty() || inBiome(footprint.apply(f), biomes, minShare));
 			List<StructureFinder.Found> results = StructureFinder.find(level, structures, BlockPos.containing(origin.x(), origin.y(), origin.z()),
 				maxDistance, limit, filter, (cx, cz) -> snapshot.inhabited(dimension, cx, cz));
 			for (StructureFinder.Found f : results) {
-				footprints.computeIfAbsent(f, k -> StructureFinder.footprint(level, k));
+				footprint.apply(f);
 			}
 			return new Search(dimension, origin, results);
 		}).get(120, TimeUnit.SECONDS);
@@ -444,6 +459,11 @@ public final class WorldTools {
 				if (!biomes.isEmpty()) {
 					r.addProperty("share_in_requested_biome", Math.round(biomeShare(footprint, biomes)) + "%");
 				}
+			}
+			JsonObject pieces = new JsonObject();
+			StructureFinder.pieces(starts.get(f)).forEach(pieces::addProperty);
+			if (!pieces.isEmpty()) {
+				r.add("pieces", pieces);
 			}
 			results.add(r);
 		}
@@ -508,6 +528,11 @@ public final class WorldTools {
 			throw new IllegalArgumentException("No dimension \"" + requested + "\".");
 		}
 		return otherWhereItGenerates != null ? otherWhereItGenerates : playerLevel;
+	}
+
+	/** Every term is part of some piece's name ("ship" matches "end_city/ship"). */
+	private static boolean hasPieces(Set<String> pieceNames, List<String> terms) {
+		return terms.stream().allMatch(term -> pieceNames.stream().anyMatch(name -> name.contains(term)));
 	}
 
 	/** Any piece in one of the biomes, and at least {@code minShare} percent of the sampled cells in them combined. */
@@ -836,17 +861,7 @@ public final class WorldTools {
 		if (server == null) {
 			throw new IllegalStateException("No single-player world open.");
 		}
-		List<String> terms = new ArrayList<>();
-		if (args != null && args.has("blocks")) {
-			JsonElement element = args.get("blocks");
-			if (element.isJsonArray()) {
-				element.getAsJsonArray().forEach(e -> terms.add(e.getAsString().trim()));
-			} else if (element.isJsonPrimitive()) {
-				terms.addAll(List.of(element.getAsString().split(",")));
-			}
-			terms.replaceAll(String::trim);
-			terms.removeIf(String::isEmpty);
-		}
+		List<String> terms = strings(args, "blocks");
 		String query = string(args, "query", "").trim().toLowerCase(Locale.ROOT);
 		int maxSize = integer(args, "max_size", Integer.MAX_VALUE);
 		int limit = Math.max(1, Math.min(30, integer(args, "limit", 10)));
@@ -1424,6 +1439,22 @@ public final class WorldTools {
 
 	private static String string(JsonObject args, String key, String fallback) {
 		return args != null && args.has(key) && args.get(key).isJsonPrimitive() ? args.get(key).getAsString() : fallback;
+	}
+
+	/** A string array, or a comma-separated string, trimmed and without empty entries. */
+	private static List<String> strings(JsonObject args, String key) {
+		List<String> values = new ArrayList<>();
+		if (args != null && args.has(key)) {
+			JsonElement element = args.get(key);
+			if (element.isJsonArray()) {
+				element.getAsJsonArray().forEach(e -> values.add(e.getAsString()));
+			} else if (element.isJsonPrimitive()) {
+				values.addAll(List.of(element.getAsString().split(",")));
+			}
+			values.replaceAll(String::trim);
+			values.removeIf(String::isEmpty);
+		}
+		return values;
 	}
 
 	private static int integer(JsonObject args, String key, int fallback) {

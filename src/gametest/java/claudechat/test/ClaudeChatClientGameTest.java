@@ -3,6 +3,10 @@ package claudechat.test;
 import claudechat.ClaudeChatClient;
 import claudechat.KnowledgeBase;
 import claudechat.Schematics;
+import claudechat.StructureFinder;
+import net.minecraft.resources.ResourceKey;
+import java.util.Map;
+import java.util.TreeMap;
 import claudechat.Waypoints;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -322,6 +326,18 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 						"find_biomes' nearest deep dark is farther than /locate's");
 					JsonObject villages = logTool(context, "find_structures", "{\"structure\": \"village\", \"limit\": 3}");
 
+					// Pieces, built in memory, must match real generation for three kinds of structure: hand-coded
+					// pieces (fortress), templates (end city) and jigsaw pools (village). End cities with a ship are
+					// searched in the End from the Overworld.
+					JsonObject shipCities = logTool(context, "find_structures", "{\"structure\": \"end_city\", \"with_pieces\": [\"ship\"], \"limit\": 2}");
+					check(!shipCities.getAsJsonArray("results").isEmpty(), "no end city with a ship");
+					for (JsonElement city : shipCities.getAsJsonArray("results")) {
+						check(city.getAsJsonObject().getAsJsonObject("pieces").has("end_city/ship"), "with_pieces let through " + city);
+						checkPieces(singleplayer, Level.END, city.getAsJsonObject());
+					}
+					checkPieces(singleplayer, Level.NETHER, fortress);
+					checkPieces(singleplayer, Level.OVERWORLD, villages.getAsJsonArray("results").get(0).getAsJsonObject());
+
 					// Visit the nearest village for a few seconds, come back, and check the visited filter flips.
 					var nearest = villages.getAsJsonArray("results").get(0).getAsJsonObject();
 					var home = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().position());
@@ -482,6 +498,21 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			// Xaero may be writing the file; the caller polls again.
 		}
 		return found;
+	}
+
+	/** A find_structures result's pieces must be what generating its start chunk for real produces. */
+	private static void checkPieces(TestSingleplayerContext singleplayer, ResourceKey<Level> dimension, JsonObject result) {
+		String id = result.get("structure").getAsString();
+		int chunkX = result.get("x").getAsInt() >> 4;
+		int chunkZ = result.get("z").getAsInt() >> 4;
+		Map<String, Integer> generated = singleplayer.getServer().computeOnServer(s -> {
+			var structure = s.registryAccess().lookupOrThrow(Registries.STRUCTURE).getValue(Identifier.parse(id));
+			return StructureFinder.pieces(s.getLevel(dimension).getChunk(chunkX, chunkZ, ChunkStatus.STRUCTURE_STARTS).getStartForStructure(structure));
+		});
+		Map<String, Integer> reported = new TreeMap<>();
+		result.getAsJsonObject("pieces").entrySet().forEach(e -> reported.put(e.getKey(), e.getValue().getAsInt()));
+		LOGGER.info("pieces of {} at {} {}: {}", id, result.get("x"), result.get("z"), reported);
+		check(reported.equals(generated), id + " pieces differ from generation: tool " + reported + ", generated " + generated);
 	}
 
 	private static List<String> readLines(Path file) {

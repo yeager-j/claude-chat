@@ -77,7 +77,7 @@ public class ClaudeCli {
 		("where are my diamonds?", "which chest has..."), search_entities (pets, named mobs, item frames, dropped items),
 		get_player (inventory, ender chest, position), find_blocks (nearest placed blocks: spawners, beds, respawn anchors,
 		portals, with block state and block entity filters), find_structures (nearest structures, optionally only ones the
-		player hasn't visited yet or ones reaching into a biome), find_biomes (nearest patches of a biome) and
+		player hasn't visited yet, ones reaching into a biome, or ones with certain rooms, like an end city with a ship), find_biomes (nearest patches of a biome) and
 		inspect_location (block and biome at a position, predicted from the seed where nothing is generated yet). They
 		return exact distances and compass directions; report those instead of working them out yourself. Show
 		coordinates as `x y z` (or `x ~ z` for structures and biomes).

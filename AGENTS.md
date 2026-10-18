@@ -22,7 +22,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_WAYPOINT_TEST=1` | Needs Xaero's Minimap via `-PextraMods`. Runs `[[waypoint:…]]` button commands, confirms Xaero's screen, checks `waypoints.txt` per dimension; `CLAUDECHAT_WAYPOINT_QUESTION="..."` also asks Claude |
-| `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), visits a village and a far chunk (checks the visited filter and `claudechat-visits.txt`), asks Claude |
+| `CLAUDECHAT_WORLD_TEST=1` | Normal world (not superflat), stashes items, calls every world tool directly (logged as `tool <name> <args> -> <json>`), checks structure pieces against real generation, visits a village and a far chunk (checks the visited filter and `claudechat-visits.txt`), asks Claude |
 
 - **Test with real mods:** `-PextraMods="<folder of jars>"`. The user's mods are in `%APPDATA%\ModrinthApp\profiles\Fabric 26.3\mods`.
 - **Hang on exit:** with those mods, the client hangs after "Xaero hud session finalized". Run the test in the background, wait for the last screenshot, then stop only the java process whose command line matches `clientGameTest`. Other `claude` and `java` processes belong to the user.
@@ -40,7 +40,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while Xaero's Minimap is loaded) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
 | `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes |
-| `StructureFinder` | Multi-result `/locate` with visited filtering; builds a structure's pieces in memory (`Structure.generate`) to sample the biomes they occupy |
+| `StructureFinder` | Multi-result `/locate` with visited filtering; builds a structure's pieces in memory (`Structure.generate`) to name them (template id, or class for hand-coded pieces, via `mixin/*Accessor`) and sample the biomes they occupy |
 | `BlockFinder` | Nearest blocks by id/tag, state properties and block entity text; re-reads only saved chunks whose palette has the block |
 | `BiomeFinder` | Multi-result `/locate biome` from the seed, off the server thread |
 | `LocationInspector` | Block and biome at a position: live, from the save, or predicted from the seed (base terrain only) |

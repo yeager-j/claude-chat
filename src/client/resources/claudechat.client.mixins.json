@@ -3,7 +3,9 @@
 	"package": "claudechat.mixin",
 	"compatibilityLevel": "JAVA_25",
 	"client": [
-		"ChatComponentAccessor"
+		"ChatComponentAccessor",
+		"FeaturePoolElementAccessor",
+		"TemplateStructurePieceAccessor"
 	],
 	"injectors": {
 		"defaultRequire": 1
