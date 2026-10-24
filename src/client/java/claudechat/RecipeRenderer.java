@@ -15,7 +15,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 
-/** Draws the game's recipes ({@link GameRecipes}) as rows of item icons, like the crafting table. */
+/**
+ * Draws the game's recipes ({@link GameRecipes}) as rows of item icons, like the crafting table. Builds chat
+ * components from atlas sprites and translations, so call it on the client thread, with a snapshot of the recipes
+ * read beforehand (reading them can take a while).
+ */
 public final class RecipeRenderer {
 	/**
 	 * Chat lines for a recipe. {@code grid} is true when they are the recipe's icon rows, which need every line to
@@ -27,22 +31,19 @@ public final class RecipeRenderer {
 		}
 	}
 
-	private final GameRecipes recipes;
-
-	public RecipeRenderer(KnowledgeBase knowledge) {
-		this.recipes = knowledge.recipes();
+	private RecipeRenderer() {
 	}
 
-	/** The lines for [[recipe:id]] on its own line: the recipe as a grid when one is found. */
-	public Lines render(Identifier id) {
-		return recipes.snapshot().find(id)
+	/** The lines for [[recipe:id]] on its own line: the recipe as a grid when {@code recipes} has one. */
+	public static Lines render(GameRecipes.Snapshot recipes, Identifier id) {
+		return recipes.find(id)
 			.map(RecipeRenderer::render)
 			.orElseGet(() -> Lines.note("(no recipe found for " + id + ")"));
 	}
 
 	/** What [[recipe:id]] in the middle of a sentence shows: the recipe's result, or the item with that id. */
-	public MutableComponent resultName(Identifier id) {
-		return recipes.snapshot().find(id)
+	public static MutableComponent resultName(GameRecipes.Snapshot recipes, Identifier id) {
+		return recipes.find(id)
 			.flatMap(GameRecipe::makes)
 			.map(RecipeRenderer::result)
 			.orElseGet(() -> ItemIcons.named(id));

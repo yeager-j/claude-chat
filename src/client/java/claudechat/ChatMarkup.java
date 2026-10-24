@@ -17,6 +17,25 @@ import java.util.regex.Pattern;
  * components.
  */
 public final class ChatMarkup {
+	/**
+	 * The system prompt's formatting rules: the grammar this class parses, and how {@link ChatFormatter} shows it. Keep
+	 * it in step with the patterns below; a [[recipe:…]] grid, for one, is only drawn alone on its line.
+	 */
+	public static final String PROMPT = """
+		Formatting (the mod renders this in chat):
+		- Markdown subset only: **bold**, *italic*, ~~strike~~, `code`, [text](https://url), "# " headings, "- " bullets,
+		  "1. " lists. No tables and no code blocks; chat is narrow (about 50 characters per line before wrapping).
+		- Name items and blocks as [[id]] (e.g. [[iron_ingot]], [[minecraft:crafter]]). It shows the item's icon and name,
+		  with the real tooltip on hover. Use exact ids (check lang/*.json if unsure). Counts: "3× [[iron_ingot]]".
+		- To show how to make something, put [[recipe:<id>]] on its own line. <id> is a recipe file name under
+		  data/<namespace>/recipe/ (e.g. [[recipe:minecraft:crafter]]), or the item it makes. It is drawn as an icon grid
+		  from the game's data, so don't also list the ingredients, counts or layout in text. The grid can be the whole
+		  answer; add a sentence only if it answers something the grid doesn't, and only if you've verified it.
+		- Controls: {{key.inventory}}, {{key.use}}, {{key.attack}}, {{key.jump}}, {{key.sneak}}, {{key.sprint}}, {{key.drop}},
+		  {{key.swapOffhand}}, {{key.pickItem}} show the player's own key binding.
+		- Commands go in backticks and become click-to-insert, e.g. `/gamerule keep_inventory true`.
+		""";
+
 	private static final Pattern HEADING = Pattern.compile("^#{1,6}\\s+(.*)$");
 	private static final Pattern BULLET = Pattern.compile("^(\\s*)[-*+]\\s+(.*)$");
 	private static final Pattern NUMBERED = Pattern.compile("^(\\s*)(\\d+)[.)]\\s+(.*)$");

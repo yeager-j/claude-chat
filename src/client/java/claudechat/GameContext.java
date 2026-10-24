@@ -7,15 +7,22 @@ import net.minecraft.SharedConstants;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
 import net.minecraft.core.BlockPos;
+import net.minecraft.resources.Identifier;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.HitResult;
 
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
 
-/** A plain-text snapshot of what the player is doing, so questions like "what is this?" just work. Call on the client thread. */
+/**
+ * What the player is doing when they ask, so questions like "what is this?" just work: a plain-text description for
+ * the system prompt, plus the facts the answer needs later. Item, block and mod names in the description are
+ * third-party text (a renamed item, a mod's name), so the prompt puts it in a {@link PromptData} block. Call on the
+ * client thread.
+ */
 public final class GameContext {
 	private static final Set<String> HIDDEN_MODS = Set.of("minecraft", "java", "fabricloader", "fabric-api", "mixinextras", ClaudeChatClient.MOD_ID);
 
@@ -61,8 +68,8 @@ public final class GameContext {
 	}
 
 	/** Mod namespaces of the held item and the block being looked at (not "minecraft"), e.g. "create". Client thread. */
-	public static String modNamespaces(Minecraft mc) {
-		Set<String> namespaces = new java.util.LinkedHashSet<>();
+	public static Set<String> modNamespaces(Minecraft mc) {
+		Set<String> namespaces = new LinkedHashSet<>();
 		if (mc.player != null) {
 			mc.player.getMainHandItem().typeHolder().unwrapKey().ifPresent(key -> namespaces.add(key.identifier().getNamespace()));
 		}
@@ -70,7 +77,13 @@ public final class GameContext {
 			mc.level.getBlockState(hit.getBlockPos()).typeHolder().unwrapKey().ifPresent(key -> namespaces.add(key.identifier().getNamespace()));
 		}
 		namespaces.remove("minecraft");
-		return String.join(" ", namespaces);
+		return Set.copyOf(namespaces);
+	}
+
+	/** The player's dimension, or the Overworld when no world is open. Client thread. */
+	public static Identifier dimension(Minecraft mc) {
+		Level level = mc.level;
+		return level != null ? level.dimension().identifier() : Level.OVERWORLD.identifier();
 	}
 
 	/** The player's own mods: top-level jars, without Minecraft, Java, Fabric itself or this mod. */
@@ -79,7 +92,7 @@ public final class GameContext {
 			.filter(mod -> mod.getContainingMod().isEmpty())
 			.filter(mod -> {
 				String id = mod.getMetadata().getId();
-				return !HIDDEN_MODS.contains(id) && !id.startsWith("fabric-");
+				return !HIDDEN_MODS.contains(id) && !KnowledgeBase.isFabricApiModule(id);
 			})
 			.toList();
 	}

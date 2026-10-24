@@ -78,7 +78,10 @@ public class ClaudeConfig {
 	public String chatPrefix = "@claude";
 	/** How long Claude may work on a question, not counting time spent waiting for the player to Allow or Deny. */
 	public int timeoutSeconds = 300;
-	/** Decompile Minecraft and installed mods in the background so Claude can search the real code. */
+	/**
+	 * Build the knowledge base in the background at startup: Minecraft's code, included mods' code and every mod's
+	 * data. Only the startup build: a question naming a mod, or Claude's decompile_mod, decompiles it either way.
+	 */
 	public boolean buildKnowledge = true;
 	/**
 	 * Mod ids to always decompile, or never decompile, overriding the automatic choice. Set with /claude knowledge on

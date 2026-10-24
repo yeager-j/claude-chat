@@ -5,6 +5,7 @@ import net.minecraft.network.chat.Component;
 import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
@@ -22,12 +23,12 @@ public final class ClaudeRun {
 	/**
 	 * What was asked, captured on the client thread.
 	 *
-	 * @param gameContext the game state for the system prompt
-	 * @param mentionText the question plus the namespaces of whatever the player is holding or looking at; a data-only
-	 *                    mod it names is decompiled first
+	 * @param gameContext the game state for the system prompt ({@link GameContext#describe})
+	 * @param namespaces  the mod ids of whatever the player is holding or looking at; a data-only mod among them, or one
+	 *                    the question names, is decompiled first
 	 * @param resume      the session to continue, or empty for a new conversation
 	 */
-	public record Request(String question, String gameContext, String mentionText, Optional<String> resume, Policy policy) {
+	public record Request(String question, String gameContext, Set<String> namespaces, Optional<String> resume, Policy policy) {
 	}
 
 	/**

@@ -122,7 +122,7 @@ class McpServerTest {
 	/** The Authorization header claude gets from the grant's --mcp-config; also sets {@link #port}. */
 	private static String authorization(McpServer.Grant grant) {
 		JsonObject minecraft = JsonParser.parseString(grant.claudeConfig()).getAsJsonObject()
-			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
+			.getAsJsonObject("mcpServers").getAsJsonObject(McpServer.NAME);
 		port = URI.create(minecraft.get("url").getAsString()).getPort();
 		return minecraft.getAsJsonObject("headers").get("Authorization").getAsString();
 	}

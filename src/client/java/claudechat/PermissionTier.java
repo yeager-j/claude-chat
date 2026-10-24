@@ -19,9 +19,9 @@ public enum PermissionTier {
 		public String prompt(boolean worldOpen) {
 			return """
 
-				Permissions: read only. You can't edit files or run shell commands, and run_command only runs commands that
-				change nothing. When the player wants something done, give them the command in backticks to click instead.
-				""";
+				Permissions: read only. You can't edit files or run shell commands, and %s only runs commands
+				that change nothing. When the player wants something done, give them the command in backticks to click instead.
+				""".formatted(McpServer.claudeName(GameCommands.TOOL));
 		}
 
 		@Override
@@ -81,7 +81,7 @@ public enum PermissionTier {
 	static final String WRITE_TOOLS = "Bash,Edit,Write"
 		+ (System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows") ? ",PowerShell" : "");
 	/** Claude Code's name for {@link Approvals#TOOL}: hidden from Claude, but it answers permission prompts. */
-	static final String APPROVE_TOOL = "mcp__minecraft__" + Approvals.TOOL;
+	static final String APPROVE_TOOL = McpServer.claudeName(Approvals.TOOL);
 
 	private static final String ACT_PROMPT = """
 
@@ -141,11 +141,11 @@ public enum PermissionTier {
 	}
 
 	private static String allowedTools(boolean toolsServer) {
-		return toolsServer ? READ_TOOLS + ",mcp__minecraft" : READ_TOOLS;
+		return toolsServer ? READ_TOOLS + "," + McpServer.CLAUDE_PREFIX : READ_TOOLS;
 	}
 
 	private static String actPrompt(boolean worldOpen, String approval) {
-		String commands = worldOpen ? ", plus game commands with mcp__minecraft__run_command" : "";
+		String commands = worldOpen ? ", plus game commands with " + McpServer.claudeName(GameCommands.TOOL) : "";
 		return ACT_PROMPT.formatted(commands, approval);
 	}
 }

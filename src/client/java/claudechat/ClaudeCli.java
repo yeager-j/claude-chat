@@ -40,72 +40,6 @@ public class ClaudeCli {
 	private static final boolean WINDOWS = System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows");
 	// After claude exits, how long its output may take to drain. A process it started can keep the pipe open.
 	private static final long OUTPUT_DRAIN_MILLIS = 10_000;
-	private static final String SYSTEM_PROMPT = """
-		You are answering a question typed into Minecraft chat by the player. Your reply is shown in the game's chat box.
-		- Answer for the exact game version and mods listed below. Mechanics change between versions, so don't trust memory
-		  for specifics: check the reference files below, or search the web if they don't cover it.
-		- "This", "here" or "it" usually means the held item or the block the player is looking at.
-		- Simple questions (recipes, drops, what something does): 1-3 short sentences.
-		- Mechanics questions (spawning, AI, redstone timing, formulas): research the source until you are confident,
-		  then explain in up to about 10 short lines and name the key class or data file so the player can check it.
-		- If answering needs a mod's code and the list below says it isn't decompiled yet, call
-		  mcp__minecraft__decompile_mod with its id, then search the source it returns. It takes a few seconds. Only
-		  decompile code that will actually help; recipes and other data are already available.
-		- The player waits while you research and sees only your text, not your tool calls. So every time you are about
-		  to call tools (including your first call), first write one status line under 8 words saying what you're doing,
-		  e.g. "Searching the crafter code" or "Found it, checking hopper logic". It is shown live in chat.
-		  Your final message is the answer; don't begin it with a status line.
-
-		Formatting (the mod renders this in chat):
-		- Markdown subset only: **bold**, *italic*, ~~strike~~, `code`, [text](https://url), "# " headings, "- " bullets,
-		  "1. " lists. No tables and no code blocks; chat is narrow (about 50 characters per line before wrapping).
-		- Name items and blocks as [[id]] (e.g. [[iron_ingot]], [[minecraft:crafter]]). It shows the item's icon and name,
-		  with the real tooltip on hover. Use exact ids (check lang/*.json if unsure). Counts: "3× [[iron_ingot]]".
-		- To show how to make something, put [[recipe:<id>]] on its own line. <id> is a recipe file name under
-		  data/<namespace>/recipe/ (e.g. [[recipe:minecraft:crafter]]), or the item it makes. It is drawn as an icon grid
-		  from the game's data, so don't also list the ingredients, counts or layout in text. The grid can be the whole
-		  answer; add a sentence only if it answers something the grid doesn't, and only if you've verified it.
-		- Controls: {{key.inventory}}, {{key.use}}, {{key.attack}}, {{key.jump}}, {{key.sneak}}, {{key.sprint}}, {{key.drop}},
-		  {{key.swapOffhand}}, {{key.pickItem}} show the player's own key binding.
-		- Commands go in backticks and become click-to-insert, e.g. `/gamerule keep_inventory true`.
-		""";
-
-	private static final String WAYPOINT_PROMPT = """
-		- Xaero's Minimap is installed. When the player asks for a waypoint, or you give them a place to travel to, put
-		  [[waypoint:<name>|<x> <y> <z>|<dimension>]] right after the coordinates, e.g.
-		  `1240 ~ -3380` [[waypoint:End City|1240 ~ -3380|the_end]]. Use ~ for an unknown y, a short name (32 characters
-		  at most) and the dimension the place is in. It shows a button that opens Xaero's Add Waypoint screen filled in.
-		  You can't add waypoints yourself, so never say one was added; tell the player to click [+ Waypoint].
-		""";
-
-	private static final String WORLD_TOOLS_PROMPT = """
-
-		The player's own world (single-player) is available through the mcp__minecraft__* tools: search_containers
-		("where are my diamonds?", "which chest has..."), search_entities (pets, named mobs, item frames, dropped items),
-		get_player (inventory, ender chest, position), find_blocks (nearest placed blocks: spawners, beds, respawn anchors,
-		portals, with block state and block entity filters), find_structures (nearest structures, optionally only ones the
-		player hasn't visited yet, ones reaching into a biome, or ones with certain rooms, like an end city with a ship), find_biomes (nearest patches of a biome) and
-		inspect_location (block and biome at a position, predicted from the seed where nothing is generated yet). They
-		return exact distances and compass directions; report those instead of working them out yourself. Show
-		coordinates as `x y z` (or `x ~ z` for structures and biomes).
-		Structure template files (data/*/structure/*.nbt) are gzipped NBT, so Read can't open them. To identify a
-		structure the player describes by its blocks or shape, use search_structure_templates with those blocks; use
-		inspect_structure_template for one template's blocks, chests, spawners and layer-by-layer shape.
-		The player's schematics (Litematica .litematic, WorldEdit .schem) are also gzipped NBT: use list_schematics and
-		inspect_schematic. For "how much X do I need", use its materials, crafting and base_materials rather than
-		working out recipes yourself; to check a chest of supplies against a schematic, pass compare_with.
-		""";
-	private static final String NO_WORLD_TOOLS_PROMPT = """
-
-		The player is on a multiplayer server, so their world's contents and structure locations aren't available.
-		""";
-	private static final String LOOK_PROMPT = """
-		mcp__minecraft__look shows what the player sees right now: a screenshot, plus the block or entity under the
-		crosshair and the visible blocks and entities with their positions and where they are in the image. Use it when
-		the player says "this", "that" or "here", asks what they're looking at, or wants help with what's in front of
-		them. Shaders and resource packs can make the screenshot misleading, so name things from the data. It reports
-		only what's in view, so for anything else use the other tools.
-		""";
 
 	private final ClaudeConfig config;
 	private final KnowledgeBase knowledge;
@@ -133,7 +67,7 @@ public class ClaudeCli {
 	/** The question's thread: always completes the run, or the player could never ask again. */
 	private void answer(ClaudeRun run, Consumer<String> onProgress) {
 		try (McpServer.Grant grant = run.grant(mcp)) {
-			decompileMentionedMods(run.request().mentionText(), onProgress);
+			decompileMentionedMods(run.request(), onProgress);
 			run.complete(ask(run, grant, onProgress));
 		} catch (CancellationException e) {
 			ClaudeChatClient.LOGGER.info("Claude question cancelled");
@@ -152,8 +86,8 @@ public class ClaudeCli {
 		}
 	}
 
-	private void decompileMentionedMods(String mentionText, Consumer<String> onProgress) throws IOException, InterruptedException {
-		for (KnowledgeBase.Source mod : knowledge.mentionedWithoutCode(mentionText)) {
+	private void decompileMentionedMods(ClaudeRun.Request request, Consumer<String> onProgress) throws IOException, InterruptedException {
+		for (KnowledgeBase.Source mod : knowledge.mentionedWithoutCode(request.question(), request.namespaces())) {
 			onProgress.accept("Decompiling " + mod.label());
 			knowledge.buildCodeNow(mod, message -> { });
 		}
@@ -201,15 +135,9 @@ public class ClaudeCli {
 	}
 
 	private String systemPrompt(ClaudeRun.Request request) {
-		boolean worldOpen = mcp.worldOpen();
-		return SYSTEM_PROMPT
-			+ (Waypoints.available() ? WAYPOINT_PROMPT : "")
-			+ "\nCurrent game state:\n" + request.gameContext()
-			+ (worldOpen ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
-			+ LOOK_PROMPT
-			+ request.policy().tier().prompt(worldOpen)
-			+ "\n" + knowledge.describeForPrompt()
-			+ (config.extraInstructions.isEmpty() ? "" : "\n" + config.extraInstructions + "\n");
+		SystemPrompt.Parts parts = new SystemPrompt.Parts(request.gameContext(), mcp.worldOpen(), Waypoints.available(),
+			request.policy().tier(), knowledge.describeForPrompt(), config.extraInstructions);
+		return SystemPrompt.build(parts, mcp.toolNames());
 	}
 
 	private List<String> command(String exe, Path mcpConfig, Path promptFile, Policy policy, Optional<String> resume) {

@@ -20,12 +20,16 @@ import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.resources.Identifier;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -88,14 +92,10 @@ public class ClaudeChatClient implements ClientModInitializer {
 		knowledge = new KnowledgeBase(config);
 		worldIndex = new WorldIndex();
 		worldTools = new WorldTools(worldIndex, knowledge);
-		// Served for the whole session; each tool says when it's available (look in any world, the world tools and
-		// run_command only in a single-player one).
-		List<Tool> tools = Stream.of(new ModTools(knowledge).tools(), List.of(Approvals.tool(), new ViewSnapshot().tool()),
-			worldTools.tools(), List.of(new GameCommands(worldIndex).tool())).flatMap(List::stream).toList();
-		mcp = new McpServer(tools, worldTools::available);
+		mcp = new McpServer(tools(knowledge, worldIndex, worldTools), worldTools::available);
 		mcp.start();
 		cli = new ClaudeCli(config, knowledge, mcp);
-		formatter = new ChatFormatter(new RecipeRenderer(knowledge));
+		formatter = new ChatFormatter(knowledge.recipes());
 
 		// Start decompiling right away so it's usually done by the time a world has loaded.
 		if (config.buildKnowledge) {
@@ -140,7 +140,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 						return 1;
 					})))
 			.then(ClientCommands.literal("preview").executes(ctx -> {
-				showAnswer(formatter.format(PREVIEW));
+				showAnswer(formatter.format(PREVIEW, GameContext.dimension(Minecraft.getInstance())));
 				return 1;
 			}))
 			.then(ClientCommands.literal("reset").executes(ctx -> {
@@ -199,17 +199,17 @@ public class ClaudeChatClient implements ClientModInitializer {
 				}))
 				.then(ClientCommands.literal("include")
 					.then(ClientCommands.argument("mod", StringArgumentType.word())
-						.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(modIds(KnowledgeBase.Tier.DATA), builder))
+						.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(modIds(KnowledgeBase.Status::includable), builder))
 						.executes(ctx -> {
 							withMod(ctx.getSource(), StringArgumentType.getString(ctx, "mod"), mod -> {
 								knowledge.include(mod, ClaudeChatClient::notifyFromBackground);
-								ChatOutput.info("Decompiling " + mod.label() + " from now on" + (knowledge.hasCode(mod) ? "." : "; starting now."));
+								ChatOutput.info("Decompiling " + mod.label() + " from now on" + (knowledge.status(mod).hasCode() ? "." : "; starting now."));
 							});
 							return 1;
 						})))
 				.then(ClientCommands.literal("exclude")
 					.then(ClientCommands.argument("mod", StringArgumentType.word())
-						.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(modIds(KnowledgeBase.Tier.CODE), builder))
+						.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(modIds(KnowledgeBase.Status::excludable), builder))
 						.executes(ctx -> {
 							withMod(ctx.getSource(), StringArgumentType.getString(ctx, "mod"), mod -> {
 								knowledge.exclude(mod);
@@ -271,6 +271,15 @@ public class ClaudeChatClient implements ClientModInitializer {
 		});
 	}
 
+	/**
+	 * Every tool the MCP server serves, for the whole session; each says when it's available (look in any world, the
+	 * world tools and run_command only in a single-player one).
+	 */
+	static List<Tool> tools(KnowledgeBase knowledge, WorldIndex worldIndex, WorldTools worldTools) {
+		return Stream.of(new ModTools(knowledge).tools(), List.of(Approvals.tool(), new ViewSnapshot().tool()),
+			worldTools.tools(), List.of(new GameCommands(worldIndex).tool())).flatMap(List::stream).toList();
+	}
+
 	private static void updateWorldPacks(MinecraftServer server) {
 		knowledge.setWorldPacks(server.getWorldData().getLevelName(), server.getWorldPath(LevelResource.DATAPACK_DIR),
 			List.copyOf(server.getPackRepository().getSelectedIds()));
@@ -292,15 +301,18 @@ public class ClaudeChatClient implements ClientModInitializer {
 			return;
 		}
 
-		// Read game state and settings now, on the client thread; the CLI call runs in the background.
-		ClaudeRun.Request request = new ClaudeRun.Request(question, GameContext.describe(mc),
-			question + " " + GameContext.modNamespaces(mc), asked.session(), Policy.of(config));
+		// Read game state and settings now, on the client thread; the CLI call runs in the background. Waypoints in the
+		// answer default to the dimension the player asked in.
+		ClaudeRun.Request request = new ClaudeRun.Request(question, GameContext.describe(mc), GameContext.modNamespaces(mc),
+			asked.session(), Policy.of(config));
+		Identifier dimension = GameContext.dimension(mc);
 		ChatOutput.send(Component.literal("> " + question).withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC));
 		// Immediate feedback; Claude's first progress note can take several seconds.
 		StatusLine.Handle line = status.start();
-		Consumer<Component> showNote = note -> mc.execute(() -> line.setNote(note));
+		Consumer<String> showProgress = note -> mc.execute(() -> line.setNote(ChatFormatter.formatProgress(note, dimension)));
+		Consumer<Component> showApproval = note -> mc.execute(() -> line.setNote(note));
 
-		ClaudeRun run = cli.start(request, note -> showNote.accept(formatter.formatProgress(note)), showNote);
+		ClaudeRun run = cli.start(request, showProgress, showApproval);
 		asked.started(run);
 		run.outcome().whenComplete((result, error) -> {
 			if (run.isCancelled()) {
@@ -309,20 +321,8 @@ public class ClaudeChatClient implements ClientModInitializer {
 
 			// ClaudeCli always completes with an outcome; anything else is a bug, which mustn't leave the player stuck.
 			ClaudeRun.Outcome outcome = error == null ? result : ClaudeRun.Outcome.failure(error.toString());
-			// Format off the render thread: recipes are read from disk.
-			Optional<ChatFormatter.Answer> lines = Optional.empty();
-			String failure = outcome.failed() ? outcome.text() : null;
-			if (failure == null) {
-				try {
-					lines = Optional.of(formatter.format(outcome.text()));
-				} catch (RuntimeException e) {
-					LOGGER.warn("Couldn't format Claude's answer", e);
-					failure = e.toString();
-				}
-			}
-
-			Optional<ChatFormatter.Answer> answer = lines;
-			String finalFailure = failure;
+			// Parsed here, off the client thread, since the recipes may be read from disk; built into chat lines there.
+			Optional<ChatFormatter.Parsed> parsed = outcome.failed() ? Optional.empty() : parse(outcome.text());
 			mc.execute(() -> {
 				// A question cancelled meanwhile belongs to a conversation that has ended: its answer is never shown.
 				if (!asked.finished(run, outcome.sessionId())) {
@@ -330,10 +330,35 @@ public class ClaudeChatClient implements ClientModInitializer {
 				}
 
 				line.remove();
-				answer.ifPresentOrElse(ClaudeChatClient::showAnswer, () ->
-					ChatOutput.send(ChatOutput.line(Component.literal(finalFailure).withStyle(ChatFormatting.RED))));
+				Optional<ChatFormatter.Answer> answer = parsed.flatMap(p -> build(p, dimension));
+				answer.ifPresentOrElse(ClaudeChatClient::showAnswer, () -> showFailure(outcome.failed()
+					? outcome.text() : "Couldn't show Claude's answer; the log has details."));
 			});
 		});
+	}
+
+	/** Any thread. Empty if the answer can't be read; logged, since the player only sees that it failed. */
+	private static Optional<ChatFormatter.Parsed> parse(String answer) {
+		try {
+			return Optional.of(formatter.parse(answer));
+		} catch (RuntimeException e) {
+			LOGGER.warn("Couldn't read Claude's answer", e);
+			return Optional.empty();
+		}
+	}
+
+	/** Client thread. Empty if the answer can't be shown; logged, since the player only sees that it failed. */
+	private static Optional<ChatFormatter.Answer> build(ChatFormatter.Parsed parsed, Identifier dimension) {
+		try {
+			return Optional.of(ChatFormatter.build(parsed, dimension));
+		} catch (RuntimeException e) {
+			LOGGER.warn("Couldn't format Claude's answer", e);
+			return Optional.empty();
+		}
+	}
+
+	private static void showFailure(String message) {
+		ChatOutput.send(ChatOutput.line(Component.literal(message).withStyle(ChatFormatting.RED)));
 	}
 
 	private static void showAnswer(ChatFormatter.Answer answer) {
@@ -346,11 +371,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		}
 		for (int i = 0; i < lines.size(); i++) {
 			// Siblings, not children of the prefix, so answer text doesn't inherit its gold color.
-			MutableComponent line = Component.empty();
-			if (i == 0 && !prefixOwnLine) {
-				line.append(ChatOutput.prefix());
-			}
-			line.append(lines.get(i));
+			MutableComponent line = i == 0 && !prefixOwnLine ? ChatOutput.line(lines.get(i)) : Component.empty().append(lines.get(i));
 			if (i == lines.size() - 1) {
 				line.append(Component.literal(" [copy]").withStyle(style -> style
 					.withColor(ChatFormatting.DARK_GRAY)
@@ -424,33 +445,37 @@ public class ClaudeChatClient implements ClientModInitializer {
 			ChatOutput.info("No game or mod jars found.");
 			return;
 		}
+		Map<Boolean, List<KnowledgeBase.Source>> byCode = knowledge.sources().stream()
+			.collect(Collectors.partitioningBy(s -> wantsOrHasCode(knowledge.status(s))));
 		ChatOutput.info("Knowledge base: decompiled code for these (green = ready):");
-		ChatOutput.send(modList(knowledge.sources().stream().filter(s -> knowledge.hasCode(s) || knowledge.tier(s) == KnowledgeBase.Tier.CODE).toList()));
-		List<KnowledgeBase.Source> dataOnly = knowledge.sources().stream()
-			.filter(s -> !knowledge.hasCode(s) && knowledge.tier(s) == KnowledgeBase.Tier.DATA).toList();
-		if (!dataOnly.isEmpty()) {
+		ChatOutput.send(modList(byCode.get(true)));
+		if (!byCode.get(false).isEmpty()) {
 			ChatOutput.info("Data only; code is decompiled when a question needs it:");
-			ChatOutput.send(modList(dataOnly));
+			ChatOutput.send(modList(byCode.get(false)));
 		}
 		ChatOutput.info("Change with /claude knowledge include|exclude <mod>.");
 		if (!config.buildKnowledge) {
-			ChatOutput.info("Automatic building is off (buildKnowledge=false). /claude knowledge rebuild builds it now.");
+			ChatOutput.info("Building at startup is off (buildKnowledge=false). /claude knowledge rebuild builds it now.");
 		}
+	}
+
+	/** Listed with the decompiled code: code is there, or is wanted up front and still being built. */
+	private static boolean wantsOrHasCode(KnowledgeBase.Status status) {
+		return status.hasCode() || status.tier() == KnowledgeBase.Tier.CODE;
 	}
 
 	private static Component modList(List<KnowledgeBase.Source> sources) {
 		MutableComponent line = Component.literal("  ");
 		for (int i = 0; i < sources.size(); i++) {
 			KnowledgeBase.Source source = sources.get(i);
-			KnowledgeBase.State state = knowledge.state(source);
-			ChatFormatting color = switch (state) {
+			KnowledgeBase.Status status = knowledge.status(source);
+			ChatFormatting color = switch (status.state()) {
 				case READY, DATA_READY -> ChatFormatting.GREEN;
 				case FAILED -> ChatFormatting.RED;
 				default -> ChatFormatting.YELLOW;
 			};
-			String detail = source.id() + ": " + state.name().toLowerCase().replace('_', ' ') + " (" + knowledge.reason(source) + ")";
 			line.append(Component.literal(source.label()).withStyle(style -> style.withColor(color)
-				.withHoverEvent(new HoverEvent.ShowText(Component.literal(detail)))));
+				.withHoverEvent(new HoverEvent.ShowText(Component.literal(statusDetail(source, status))))));
 			if (i < sources.size() - 1) {
 				line.append(Component.literal(", ").withStyle(ChatFormatting.DARK_GRAY));
 			}
@@ -458,24 +483,34 @@ public class ClaudeChatClient implements ClientModInitializer {
 		return line;
 	}
 
-	/** Tab completion: include offers mods not decompiled yet; exclude offers decompiled or included ones. */
-	private static List<String> modIds(KnowledgeBase.Tier tier) {
+	/** "create: data ready (decompiled when needed)", and why a build failed. */
+	private static String statusDetail(KnowledgeBase.Source source, KnowledgeBase.Status status) {
+		String detail = source.id() + ": " + status.state().name().toLowerCase(Locale.ROOT).replace('_', ' ') + " (" + status.reason() + ")";
+		return status.failure() != null ? detail + "\n" + status.failure() : detail;
+	}
+
+	/** Tab completion: the mods {@code /claude knowledge include} (or exclude) would change. */
+	private static List<String> modIds(Predicate<KnowledgeBase.Status> changes) {
 		return knowledge.sources().stream()
-			.filter(s -> !s.id().equals("minecraft") && !s.codeContainers().isEmpty())
-			.filter(s -> tier == KnowledgeBase.Tier.DATA
-				? knowledge.canDecompile(s) || knowledge.reason(s).equals("excluded by you")
-				: knowledge.hasCode(s) || knowledge.tier(s) == KnowledgeBase.Tier.CODE)
+			.filter(s -> changes.test(knowledge.status(s)))
 			.map(KnowledgeBase.Source::id).toList();
 	}
 
+	/** Runs {@code action} for the mod with this id, if the player can include or exclude it; otherwise says why not. */
 	private static void withMod(FabricClientCommandSource source, String id, Consumer<KnowledgeBase.Source> action) {
-		knowledge.source(id).filter(s -> !s.id().equals("minecraft")).ifPresentOrElse(mod -> {
-			if (mod.codeContainers().isEmpty()) {
-				source.sendError(Component.literal(mod.label() + " has no code to decompile."));
-			} else {
-				action.accept(mod);
-			}
-		}, () -> source.sendError(Component.literal("No installed mod with id " + id + ".")));
+		Optional<KnowledgeBase.Source> mod = knowledge.source(id).filter(s -> !s.isGame());
+		if (mod.isEmpty()) {
+			source.sendError(Component.literal("No installed mod with id " + id + "."));
+			return;
+		}
+
+		KnowledgeBase.Status status = knowledge.status(mod.get());
+		if (!status.includable() && !status.excludable()) {
+			source.sendError(Component.literal(mod.get().label() + " has no code to decompile."));
+			return;
+		}
+
+		action.accept(mod.get());
 	}
 
 	/** Progress messages from the knowledge builder: show them in chat if the player is in a world. */

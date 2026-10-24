@@ -92,7 +92,7 @@ All of these tab-complete.
 | `chatPrefix` | `@claude` | |
 | `timeoutSeconds` | `300` | |
 | `claudePath` | (auto) | Full path to `claude` / `claude.exe` |
-| `buildKnowledge` | `true` | Decompile Minecraft at startup |
+| `buildKnowledge` | `true` | Build the knowledge base at startup: decompile Minecraft and included mods, copy every mod's data. With `false`, that waits for `/claude knowledge rebuild` or `include`. Either way, a question that names a mod, or Claude's `decompile_mod`, still decompiles that mod |
 | `knowledgeInclude`, `knowledgeExclude` | | Mod ids, comma-separated |
 | `extraInstructions` | | Added to Claude's instructions, e.g. `Answer like a pirate.` |
 | `permissions` | `read_only` | `read_only`, `ask` or `full` |

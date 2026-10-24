@@ -5,8 +5,6 @@ import net.fabricmc.loader.api.Version;
 import net.fabricmc.loader.api.VersionParsingException;
 import net.fabricmc.loader.api.metadata.version.VersionPredicate;
 import net.minecraft.ChatFormatting;
-import net.minecraft.client.Minecraft;
-import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
@@ -44,6 +42,16 @@ public final class Waypoints {
 	// Readable WaypointColor ordinals: gold, green, aqua, red, light purple, yellow, blue.
 	private static final int[] COLORS = {6, 10, 11, 12, 13, 14, 9};
 	private static final int MAX_NAME = 32; // Xaero rejects longer shared names
+	private static final String BUTTON = "[+ Waypoint]";
+
+	/** The system prompt's waypoint rules, for when {@link #available()}: the tag's grammar, as {@code TAG} reads it. */
+	public static final String PROMPT = """
+		- Xaero's Minimap is installed. When the player asks for a waypoint, or you give them a place to travel to, put
+		  [[waypoint:<name>|<x> <y> <z>|<dimension>]] right after the coordinates, e.g.
+		  `1240 ~ -3380` [[waypoint:End City|1240 ~ -3380|the_end]]. Use ~ for an unknown y, a short name (%d characters
+		  at most) and the dimension the place is in. It shows a button that opens Xaero's Add Waypoint screen filled in.
+		  You can't add waypoints yourself, so never say one was added; tell the player to click %s.
+		""".formatted(MAX_NAME, BUTTON);
 
 	/** A parsed tag. {@code y} is null when unknown (structures, biomes); Xaero then shows the waypoint without a height. */
 	private record Waypoint(String name, int x, Integer y, int z, Identifier dimension) {}
@@ -84,8 +92,8 @@ public final class Waypoints {
 		return false;
 	}
 
-	/** "Name|x y z|dimension"; the dimension is optional and defaults to the player's current one. */
-	private static Optional<Waypoint> parse(String tag) {
+	/** "Name|x y z|dimension"; without a dimension, {@code defaultDimension}. */
+	private static Optional<Waypoint> parse(String tag, Identifier defaultDimension) {
 		Matcher m = TAG.matcher(tag);
 		if (!m.matches()) {
 			return Optional.empty();
@@ -94,7 +102,7 @@ public final class Waypoints {
 		if (name.length() > MAX_NAME) {
 			name = name.substring(0, MAX_NAME).strip();
 		}
-		Identifier dimension = dimension(m.group("dim"));
+		Identifier dimension = m.group("dim") == null ? defaultDimension : dimension(m.group("dim"));
 		if (dimension == null) {
 			return Optional.empty();
 		}
@@ -102,12 +110,8 @@ public final class Waypoints {
 		return Optional.of(new Waypoint(name, Integer.parseInt(m.group("x")), y, Integer.parseInt(m.group("z")), dimension));
 	}
 
+	/** A dimension as Claude writes it ("the_end", "nether", "minecraft:overworld", a modded id); null if invalid. */
 	private static Identifier dimension(String text) {
-		if (text == null) {
-			// Answers are formatted off the render thread, so read the level once.
-			ClientLevel level = Minecraft.getInstance().level;
-			return level != null ? level.dimension().identifier() : Level.OVERWORLD.identifier();
-		}
 		String lower = text.toLowerCase(Locale.ROOT);
 		Identifier alias = DIMENSION_ALIASES.get(lower.replaceFirst("^(minecraft:)?(the_)?", ""));
 		return alias != null ? alias : Identifier.tryParse(lower);
@@ -154,14 +158,15 @@ public final class Waypoints {
 
 	/**
 	 * The chat button for the text inside [[waypoint:…]]. Nothing without a supported minimap; the text as written,
-	 * dimmed, if it can't be read.
+	 * dimmed, if it can't be read. A tag without a dimension gets {@code defaultDimension}: the one the player was in
+	 * when they asked, since they may have moved by the time the answer arrives.
 	 */
-	public static MutableComponent button(String tag) {
+	public static MutableComponent button(String tag, Identifier defaultDimension) {
 		if (!available()) {
 			return Component.empty();
 		}
 
-		Optional<Waypoint> parsed = parse(tag);
+		Optional<Waypoint> parsed = parse(tag, defaultDimension);
 		if (parsed.isEmpty()) {
 			ClaudeChatClient.LOGGER.warn("Couldn't read waypoint [[waypoint:{}]]", tag);
 			return Component.literal(tag).withStyle(style -> style
@@ -174,7 +179,7 @@ public final class Waypoints {
 		String where = waypoint.dimension().getPath().replaceFirst("^the_", "").replace('_', ' ');
 		Component hover = Component.literal("Add \"" + waypoint.name() + "\" at " + coords + " (" + where + ")\n")
 			.append(Component.literal("Opens Xaero's Add Waypoint screen").withStyle(ChatFormatting.GRAY));
-		return Component.literal("[+ Waypoint]").withStyle(style -> style
+		return Component.literal(BUTTON).withStyle(style -> style
 			.withColor(ChatFormatting.GREEN)
 			.withClickEvent(new ClickEvent.RunCommand("/" + xaeroCommand(waypoint)))
 			.withHoverEvent(new HoverEvent.ShowText(hover)));

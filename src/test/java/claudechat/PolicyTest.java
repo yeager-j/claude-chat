@@ -68,7 +68,7 @@ class PolicyTest {
 
 		assertEquals("none", valueAfter(flags, "--permission-prompts"));
 		assertFalse(flags.contains("--permission-prompt-tool"), flags.toString());
-		assertFalse(valueAfter(flags, "--allowedTools").contains("mcp__minecraft"), flags.toString());
+		assertFalse(valueAfter(flags, "--allowedTools").contains(McpServer.CLAUDE_PREFIX), flags.toString());
 	}
 
 	@Test

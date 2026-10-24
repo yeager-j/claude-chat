@@ -1,8 +1,10 @@
 package claudechat.test;
 
 import claudechat.Approvals;
+import claudechat.ChatOutput;
 import claudechat.ClaudeChatClient;
 import claudechat.ClaudeConfig;
+import claudechat.GameContext;
 import claudechat.GameRecipe;
 import claudechat.GameRecipes;
 import claudechat.KnowledgeBase;
@@ -127,7 +129,8 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		JsonObject decompiled = mcpCall("tools/call", "{\"name\": \"decompile_mod\", \"arguments\": {\"mod\": \"claudechat-test\"}}");
 		LOGGER.info("decompile_mod claudechat-test ({} ms) -> {}", (System.nanoTime() - decompileStart) / 1_000_000, decompiled);
 		check(!decompiled.has("isError") && ClaudeChatClient.knowledge().source("claudechat-test")
-			.map(ClaudeChatClient.knowledge()::hasCode).orElse(false), "decompile_mod didn't decompile the test mod: " + decompiled);
+			.map(mod -> ClaudeChatClient.knowledge().status(mod).hasCode()).orElse(false),
+			"decompile_mod didn't decompile the test mod: " + decompiled);
 
 		boolean worldTest = "1".equals(System.getenv("CLAUDECHAT_WORLD_TEST"));
 		boolean templateTest = "1".equals(System.getenv("CLAUDECHAT_TEMPLATE_TEST"));
@@ -181,9 +184,9 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 
 				// 3. How installed mods were classified (put mod jars in build/run/clientGameTest/mods to test real ones).
 				for (KnowledgeBase.Source source : ClaudeChatClient.knowledge().sources()) {
+					KnowledgeBase.Status status = ClaudeChatClient.knowledge().status(source);
 					LOGGER.info("knowledge: {} tier={} state={} reason={} codeJars={}", source.id(),
-						ClaudeChatClient.knowledge().tier(source), ClaudeChatClient.knowledge().state(source),
-						ClaudeChatClient.knowledge().reason(source), source.codeContainers().size());
+						status.tier(), status.state(), status.reason(), source.codeContainers().size());
 				}
 				chat(context, "/claude knowledge");
 				context.waitTicks(10);
@@ -199,7 +202,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					singleplayer.getServer().runCommand("reload");
 					context.waitFor(mc -> pistonCount() == 2, 60 * SECONDS);
 					context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 60 * SECONDS);
-					checkPackOverrides();
+					checkPackOverrides(context);
 
 					if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
 						chat(context, "@claude what's in a secret vault chest? and what can dungeon chests have in this world?");
@@ -816,10 +819,17 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			go(folder);
 			try (TestSingleplayerContext world = context.worldBuilder().create()) {
 				world.getConnection().waitForChunksRender();
-				scenario(folder, "answer Fresh answer in the new world");
+				// It starts with a recipe grid, built on the client thread from icons: an icon's text is its sprite
+				// ("[item/…@items]"), a name instead of one would read "[Smithing Template]". The prefix gets a line of its own.
+				scenario(folder, "answer [[recipe:minecraft:sentry_armor_trim_smithing_template_smithing_trim]]\nFresh answer in the new world");
 				chat(context, "@claude anything new?");
 				awaitAnswer(context);
 				check(context.computeOnClient(mc -> chatHas(mc, "Fresh answer in the new world")), "no answer in the new world");
+				check(context.computeOnClient(mc -> chatHas(mc, "item/sentry_armor_trim_smithing_template")
+					&& !chatHas(mc, "[Smithing Template]")), "the answer's trim grid has no icons");
+				check(context.computeOnClient(mc -> chatMessages(mc).stream()
+					.anyMatch(message -> message.content().getString().equals(ChatOutput.prefix().getString()))),
+					"the [Claude] prefix isn't on a line of its own before the grid");
 				check(!context.computeOnClient(mc -> chatHas(mc, "Late answer from the old world")), "the old world's answer arrived");
 				check(!FakeClaude.calls(folder).getLast().contains("--resume"), "the new world continued the old conversation");
 				context.waitTicks(10);
@@ -989,9 +999,8 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		check(recipes.find(Identifier.withDefaultNamespace("piston")).flatMap(GameRecipe::resultItem).map(item -> item.value() == Items.PISTON)
 			.orElse(false), "no piston recipe");
 
-		RecipeRenderer renderer = new RecipeRenderer(ClaudeChatClient.knowledge());
 		RecipeRenderer.Lines trim = context.computeOnClient(mc ->
-			renderer.render(Identifier.withDefaultNamespace("sentry_armor_trim_smithing_template_smithing_trim")));
+			RecipeRenderer.render(recipes, Identifier.withDefaultNamespace("sentry_armor_trim_smithing_template_smithing_trim")));
 		check(trim.grid(), "the trim recipe didn't draw: " + trim.lines());
 		context.runOnClient(mc -> trim.lines().forEach(mc.gui.hud.getChat()::addClientSystemMessage));
 		context.waitTicks(2);
@@ -1006,7 +1015,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	}
 
 	/** The zip pack's piston recipe replaces vanilla's for grids and material lists alike, and its folder comes first. */
-	private static void checkPackOverrides() {
+	private static void checkPackOverrides(ClientGameTestContext context) {
 		KnowledgeBase knowledge = ClaudeChatClient.knowledge();
 		Identifier pistonId = Identifier.withDefaultNamespace("piston");
 
@@ -1018,7 +1027,8 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		check(pistons.remaining().get(Materials.Material.item(Identifier.withDefaultNamespace("dirt"))) == 1,
 			"the pack's dirt isn't in the breakdown: " + pistons);
 
-		RecipeRenderer.Lines grid = new RecipeRenderer(knowledge).render(pistonId);
+		GameRecipes.Snapshot recipes = knowledge.recipes().snapshot();
+		RecipeRenderer.Lines grid = context.computeOnClient(mc -> RecipeRenderer.render(recipes, pistonId));
 		String text = grid.lines().stream().map(Component::getString).reduce("", String::concat);
 		check(grid.grid() && text.contains("2×"), "the piston grid doesn't show the pack's recipe: " + text);
 
@@ -1325,8 +1335,8 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	private static void addWaypoint(ClientGameTestContext context, String tag, String folder, String coords, String label) {
 		Path minimap = FabricLoader.getInstance().getGameDir().resolve("xaero/minimap");
 		int before = savedWaypoints(minimap, folder, coords).size();
-		// A tag without a dimension reads the player's, and Minecraft.getInstance() is off limits on the test thread.
-		ClickEvent click = context.computeOnClient(mc -> Waypoints.button(tag)).getStyle().getClickEvent();
+		// A tag without a dimension gets the player's, as when they ask; Minecraft.getInstance() is off limits on the test thread.
+		ClickEvent click = context.computeOnClient(mc -> Waypoints.button(tag, GameContext.dimension(mc))).getStyle().getClickEvent();
 		check(click instanceof ClickEvent.RunCommand, "no click command for " + tag);
 		String command = ((ClickEvent.RunCommand) click).command();
 		LOGGER.info("waypoint {} -> {}", tag, command);
@@ -1378,7 +1388,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	/** One JSON-RPC request to the mod's MCP server; returns the whole response, result or error. */
 	private static JsonObject mcpResponse(String method, String params) {
 		JsonObject server = JsonParser.parseString(grant.claudeConfig()).getAsJsonObject()
-			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
+			.getAsJsonObject("mcpServers").getAsJsonObject(McpServer.NAME);
 		String body = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
 		try {
 			HttpResponse<String> response = HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(server.get("url").getAsString()))
