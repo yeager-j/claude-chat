@@ -34,6 +34,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -47,6 +50,14 @@ public final class WorldTools {
 	private final WorldIndex index;
 	private final StructureTemplates templates = new StructureTemplates();
 	private final Materials materials;
+	/** Runs the world-independent warm-up in {@link #prepare}, one at a time, at low priority. */
+	private final ExecutorService warmUp = Executors.newSingleThreadExecutor(task -> {
+		Thread thread = new Thread(task, "Claude Chat materials");
+		thread.setDaemon(true);
+		thread.setPriority(Thread.MIN_PRIORITY);
+		return thread;
+	});
+	private Future<?> warmUpRun;
 
 	public WorldTools(WorldIndex index, KnowledgeBase knowledge) {
 		this.index = index;
@@ -163,7 +174,7 @@ public final class WorldTools {
 				+ "(\"a small tower of mossy stone bricks with a spawner\"): pass the blocks they mention. Templates containing "
 				+ "the most of the requested blocks come first, then those with many of them that also make up much of the build. "
 				+ "Big buildings are often split into several templates (a main building plus add-ons), so look past small "
-				+ "pieces. Covers Minecraft, mods, the "
+				+ "pieces. Templates with several block variants (palettes) match on any of them. Covers Minecraft, mods, the "
 				+ "world's data packs and templates saved in the world with a structure block. Each result says which structures "
 				+ "can place it (traced through template pools; structures that place templates from code, like igloos or many "
 				+ "mods' own structures, aren't traced, so that list can be empty). Template files are gzipped NBT and can't be "
@@ -180,7 +191,8 @@ public final class WorldTools {
 			"One structure template in detail: size, every block with its count, chests (with loot tables), spawners and "
 				+ "other block entities, entities, jigsaw connectors (which pools it attaches to), and the structures that can "
 				+ "place it. With layers, also draws it as text, one horizontal slice per y level: rows run north to south, "
-				+ "columns west to east, '.' is air, ' ' is empty (keeps whatever was there), and a legend maps the other "
+				+ "columns west to east, '.' is air, ' ' is nothing (structure void or not part of it: keeps whatever was there), "
+				+ "and a legend maps the other "
 				+ "characters to blocks. Blocks shown are before processors run, so a structure may swap some in the world "
 				+ "(cracked or mossy variants, random ores, decay).",
 			"""
@@ -193,11 +205,11 @@ public final class WorldTools {
 			"""));
 		tools.add(tool("list_schematics",
 			"List the player's schematic files (Litematica .litematic, WorldEdit .schem, structure .nbt) from their "
-				+ "schematics folder, with name, author, size and block count. The files are gzipped NBT and can't be read with "
-				+ "Read; use inspect_schematic.",
+				+ "schematics folder, with name, author, size, and block count where the file records one (Litematica). The files "
+				+ "are gzipped NBT and can't be read with Read; use inspect_schematic.",
 			"""
 			{"type": "object", "properties": {
-			  "query": {"type": "string", "description": "Only files whose path or schematic name contains this text."}
+			  "query": {"type": "string", "description": "Only files whose path (folders separated by /) or schematic name contains this text: the same files inspect_schematic chooses from."}
 			}}
 			"""));
 		tools.add(tool("inspect_schematic",
@@ -213,7 +225,7 @@ public final class WorldTools {
 				+ "like inspect_structure_template.",
 			"""
 			{"type": "object", "properties": {
-			  "schematic": {"type": "string", "description": "File name (\\"Witch Farm.litematic\\"), part of it, or the schematic's name."},
+			  "schematic": {"type": "string", "description": "File name (\\"Witch Farm.litematic\\", \\"farms/Witch Farm\\"), part of it, or the schematic's name. If several match, the error lists them."},
 			  "compare_with": {"type": "string", "description": "Container to check against: custom name (\\"witch farm\\"; every container with that name counts, e.g. both halves of a double chest), \\"x y z\\", or \\"inventory\\"."},
 			  "layers": {"type": "boolean"},
 			  "y_from": {"type": "integer"},
@@ -836,29 +848,40 @@ public final class WorldTools {
 	private static final String LAYER_SYMBOLS = "#ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@$%&*+=!~^<>/|:;";
 	/** About 10k tokens of drawing. */
 	private static final int MAX_LAYER_CELLS = 40_000;
-	private static final int MIN_BUILDING_BLOCKS = 8;
 
 	/**
 	 * Slow first-use work, in the background when the world opens or reloads: the structure template index, the
-	 * recipes for material breakdowns, and the data fixer's block state rules for old schematics.
+	 * recipes for material breakdowns, and the data fixer's rules for old schematics. The last two don't depend on the
+	 * world, so one run at a time is enough.
 	 */
 	public void prepare(MinecraftServer server) {
 		templates.prepare(server);
-		Thread thread = new Thread(() -> {
-			long start = System.nanoTime();
-			materials.prepare();
-			long recipesDone = System.nanoTime();
-			Schematics.prepare();
-			ClaudeChatClient.LOGGER.info("Prepared recipes in {} ms and the schematic data fixer in {} ms",
-				(recipesDone - start) / 1_000_000, (System.nanoTime() - recipesDone) / 1_000_000);
-		}, "Claude Chat materials");
-		thread.setDaemon(true);
-		thread.setPriority(Thread.MIN_PRIORITY);
-		thread.start();
+		synchronized (warmUp) {
+			if (warmUpRun == null || warmUpRun.isDone()) {
+				warmUpRun = warmUp.submit(() -> {
+					long start = System.nanoTime();
+					materials.prepare();
+					long recipesDone = System.nanoTime();
+					Schematics.prepare();
+					ClaudeChatClient.LOGGER.info("Prepared recipes in {} ms and the schematic data fixer in {} ms",
+						(recipesDone - start) / 1_000_000, (System.nanoTime() - recipesDone) / 1_000_000);
+				});
+			}
+		}
 	}
 
+	/**
+	 * Stops the background work for the world that's closing: the template index build, and a warm-up that hasn't
+	 * started yet. A warm-up already running finishes; it doesn't hold the server.
+	 */
 	public void clearTemplates() {
-		templates.clear();
+		templates.stop();
+		synchronized (warmUp) {
+			if (warmUpRun != null) {
+				warmUpRun.cancel(false);
+				warmUpRun = null;
+			}
+		}
 	}
 
 	private JsonElement searchTemplates(JsonObject args) throws Exception {
@@ -867,8 +890,7 @@ public final class WorldTools {
 			throw new IllegalStateException("No single-player world open.");
 		}
 		List<String> terms = strings(args, "blocks");
-		String query = string(args, "query", "").trim().toLowerCase(Locale.ROOT);
-		int maxSize = integer(args, "max_size", Integer.MAX_VALUE);
+		String query = string(args, "query", "").trim();
 		int limit = Math.max(1, Math.min(30, integer(args, "limit", 10)));
 		if (terms.isEmpty() && query.isEmpty()) {
 			throw new IllegalArgumentException("Give blocks, a query, or both.");
@@ -881,42 +903,11 @@ public final class WorldTools {
 			}
 			wanted.put(term, new HashSet<>(blocks));
 		}
-		Set<Block> anyWanted = new HashSet<>();
-		wanted.values().forEach(anyWanted::addAll);
 
 		StructureTemplates.Index templateIndex = templates.index(server);
-		/** score: matching blocks × their share, so both many matches and a build mostly made of them rank high. */
-		record Hit(StructureTemplates.Summary template, Map<String, Integer> perTerm, int termsMatched, double share, double score) {
-		}
-		List<Hit> hits = new ArrayList<>();
-		for (StructureTemplates.Summary t : templateIndex.templates()) {
-			Vec3i size = t.size();
-			if (Math.max(size.getX(), Math.max(size.getY(), size.getZ())) > maxSize) {
-				continue;
-			}
-			Set<Identifier> structures = templateIndex.structures().getOrDefault(t.id(), Set.of());
-			if (!query.isEmpty() && !t.id().toString().contains(query) && structures.stream().noneMatch(s -> s.toString().contains(query))) {
-				continue;
-			}
-			Map<String, Integer> perTerm = new LinkedHashMap<>();
-			int termsMatched = 0;
-			for (Map.Entry<String, Set<Block>> term : wanted.entrySet()) {
-				int count = term.getValue().stream().mapToInt(b -> t.blockCounts().getOrDefault(b, 0)).sum();
-				perTerm.put(term.getKey(), count);
-				termsMatched += count > 0 ? 1 : 0;
-			}
-			if (!wanted.isEmpty() && termsMatched == 0) {
-				continue;
-			}
-			int matchingBlocks = anyWanted.stream().mapToInt(b -> t.blockCounts().getOrDefault(b, 0)).sum();
-			double share = t.solidBlocks() == 0 ? 0 : (double) matchingBlocks / t.solidBlocks();
-			hits.add(new Hit(t, perTerm, termsMatched, share, matchingBlocks * share));
-		}
-		// Tiny pieces (a lone spawner on a jigsaw) match a single block perfectly but rarely identify anything; rank them after real buildings.
-		hits.sort(Comparator.comparingInt(Hit::termsMatched).reversed()
-			.thenComparing(h -> h.template().solidBlocks() < MIN_BUILDING_BLOCKS)
-			.thenComparing(Comparator.comparingDouble(Hit::score).reversed())
-			.thenComparing(h -> h.template().id().toString()));
+		StructureTemplates.SearchResult found = StructureTemplates.search(templateIndex,
+			new StructureTemplates.Query(wanted, query, integer(args, "max_size", Integer.MAX_VALUE)));
+		List<StructureTemplates.Hit> hits = found.hits();
 
 		JsonObject out = new JsonObject();
 		JsonObject searched = new JsonObject();
@@ -926,18 +917,21 @@ public final class WorldTools {
 			out.add("searched_blocks", searched);
 		}
 		out.addProperty("templates_indexed", templateIndex.templates().size());
+		if (!templateIndex.unreadable().isEmpty()) {
+			out.addProperty("templates_unreadable", templateIndex.unreadable().size());
+		}
 		out.addProperty("total_found", hits.size());
-		if (!hits.isEmpty() && wanted.size() > 1 && hits.getFirst().termsMatched() < wanted.size()) {
+		if (found.noneHasAll()) {
 			out.addProperty("note", "No template has all of these blocks; these have the most.");
 		}
 		JsonArray results = new JsonArray();
-		for (Hit hit : hits.subList(0, Math.min(limit, hits.size()))) {
+		for (StructureTemplates.Hit hit : hits.subList(0, Math.min(limit, hits.size()))) {
 			StructureTemplates.Summary t = hit.template();
 			JsonObject r = new JsonObject();
 			r.addProperty("template", t.id().toString());
-			r.addProperty("from", t.pack());
+			r.addProperty("from", t.origin().describe());
 			r.addProperty("size", sizeText(t.size()));
-			r.addProperty("solid_blocks", t.solidBlocks());
+			r.addProperty("solid_blocks", t.countedBlocks());
 			if (!wanted.isEmpty()) {
 				JsonObject matching = new JsonObject();
 				hit.perTerm().forEach(matching::addProperty);
@@ -976,44 +970,38 @@ public final class WorldTools {
 		StructureTemplates.Index templateIndex = templates.index(server);
 		StructureTemplates.Template t = StructureTemplates.load(server, id).orElse(null);
 		if (t == null) {
-			String last = id.getPath().substring(id.getPath().lastIndexOf('/') + 1);
-			List<String> similar = templateIndex.templates().stream().map(s -> s.id().toString())
-				.filter(s -> s.contains(last)).limit(10).toList();
+			List<String> similar = templateIndex.similarTo(id, 10).stream().map(Identifier::toString).toList();
 			throw new IllegalArgumentException("No structure template " + id + "."
 				+ (similar.isEmpty() ? " Use search_structure_templates to find one." : " Similar: " + String.join(", ", similar)));
 		}
 
 		JsonObject out = new JsonObject();
 		out.addProperty("template", id.toString());
-		out.addProperty("from", t.pack());
-		out.addProperty("size", sizeText(t.size()));
+		out.addProperty("from", t.origin().describe());
+		out.addProperty("size", sizeText(t.volume().size()));
 		if (t.palettes() > 1) {
 			out.addProperty("palettes", t.palettes() + " block variants, one picked at random when placed; showing the first");
 		}
-		Map<Block, Integer> counts = new HashMap<>();
-		t.blocks().stream().filter(b -> !b.state().isAir() && !b.state().is(Blocks.JIGSAW)).forEach(b -> counts.merge(b.state().getBlock(), 1, Integer::sum));
+		Map<Block, Integer> counts = t.volume().countedBlocks();
 		out.addProperty("solid_blocks", counts.values().stream().mapToInt(Integer::intValue).sum());
 		JsonObject blocks = new JsonObject();
 		counts.entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).limit(100)
 			.forEach(e -> blocks.addProperty(StructureTemplates.id(e.getKey()), e.getValue()));
 		out.add("blocks", blocks);
-		addBlockEntities(out, t.blocks(), t.entities());
+		addBlockEntities(out, t.volume());
 		addTemplateUsage(out, templateIndex, id, 20);
 		if (args != null && args.has("layers") && args.get("layers").getAsBoolean()) {
-			addLayers(out, t.size(), t.blocks(), args);
+			addLayers(out, t.volume(), args);
 		}
 		return out;
 	}
 
 	/** "block_entities" (chests with loot tables, spawners, signs...), "entities" and "jigsaw_connectors". */
-	private static void addBlockEntities(JsonObject out, List<StructureTemplates.BlockInfo> all, List<StructureTemplates.EntityInfo> entityList) {
+	private static void addBlockEntities(JsonObject out, BlockVolume volume) {
 		JsonArray blockEntities = new JsonArray();
 		JsonArray jigsaws = new JsonArray();
 		int moreBlockEntities = 0;
-		for (StructureTemplates.BlockInfo b : all) {
-			if (b.nbt() == null) {
-				continue;
-			}
+		for (BlockVolume.BlockEntity b : volume.blockEntities()) {
 			JsonObject r = new JsonObject();
 			if (b.state().is(Blocks.JIGSAW)) {
 				r.addProperty("pos", posText(b.pos()));
@@ -1022,7 +1010,7 @@ public final class WorldTools {
 					r.addProperty("facing", facing);
 				}
 				for (String key : List.of("pool", "name", "target", "final_state")) {
-					String value = b.nbt().getStringOr(key, "");
+					String value = b.data().getStringOr(key, "");
 					if (!value.isEmpty() && !value.equals("minecraft:empty")) {
 						r.addProperty(key.equals("final_state") ? "turns_into" : key, value);
 					}
@@ -1038,8 +1026,8 @@ public final class WorldTools {
 			}
 			addBlockState(r, b.state());
 			r.addProperty("pos", posText(b.pos()));
-			b.nbt().getString("LootTable").ifPresent(loot -> r.addProperty("loot_table", loot));
-			CompoundTag rest = b.nbt().copy();
+			b.data().getString("LootTable").ifPresent(loot -> r.addProperty("loot_table", loot));
+			CompoundTag rest = b.data().copy();
 			rest.remove("LootTable");
 			addBlockEntity(r, rest);
 			blockEntities.add(r);
@@ -1050,9 +1038,9 @@ public final class WorldTools {
 				out.addProperty("more_block_entities", moreBlockEntities);
 			}
 		}
-		if (!entityList.isEmpty()) {
+		if (!volume.entities().isEmpty()) {
 			JsonArray entities = new JsonArray();
-			entityList.stream().limit(30).forEach(e -> entities.add(e.type() + " at " + posText(e.pos())));
+			volume.entities().stream().limit(30).forEach(e -> entities.add(e.type() + " at " + posText(e.pos())));
 			out.add("entities", entities);
 		}
 		if (!jigsaws.isEmpty()) {
@@ -1063,30 +1051,28 @@ public final class WorldTools {
 	// --- schematics -----------------------------------------------------------------------------------------------
 
 	private JsonElement listSchematics(JsonObject args) throws Exception {
-		String query = string(args, "query", "").trim().toLowerCase(Locale.ROOT);
+		String query = string(args, "query", "").trim();
+		Schematics.Folder folder = Schematics.folder();
 		JsonObject out = new JsonObject();
-		out.addProperty("folder", Schematics.directory().toString());
+		out.addProperty("folder", folder.dir().toString());
 		JsonArray results = new JsonArray();
-		for (java.nio.file.Path file : Schematics.list()) {
+		for (Schematics.Entry entry : folder.entries()) {
+			if (!query.isEmpty() && !Schematics.matches(entry, query)) {
+				continue;
+			}
 			JsonObject r = new JsonObject();
-			r.addProperty("file", Schematics.relativeName(file));
-			try {
-				Schematics.Schematic s = Schematics.load(file);
-				if (!query.isEmpty() && !Schematics.relativeName(file).toLowerCase(Locale.ROOT).contains(query)
-					&& !s.name().toLowerCase(Locale.ROOT).contains(query)) {
-					continue;
+			r.addProperty("file", entry.path());
+			switch (entry) {
+				case Schematics.Readable readable -> {
+					Schematics.Info info = readable.info();
+					r.addProperty("name", info.name());
+					if (!info.author().isEmpty()) {
+						r.addProperty("author", info.author());
+					}
+					r.addProperty("size", sizeText(info.size()));
+					info.recordedBlocks().ifPresent(blocks -> r.addProperty("blocks", blocks));
 				}
-				r.addProperty("name", s.name());
-				if (!s.author().isEmpty()) {
-					r.addProperty("author", s.author());
-				}
-				r.addProperty("size", sizeText(s.size()));
-				r.addProperty("blocks", s.blocks().stream().filter(b -> !b.state().isAir()).count());
-			} catch (Exception e) {
-				if (!query.isEmpty() && !Schematics.relativeName(file).toLowerCase(Locale.ROOT).contains(query)) {
-					continue;
-				}
-				r.addProperty("error", "unreadable: " + e.getMessage());
+				case Schematics.Unreadable unreadable -> r.addProperty("error", "unreadable: " + unreadable.error());
 			}
 			results.add(r);
 		}
@@ -1099,20 +1085,27 @@ public final class WorldTools {
 
 	private JsonElement inspectSchematic(JsonObject args) throws Exception {
 		String query = string(args, "schematic", "").trim();
-		java.nio.file.Path file = Schematics.find(query).orElseThrow(() -> new IllegalArgumentException(
-			"No schematic matching \"" + query + "\" in " + Schematics.directory() + ". Use list_schematics."));
-		Schematics.Schematic s = Schematics.load(file);
+		Schematics.Folder folder = Schematics.folder();
+		Schematics.Entry entry = switch (Schematics.match(folder.entries(), query)) {
+			case Schematics.Found found -> found.entry();
+			case Schematics.Ambiguous ambiguous -> throw new IllegalArgumentException("\"" + query + "\" matches several schematics: "
+				+ String.join(", ", ambiguous.candidates().stream().limit(20).map(Schematics.Entry::path).toList()) + ". Give the file name.");
+			case Schematics.NotFound notFound -> throw new IllegalArgumentException(
+				"No schematic matching \"" + query + "\" in " + folder.dir() + ". Use list_schematics.");
+		};
+		Schematics.Schematic s = Schematics.load(entry.file());
+		Schematics.Info info = s.info();
 
 		JsonObject out = new JsonObject();
-		out.addProperty("file", Schematics.relativeName(file));
-		out.addProperty("name", s.name());
-		if (!s.author().isEmpty()) {
-			out.addProperty("author", s.author());
+		out.addProperty("file", entry.path());
+		out.addProperty("name", info.name());
+		if (!info.author().isEmpty()) {
+			out.addProperty("author", info.author());
 		}
-		if (!s.description().isEmpty()) {
-			out.addProperty("description", s.description());
+		if (!info.description().isEmpty()) {
+			out.addProperty("description", info.description());
 		}
-		out.addProperty("size", sizeText(s.size()));
+		out.addProperty("size", sizeText(info.size()));
 		if (s.regions().size() > 1) {
 			JsonArray regions = new JsonArray();
 			s.regions().forEach(r -> regions.add(r.name() + ": " + sizeText(r.size()) + " at " + posText(r.position())));
@@ -1120,7 +1113,7 @@ public final class WorldTools {
 		}
 
 		Map<String, Integer> noItem = new TreeMap<>();
-		Map<String, Integer> placed = Materials.asPlaced(s.blocks().stream().map(StructureTemplates.BlockInfo::state).toList(), noItem);
+		Map<String, Integer> placed = Materials.asPlaced(s.volume(), noItem);
 		out.add("materials", countsJson(placed));
 		out.addProperty("total_items", placed.values().stream().mapToInt(Integer::intValue).sum());
 		if (!noItem.isEmpty()) {
@@ -1136,9 +1129,9 @@ public final class WorldTools {
 		if (!compare.isEmpty()) {
 			out.add("comparison", compare(compare, placed));
 		}
-		addBlockEntities(out, s.blocks(), s.entities());
+		addBlockEntities(out, s.volume());
 		if (args.has("layers") && args.get("layers").getAsBoolean()) {
-			addLayers(out, s.size(), s.blocks(), args);
+			addLayers(out, s.volume(), args);
 		}
 		return out;
 	}
@@ -1198,28 +1191,16 @@ public final class WorldTools {
 		JsonArray containers = new JsonArray();
 		used.forEach(containers::add);
 		out.add("containers", containers);
-		Map<String, Integer> missingAsPlaced = new TreeMap<>();
-		placed.forEach((item, need) -> {
-			int shortfall = need - stock.getOrDefault(item, 0);
-			if (shortfall > 0) {
-				missingAsPlaced.put(item, shortfall);
-			}
-		});
-		out.add("missing_as_placed", countsJson(missingAsPlaced));
-		Materials.Breakdown withStock = materials.breakDown(placed, stock);
-		out.add("still_missing_after_crafting_from_contents", countsJson(withStock.remaining()));
-		if (!withStock.crafts().isEmpty()) {
-			out.add("crafting_needed", craftsJson(withStock.crafts()));
+		Materials.Comparison comparison = materials.compare(placed, stock);
+		out.add("missing_as_placed", countsJson(comparison.missingAsPlaced()));
+		out.add("still_missing_after_crafting_from_contents", countsJson(comparison.afterCrafting().remaining()));
+		if (!comparison.afterCrafting().crafts().isEmpty()) {
+			out.add("crafting_needed", craftsJson(comparison.afterCrafting().crafts()));
 		}
-		out.addProperty("complete", withStock.remaining().isEmpty());
-		Map<String, Integer> fullNeeds = new HashMap<>(placed);
-		materials.breakDown(placed, Map.of()).crafts().forEach(c -> c.recipe().ingredients().keySet().forEach(i -> fullNeeds.putIfAbsent(i, 0)));
-		Map<String, Integer> have = new TreeMap<>();
-		Map<String, Integer> extra = new TreeMap<>();
-		stock.forEach((item, count) -> (fullNeeds.containsKey(item) ? have : extra).put(item, count));
-		out.add("useful_contents", countsJson(have));
-		if (!extra.isEmpty()) {
-			out.add("not_needed", countsJson(extra));
+		out.addProperty("complete", comparison.complete());
+		out.add("useful_contents", countsJson(comparison.useful()));
+		if (!comparison.notNeeded().isEmpty()) {
+			out.add("not_needed", countsJson(comparison.notNeeded()));
 		}
 		return out;
 	}
@@ -1268,8 +1249,8 @@ public final class WorldTools {
 
 	/** "used_by_structures" (traced through pools) and "in_pools". */
 	private static void addTemplateUsage(JsonObject r, StructureTemplates.Index index, Identifier id, int max) {
-		Set<Identifier> structures = index.structures().getOrDefault(id, Set.of());
-		Set<Identifier> pools = index.pools().getOrDefault(id, Set.of());
+		Set<Identifier> structures = index.structuresUsing(id);
+		Set<Identifier> pools = index.poolsListing(id);
 		if (!structures.isEmpty()) {
 			r.add("used_by_structures", idList(structures, max));
 		}
@@ -1291,7 +1272,8 @@ public final class WorldTools {
 	}
 
 	/** One text grid per y level, plus the legend. Skipped with a note if it would be too long. */
-	private static void addLayers(JsonObject out, Vec3i size, List<StructureTemplates.BlockInfo> blockList, JsonObject args) {
+	private static void addLayers(JsonObject out, BlockVolume volume, JsonObject args) {
+		Vec3i size = volume.size();
 		int sx = size.getX();
 		int sy = size.getY();
 		int sz = size.getZ();
@@ -1308,22 +1290,21 @@ public final class WorldTools {
 				: "Too large to draw all at once; ask for at most " + fits + " layers with y_from/y_to (0 to " + (sy - 1) + ").");
 			return;
 		}
-		BlockState[] cells = new BlockState[(int) perLayer * (yTo - yFrom + 1)];
+		// Symbols go to blocks by how common they are in the drawn layers, so the legend fits what's shown.
 		Map<Block, Integer> counts = new HashMap<>();
-		for (StructureTemplates.BlockInfo b : blockList) {
-			BlockPos p = b.pos();
-			if (p.getY() < yFrom || p.getY() > yTo || p.getX() < 0 || p.getX() >= sx || p.getZ() < 0 || p.getZ() >= sz) {
-				continue;
-			}
-			cells[(p.getY() - yFrom) * (int) perLayer + p.getZ() * sx + p.getX()] = b.state();
-			if (!b.state().isAir()) {
-				counts.merge(b.state().getBlock(), 1, Integer::sum);
+		for (int y = yFrom; y <= yTo; y++) {
+			for (int z = 0; z < sz; z++) {
+				for (int x = 0; x < sx; x++) {
+					if (volume.kind(x, y, z) == BlockVolume.Kind.BLOCK) {
+						counts.merge(volume.state(x, y, z).getBlock(), 1, Integer::sum);
+					}
+				}
 			}
 		}
 		Map<Block, Character> symbols = new HashMap<>();
 		JsonObject legend = new JsonObject();
 		legend.addProperty(".", "air");
-		legend.addProperty(" ", "nothing (keeps the world's block)");
+		legend.addProperty(" ", "nothing: structure void, or not part of it (keeps the world's block)");
 		List<Block> byCount = counts.entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).map(Map.Entry::getKey).toList();
 		for (int i = 0; i < byCount.size(); i++) {
 			char c = i < LAYER_SYMBOLS.length() ? LAYER_SYMBOLS.charAt(i) : '?';
@@ -1341,8 +1322,12 @@ public final class WorldTools {
 			for (int z = 0; z < sz; z++) {
 				StringBuilder row = new StringBuilder(sx);
 				for (int x = 0; x < sx; x++) {
-					BlockState state = cells[(y - yFrom) * (int) perLayer + z * sx + x];
-					row.append(state == null ? ' ' : state.isAir() ? '.' : symbols.get(state.getBlock()));
+					char cell = switch (volume.kind(x, y, z)) {
+						case ABSENT, VOID -> ' ';
+						case AIR -> '.';
+						case BLOCK -> symbols.get(volume.state(x, y, z).getBlock());
+					};
+					row.append(cell);
 				}
 				rows.add(row.toString());
 			}

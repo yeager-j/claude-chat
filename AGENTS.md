@@ -21,8 +21,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `CLAUDECHAT_LIVE_TEST=1` | Real `@claude` questions (uses the user's Claude subscription) |
 | `CLAUDECHAT_MOD_QUESTION="..."` | Ask about a mod (on-demand decompile) |
 | `CLAUDECHAT_PACK_TEST=1` | Writes a folder and a zip data pack, runs `/reload`, asks about them |
-| `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
-| `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude |
+| `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks, including a structure block save showing up in search; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
+| `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude. For a folder of test files (every format, old versions, a broken file), first run `gradlew test --rerun --tests claudechat.ExportSchematicFixtures` with `CLAUDECHAT_EXPORT_SCHEMATICS="<folder>"` |
 | `CLAUDECHAT_WAYPOINT_TEST=1` | Needs Xaero's Minimap via `-PextraMods`. Runs `[[waypoint:…]]` button commands, confirms Xaero's screen, checks `waypoints.txt` per dimension; `CLAUDECHAT_WAYPOINT_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_PERMISSION_TEST=1` | World with cheats off. Calls `run_command` in each tier with cheats off and on, clicks the chat Allow/Deny buttons (screenshots `claudechat-approval-*`), calls the `approve` tool over MCP; with `CLAUDECHAT_LIVE_TEST=1` Claude also creates a file and runs a command, and the test clicks Allow |
 | `CLAUDECHAT_LOOK_TEST=1` | Builds a wall with a glass window in front of the player, calls `look` and checks what it sees (diamonds through the glass, sign text, the near pig) and doesn't (a gold block and a pig behind the wall); saves the tool's screenshot as `claudechat-look-tool.png`. `CLAUDECHAT_LOOK_QUESTION="..."` also asks Claude |
@@ -49,8 +49,9 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `BiomeFinder` | Multi-result `/locate biome` from the seed, off the server thread |
 | `LocationInspector` | Block and biome at a position: live, from the save, or predicted from the seed (base terrain only) |
 | `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
-| `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
-| `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
+| `StructureTemplates` | Structure `.nbt` templates: one from the game's `StructureTemplateManager`; for block search, all of them indexed per reload through the game's template sources (not the manager's cache), with structure block saves re-read when their file changes; search ranking; traces template → pools → structures |
+| `BlockVolume`, `StructureNbt` | The shared block model (block, air, structure void or absent per position; `counts` decides which blocks a build is made of) and the structure NBT layout, whose `upgrade` data-fixes every format's blocks, block entities and entities |
+| `Schematics`, `LitematicaFormat`, `SpongeFormat`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder: listing reads only each file's description, one matcher for list and inspect; material lists, recipe breakdown and container comparison |
 | `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` and `approve` always, the eleven world tools and `run_command` only while a single-player world is open |
 | `ViewSnapshot` | `look`, in any world (multiplayer too): rays through the screen grid (refined on edges) plus an entity line-of-sight pass, reporting what's visible with image positions, and a screenshot of the same frame as MCP image content |
 | `GameCommands` | `run_command`: parses with the server's dispatcher, follows `execute … run`, and checks the words against its read-only list (runs in every tier) and destructive list (red warning). Player's own source, or GAMEMASTER level with cheats on |

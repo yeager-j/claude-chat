@@ -52,6 +52,18 @@ public final class Materials {
 	public record Breakdown(Map<String, Integer> remaining, List<Craft> crafts) {
 	}
 
+	/**
+	 * Materials checked against what the player has. {@code missingAsPlaced} is the shortfall without crafting;
+	 * {@code afterCrafting} is what's still missing once components are crafted from the stock, with the crafts that
+	 * takes. {@code useful} is the stock that is a material or an ingredient of one, {@code notNeeded} the rest.
+	 */
+	public record Comparison(Map<String, Integer> missingAsPlaced, Breakdown afterCrafting, Map<String, Integer> useful,
+		Map<String, Integer> notNeeded) {
+		public boolean complete() {
+			return afterCrafting.remaining().isEmpty();
+		}
+	}
+
 	private final KnowledgeBase knowledge;
 	private Map<String, List<Recipe>> recipes;
 	private int indexedGeneration = -1;
@@ -62,22 +74,22 @@ public final class Materials {
 
 	// --- as placed ----------------------------------------------------------------------------------------------
 
-	/** Items needed to place these blocks, by item id. Blocks with no item (fire, piston heads) go to {@code noItem}. */
-	public static Map<String, Integer> asPlaced(Iterable<BlockState> states, Map<String, Integer> noItem) {
+	/**
+	 * Items needed to place a volume's counted blocks ({@link BlockVolume#counts}), by item id. Blocks with no item
+	 * (fire, end portal) go to {@code noItem}.
+	 */
+	public static Map<String, Integer> asPlaced(BlockVolume volume, Map<String, Integer> noItem) {
 		Map<String, Integer> items = new TreeMap<>();
-		for (BlockState state : states) {
-			addItems(state, items, noItem);
-		}
+		volume.forEachCounted(state -> addItems(state, items, noItem));
 		return items;
 	}
 
 	private static void addItems(BlockState state, Map<String, Integer> items, Map<String, Integer> noItem) {
 		Block block = state.getBlock();
-		if (state.isAir() || block == Blocks.STRUCTURE_VOID || block == Blocks.JIGSAW || block == Blocks.PISTON_HEAD
-			|| block == Blocks.MOVING_PISTON) {
+		// An extended piston's head, and the second half of two-block things, come with the first part.
+		if (block == Blocks.PISTON_HEAD) {
 			return;
 		}
-		// The second half of two-block things comes with the first.
 		if (state.hasProperty(BlockStateProperties.DOUBLE_BLOCK_HALF) && state.getValue(BlockStateProperties.DOUBLE_BLOCK_HALF) == DoubleBlockHalf.UPPER) {
 			return;
 		}
@@ -170,6 +182,29 @@ public final class Materials {
 			}
 		});
 		return new Breakdown(remaining, crafts);
+	}
+
+	/** Checks the materials for {@code placed} against {@code stock} (item id → count); see {@link Comparison}. */
+	public Comparison compare(Map<String, Integer> placed, Map<String, Integer> stock) {
+		return compare(placed, stock, breakDown(placed, Map.of()), breakDown(placed, stock));
+	}
+
+	/** The comparison, given the breakdown with nothing in stock ({@code full}) and with the stock ({@code withStock}). */
+	static Comparison compare(Map<String, Integer> placed, Map<String, Integer> stock, Breakdown full, Breakdown withStock) {
+		Map<String, Integer> missingAsPlaced = new TreeMap<>();
+		placed.forEach((item, need) -> {
+			int shortfall = need - stock.getOrDefault(item, 0);
+			if (shortfall > 0) {
+				missingAsPlaced.put(item, shortfall);
+			}
+		});
+
+		Set<String> materialsAndIngredients = new HashSet<>(placed.keySet());
+		full.crafts().forEach(c -> materialsAndIngredients.addAll(c.recipe().ingredients().keySet()));
+		Map<String, Integer> useful = new TreeMap<>();
+		Map<String, Integer> notNeeded = new TreeMap<>();
+		stock.forEach((item, count) -> (materialsAndIngredients.contains(item) ? useful : notNeeded).put(item, count));
+		return new Comparison(missingAsPlaced, withStock, useful, notNeeded);
 	}
 
 	/** Depth-first post-order through expandable recipes; a cycle (ingots ↔ blocks) stops at the repeated item. */
