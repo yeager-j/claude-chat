@@ -11,19 +11,21 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** The MCP server's HTTP and JSON-RPC handling and the tool contract, over a real socket, with stand-in tools. */
@@ -33,6 +35,10 @@ class McpServerTest {
 
 	/** Counted down when the block tool starts waiting. */
 	private static final CountDownLatch blocking = new CountDownLatch(1);
+	/** Counted down when the hold tool starts waiting; a test of its own uses it. */
+	private static final CountDownLatch holding = new CountDownLatch(1);
+	/** Calls of the sentinel tool, which stands for one that changes the world. */
+	private static final AtomicInteger sentinelCalls = new AtomicInteger();
 
 	private static McpServer server;
 	private static int port;
@@ -61,7 +67,23 @@ class McpServerTest {
 			Thread.sleep(60_000);
 			return Tool.Result.of(new JsonObject());
 		});
-		server = new McpServer(List.of(echo, closed, silent, picture, tier, block), () -> false);
+		// Turns the interrupt into an ordinary error result, as a tool that catches it would.
+		Tool hold = Tool.of("hold", "Waits until interrupted, then fails.", Tool.Requirement.NOTHING, List.of(), (arguments, context) -> {
+			holding.countDown();
+			try {
+				Thread.sleep(60_000);
+			} catch (InterruptedException e) {
+				throw new IllegalStateException("interrupted");
+			}
+			return Tool.Result.of(new JsonObject());
+		});
+		Tool sentinel = Tool.of("sentinel", "Counts its calls.", Tool.Requirement.NOTHING, List.of(), (arguments, context) -> {
+			sentinelCalls.incrementAndGet();
+			return Tool.Result.of(new JsonObject());
+		});
+		Tool big = Tool.of("big", "Returns 6 MiB.", Tool.Requirement.NOTHING, List.of(),
+			(arguments, context) -> Tool.Result.of(new JsonPrimitive("x".repeat(6 * 1024 * 1024))));
+		server = new McpServer(List.of(echo, closed, silent, picture, tier, block, hold, sentinel, big), () -> false);
 		server.start();
 		authorization = authorization(server.grant(context(PermissionTier.READ_ONLY)));
 	}
@@ -100,19 +122,118 @@ class McpServerTest {
 			try {
 				return exchange(post(token, rpcRequest("tools/call", "{\"name\": \"block\"}")));
 			} catch (IOException e) {
-				throw new UncheckedIOException(e);
+				return ""; // reset rather than closed: no answer either way
 			}
 		});
 		assertTrue(blocking.await(10, TimeUnit.SECONDS));
 
 		grant.close();
 
-		JsonObject result = body(call.get(10, TimeUnit.SECONDS)).getAsJsonObject("result");
-		assertTrue(result.get("isError").getAsBoolean(), result.toString());
+		// The question is gone, so the call gets no answer: its connection is closed.
+		assertFalse(call.get(10, TimeUnit.SECONDS).startsWith("HTTP/1.1 200"));
 		// The worker that was interrupted serves the next request normally.
 		for (int i = 0; i < 20; i++) {
 			assertEquals("\"read_only\"", callAs(authorization, "tier"));
 		}
+	}
+
+	@Test
+	void aBatchStopsWhenItsGrantCloses() throws Exception {
+		McpServer.Grant grant = server.grant(context(PermissionTier.FULL));
+		String token = authorization(grant);
+		String batch = "[" + rpcRequest("tools/call", "{\"name\": \"hold\"}") + ", "
+			+ rpcRequest("tools/call", "{\"name\": \"sentinel\"}") + "]";
+		int before = sentinelCalls.get();
+		CompletableFuture<String> call = CompletableFuture.supplyAsync(() -> {
+			try {
+				return exchange(post(token, batch));
+			} catch (IOException e) {
+				return "";
+			}
+		});
+		assertTrue(holding.await(10, TimeUnit.SECONDS));
+
+		grant.close();
+
+		assertFalse(call.get(10, TimeUnit.SECONDS).startsWith("HTTP/1.1 200"));
+		assertEquals(before, sentinelCalls.get());
+	}
+
+	@Test
+	void aRequestStillArrivingWhenItsGrantClosesIsNeverRun() throws Exception {
+		McpServer.Grant grant = server.grant(context(PermissionTier.FULL));
+		String token = authorization(grant);
+		String request = post(token, rpcRequest("tools/call", "{\"name\": \"sentinel\"}"));
+		int split = request.length() - 10;
+		int before = sentinelCalls.get();
+		try (Socket socket = new Socket(InetAddress.getLoopbackAddress(), port)) {
+			OutputStream out = socket.getOutputStream();
+			out.write(request.substring(0, split).getBytes(StandardCharsets.UTF_8));
+			out.flush();
+			Thread.sleep(300);
+
+			grant.close();
+
+			String response;
+			try {
+				out.write(request.substring(split).getBytes(StandardCharsets.UTF_8));
+				out.flush();
+				response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+			} catch (IOException e) {
+				response = "";
+			}
+			assertFalse(response.startsWith("HTTP/1.1 200"), response);
+		}
+		assertEquals(before, sentinelCalls.get());
+	}
+
+	@Test
+	void aClosedContextRefusesCalls() {
+		Tool.Context ended = context(PermissionTier.FULL).whileOpen(() -> false);
+
+		assertThrows(CancellationException.class, ended::throwIfEnded);
+		Tool echo = Tool.of("echo", "", Tool.Requirement.NOTHING, List.of(), (arguments, context) -> {
+			throw new AssertionError("ran after the question ended");
+		});
+		assertThrows(CancellationException.class, () -> echo.call(new JsonObject(), ended));
+	}
+
+	@Test
+	void largeBatchesAreRefused() throws IOException {
+		List<String> calls = new ArrayList<>();
+		for (int i = 0; i <= McpServer.MAX_BATCH; i++) {
+			calls.add(rpcRequest("tools/call", "{\"name\": \"sentinel\"}"));
+		}
+		int before = sentinelCalls.get();
+		String response = exchange(post(authorization, "[" + String.join(", ", calls) + "]"));
+
+		assertTrue(response.startsWith("HTTP/1.1 400"), response);
+		assertEquals(-32600, body(response).getAsJsonObject("error").get("code").getAsInt());
+		assertEquals(before, sentinelCalls.get());
+	}
+
+	@Test
+	void aBatchWithinTheLimitIsAnswered() throws IOException {
+		String response = exchange(post(authorization, "[" + rpcRequest("ping", "{}") + ", " + rpcRequest("ping", "{}") + "]"));
+
+		assertTrue(response.startsWith("HTTP/1.1 200"), response);
+		assertEquals(2, JsonParser.parseString(response.substring(response.indexOf("\r\n\r\n") + 4)).getAsJsonArray().size());
+	}
+
+	@Test
+	void answersBeyondTheResponseLimitBecomeErrors() throws IOException {
+		List<String> calls = new ArrayList<>();
+		for (int i = 0; i < McpServer.MAX_BATCH; i++) {
+			calls.add(rpcRequest("tools/call", "{\"name\": \"big\"}"));
+		}
+		String response = exchange(post(authorization, "[" + String.join(", ", calls) + "]"));
+		String body = response.substring(response.indexOf("\r\n\r\n") + 4);
+		JsonArray answers = JsonParser.parseString(body).getAsJsonArray();
+
+		assertTrue(body.getBytes(StandardCharsets.UTF_8).length <= McpServer.MAX_RESPONSE_BYTES, String.valueOf(body.length()));
+		assertEquals(McpServer.MAX_BATCH, answers.size());
+		assertTrue(answers.get(0).getAsJsonObject().has("result"));
+		assertEquals(-32603, answers.get(McpServer.MAX_BATCH - 1).getAsJsonObject().getAsJsonObject("error").get("code").getAsInt());
 	}
 
 	private static Tool.Context context(PermissionTier tier) {
@@ -172,7 +293,7 @@ class McpServerTest {
 		rpc("tools/list", "{}").getAsJsonObject("result").getAsJsonArray("tools")
 			.forEach(tool -> names.add(tool.getAsJsonObject().get("name").getAsString()));
 
-		assertEquals(List.of("echo", "silent", "picture", "tier", "block"), names);
+		assertEquals(List.of("echo", "silent", "picture", "tier", "block", "hold", "sentinel", "big"), names);
 	}
 
 	@Test

@@ -8,6 +8,7 @@ import com.google.gson.JsonParseException;
 import com.google.gson.JsonParser;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -15,11 +16,12 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
+import java.util.ArrayList;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -68,6 +70,15 @@ public class McpServer {
 	/** Generous: an approval request for a Write carries the whole file. */
 	private static final int MAX_BODY_BYTES = 32 * 1024 * 1024;
 	private static final int MAX_DRAIN_BYTES = 64 * 1024;
+	/** The whole request, headers and body, must arrive within this, however steadily it trickles in. */
+	private static final int REQUEST_DEADLINE_MILLIS = 60_000;
+	/**
+	 * Messages in one JSON-RPC batch. Claude Code sends one message per request (MCP dropped batches in 2025-06-18),
+	 * so this only stops one small request from asking for a great many answers at once.
+	 */
+	static final int MAX_BATCH = 8;
+	/** All the answers to one request together. A look screenshot, the largest single answer, is far below this. */
+	static final int MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
 
 	/** JSON-RPC's code for a request whose params are wrong; MCP uses it for a call to a tool it doesn't have. */
 	private static final int INVALID_PARAMS = -32602;
@@ -188,18 +199,25 @@ public class McpServer {
 
 	/**
 	 * One question's access to the tools: a token of its own and the question's {@link Tool.Context}. Closing it
-	 * revokes the token, so later requests with it are refused, and interrupts the calls it is still serving, so slow
-	 * reads (schematics, templates, searches) stop rather than finish for nobody.
+	 * revokes the token, so later requests with it are refused; closes the connections it is still serving, so a
+	 * request still arriving never completes; and interrupts their calls, so slow reads (schematics, templates,
+	 * searches) stop rather than finish for nobody. A request already let in checks the grant again before each
+	 * message and each call, and its context says the question ended, so nothing acts for it afterwards.
 	 */
 	public final class Grant implements AutoCloseable {
 		private final String token = newToken();
 		private final Tool.Context context;
-		/** The worker threads serving this grant's requests right now. */
-		private final Set<Thread> serving = new HashSet<>();
-		private boolean closed;
+		/** The worker threads serving this grant's requests right now, and their connections. */
+		private final Map<Thread, Socket> serving = new HashMap<>();
+		private volatile boolean closed;
 
 		private Grant(Tool.Context context) {
-			this.context = context;
+			this.context = context.whileOpen(this::isOpen);
+		}
+
+		/** False once the question has ended. */
+		public boolean isOpen() {
+			return !closed;
 		}
 
 		/** The --mcp-config JSON for claude: this server as {@link #NAME} with this token, or no servers if it isn't running. */
@@ -221,13 +239,16 @@ public class McpServer {
 			return config.toString();
 		}
 
-		/** Registers the current thread as serving one of this grant's requests; false once the grant is closed. */
-		private synchronized boolean enter() {
+		/**
+		 * Registers the current thread as serving one of this grant's requests over {@code client}; false once the
+		 * grant is closed.
+		 */
+		private synchronized boolean enter(Socket client) {
 			if (closed) {
 				return false;
 			}
 
-			serving.add(Thread.currentThread());
+			serving.put(Thread.currentThread(), client);
 			return true;
 		}
 
@@ -240,13 +261,22 @@ public class McpServer {
 			Thread.interrupted();
 		}
 
-		/** Revokes the token and interrupts the requests still being served. Safe to call more than once. */
+		/**
+		 * Revokes the token, closes the connections still being served and interrupts their calls. Safe to call more
+		 * than once.
+		 */
 		@Override
 		public void close() {
 			grants.remove(this);
 			synchronized (this) {
 				closed = true;
-				serving.forEach(Thread::interrupt);
+				serving.forEach((thread, client) -> {
+					thread.interrupt();
+					try {
+						client.close();
+					} catch (IOException ignored) {
+					}
+				});
 			}
 		}
 	}
@@ -267,10 +297,10 @@ public class McpServer {
 		try (client) {
 			// Reads only: a slow tool call doesn't read the socket, so this bounds idle clients, not tool time.
 			client.setSoTimeout(READ_TIMEOUT_MILLIS);
-			InputStream in = client.getInputStream();
+			InputStream in = new Deadline(client, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(REQUEST_DEADLINE_MILLIS));
 			OutputStream out = client.getOutputStream();
 			try {
-				serve(in, out);
+				serve(client, in, out);
 			} catch (BadRequest e) {
 				ClaudeChatClient.LOGGER.debug("MCP request refused: {}", e.getMessage());
 				respond(out, e.status, null);
@@ -282,22 +312,63 @@ public class McpServer {
 	}
 
 	/**
+	 * The request's input, which must all arrive by {@code deadline} ({@link System#nanoTime}): each read waits at most
+	 * until then, so a client can't keep a request open by sending a byte every so often.
+	 */
+	private static final class Deadline extends FilterInputStream {
+		private final Socket client;
+		private final long deadline;
+
+		Deadline(Socket client, long deadline) throws IOException {
+			super(client.getInputStream());
+			this.client = client;
+			this.deadline = deadline;
+		}
+
+		private void beforeRead() throws IOException {
+			long left = TimeUnit.NANOSECONDS.toMillis(deadline - System.nanoTime());
+			if (left <= 0) {
+				throw new SocketTimeoutException("request not received within " + REQUEST_DEADLINE_MILLIS + " ms");
+			}
+			client.setSoTimeout((int) Math.min(left, READ_TIMEOUT_MILLIS));
+		}
+
+		/** The socket's input itself, without the deadline. */
+		InputStream raw() {
+			return in;
+		}
+
+		@Override
+		public int read() throws IOException {
+			beforeRead();
+			return super.read();
+		}
+
+		@Override
+		public int read(byte[] buffer, int offset, int length) throws IOException {
+			beforeRead();
+			return super.read(buffer, offset, length);
+		}
+	}
+
+	/**
 	 * Reads and drops what the client is still sending, within limits. Closing with unread input makes TCP reset the
 	 * connection, which can discard the error response before the client reads it.
 	 */
 	private static void drain(Socket client, InputStream in) throws IOException {
 		client.shutdownOutput();
 		client.setSoTimeout(1000);
+		InputStream raw = in instanceof Deadline deadline ? deadline.raw() : in;
 		byte[] buffer = new byte[8192];
 		int drained = 0;
 		int read;
-		while (drained < MAX_DRAIN_BYTES && (read = in.read(buffer)) != -1) {
+		while (drained < MAX_DRAIN_BYTES && (read = raw.read(buffer)) != -1) {
 			drained += read;
 		}
 	}
 
 	/** One HTTP exchange. The headers are read within fixed limits and the token checked before any body is read. */
-	private void serve(InputStream in, OutputStream out) throws IOException, BadRequest {
+	private void serve(Socket client, InputStream in, OutputStream out) throws IOException, BadRequest {
 		String requestLine = readLine(in);
 		if (requestLine == null || requestLine.isEmpty()) {
 			return;
@@ -322,19 +393,23 @@ public class McpServer {
 			// No server-to-client event stream; clients fall back to plain request/response.
 			throw new BadRequest(405, "method " + method);
 		}
-		if (!grant.enter()) {
+		if (!grant.enter(client)) {
 			throw new BadRequest(401, "token revoked");
 		}
 
 		try {
-			answer(in, out, headers, grant.context);
+			answer(in, out, headers, grant);
 		} finally {
 			grant.exit();
 		}
 	}
 
-	/** Reads a POST body of JSON-RPC messages and answers them for the question with {@code context}. */
-	private void answer(InputStream in, OutputStream out, Map<String, String> headers, Tool.Context context)
+	/**
+	 * Reads a POST body of JSON-RPC messages and answers them for the question {@code grant} belongs to. The grant is
+	 * checked again once the body is in and before each message: once the question ends, nothing more is done for the
+	 * request and it gets no answer (its connection is closed anyway).
+	 */
+	private void answer(InputStream in, OutputStream out, Map<String, String> headers, Grant grant)
 		throws IOException, BadRequest {
 		JsonElement request;
 		try {
@@ -343,20 +418,75 @@ public class McpServer {
 			respond(out, 400, error(JsonNull.INSTANCE, -32700, "Parse error").toString());
 			return;
 		}
-		JsonElement response;
-		if (request.isJsonArray()) {
-			JsonArray responses = new JsonArray();
-			for (JsonElement message : request.getAsJsonArray()) {
-				JsonObject r = handleMessage(message, context);
-				if (r != null) {
-					responses.add(r);
-				}
-			}
-			response = responses.isEmpty() ? null : responses;
-		} else {
-			response = handleMessage(request, context);
+		boolean batch = request.isJsonArray();
+		List<JsonElement> messages = batch ? request.getAsJsonArray().asList() : List.of(request);
+		if (batch && messages.size() > MAX_BATCH) {
+			respond(out, 400, error(JsonNull.INSTANCE, -32600, "Invalid Request: a batch may hold at most " + MAX_BATCH
+				+ " messages").toString());
+			return;
 		}
-		respond(out, response == null ? 202 : 200, response == null ? null : response.toString());
+
+		Answers answers = new Answers();
+		for (JsonElement message : messages) {
+			if (!grant.isOpen() || Thread.currentThread().isInterrupted()) {
+				return;
+			}
+			JsonObject response = handleMessage(message, grant.context);
+			if (response != null) {
+				answers.add(response);
+			}
+		}
+		if (!grant.isOpen()) {
+			return;
+		}
+		if (answers.isEmpty()) {
+			respond(out, 202, null);
+		} else {
+			answers.send(out, batch);
+		}
+	}
+
+	/**
+	 * The answers to one request, each kept only as its JSON bytes, together within {@link #MAX_RESPONSE_BYTES}. An
+	 * answer that doesn't fit is replaced by an error saying so.
+	 */
+	private static final class Answers {
+		private final List<byte[]> parts = new ArrayList<>();
+		/** As sent in a batch: brackets and commas included. */
+		private long size = 2;
+
+		void add(JsonObject response) {
+			byte[] part = response.toString().getBytes(StandardCharsets.UTF_8);
+			if (size + part.length + 1 > MAX_RESPONSE_BYTES) {
+				part = error(response.get("id"), -32603, "The answer is over " + MAX_RESPONSE_BYTES / (1024 * 1024)
+					+ " MiB, together with the request's other answers. Ask for less at a time.").toString()
+					.getBytes(StandardCharsets.UTF_8);
+			}
+			parts.add(part);
+			size += part.length + 1;
+		}
+
+		boolean isEmpty() {
+			return parts.isEmpty();
+		}
+
+		/** One answer, or a batch's as a JSON array. */
+		void send(OutputStream out, boolean batch) throws IOException {
+			List<byte[]> body = new ArrayList<>();
+			if (batch) {
+				body.add(new byte[] {'['});
+			}
+			for (int i = 0; i < parts.size(); i++) {
+				if (i > 0) {
+					body.add(new byte[] {','});
+				}
+				body.add(parts.get(i));
+			}
+			if (batch) {
+				body.add(new byte[] {']'});
+			}
+			respond(out, 200, true, body);
+		}
 	}
 
 	/**
@@ -454,7 +584,15 @@ public class McpServer {
 	}
 
 	private static void respond(OutputStream out, int status, String json) throws IOException {
-		byte[] body = json == null ? new byte[0] : json.getBytes(StandardCharsets.UTF_8);
+		respond(out, status, json != null, json == null ? List.of() : List.of(json.getBytes(StandardCharsets.UTF_8)));
+	}
+
+	/** A response whose body is {@code body}'s parts one after another, written without joining them first. */
+	private static void respond(OutputStream out, int status, boolean isJson, List<byte[]> body) throws IOException {
+		long length = 0;
+		for (byte[] part : body) {
+			length += part.length;
+		}
 		String reason = switch (status) {
 			case 200 -> "OK";
 			case 202 -> "Accepted";
@@ -468,11 +606,13 @@ public class McpServer {
 			default -> "Error";
 		};
 		String head = "HTTP/1.1 " + status + " " + reason + "\r\n"
-			+ (json != null ? "Content-Type: application/json\r\n" : "")
-			+ "Content-Length: " + body.length + "\r\n"
+			+ (isJson ? "Content-Type: application/json\r\n" : "")
+			+ "Content-Length: " + length + "\r\n"
 			+ "Connection: close\r\n\r\n";
 		out.write(head.getBytes(StandardCharsets.ISO_8859_1));
-		out.write(body);
+		for (byte[] part : body) {
+			out.write(part);
+		}
 		out.flush();
 	}
 

@@ -7,6 +7,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.util.Base64;
 import java.util.List;
+import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
@@ -45,8 +46,29 @@ public record Tool(String name, Function<Context, String> description, List<Para
 	 *
 	 * @param policy    the permissions the question started with
 	 * @param approvals where to ask the player, for this question only
+	 * @param open      false once the question has ended; a call that started before then must not act for it after
 	 */
-	public record Context(Policy policy, Approvals approvals) {
+	public record Context(Policy policy, Approvals approvals, BooleanSupplier open) {
+		/** A context that stays open; the server's {@link McpServer.Grant} closes it with the question. */
+		public Context(Policy policy, Approvals approvals) {
+			this(policy, approvals, () -> true);
+		}
+
+		/** This context, closed as soon as {@code open} says so too. */
+		Context whileOpen(BooleanSupplier open) {
+			BooleanSupplier own = this.open;
+			return new Context(policy, approvals, () -> open.getAsBoolean() && own.getAsBoolean());
+		}
+
+		/**
+		 * Throws once the question has ended. Checked before a call starts and again right before anything that
+		 * changes the world, since revoking the token doesn't stop a request that was already let in.
+		 */
+		public void throwIfEnded() {
+			if (!open.getAsBoolean()) {
+				throw new CancellationException("The question ended, so this call did nothing.");
+			}
+		}
 	}
 
 	/**
@@ -117,8 +139,10 @@ public record Tool(String name, Function<Context, String> description, List<Para
 	 *
 	 * @throws IllegalStateException    when the requirement isn't met
 	 * @throws IllegalArgumentException when an argument is missing or malformed
+	 * @throws CancellationException    when the question has ended
 	 */
 	public Result call(JsonObject arguments, Context context) throws Exception {
+		context.throwIfEnded();
 		if (!available()) {
 			throw new IllegalStateException(requirement.unmet());
 		}
