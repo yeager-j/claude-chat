@@ -52,9 +52,14 @@ public final class ChatFormatter {
 		this.recipes = recipes;
 	}
 
-	/** Any thread: the reply's lines, and the game's recipes, read now if they changed since last time. */
+	/**
+	 * Any thread: the reply's lines, and the game's recipes if they draw one, read now if they changed since last time.
+	 * Without a recipe in the reply nothing is read: in multiplayer that would mean every recipe file (see
+	 * {@link GameRecipes}).
+	 */
 	public Parsed parse(String text) {
-		return new Parsed(ChatMarkup.parse(text), recipes.snapshot());
+		List<Line> lines = ChatMarkup.parse(text);
+		return new Parsed(lines, ChatMarkup.usesRecipes(lines) ? recipes.snapshot() : GameRecipes.Snapshot.EMPTY);
 	}
 
 	/**

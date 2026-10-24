@@ -17,11 +17,13 @@ import org.junit.jupiter.api.io.TempDir;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -121,6 +123,100 @@ class GameRecipesTest {
 
 		assertEquals(pack.resolve("minecraft/recipe/piston.json"), files.get(id("piston")));
 		assertTrue(files.containsKey(id("sub/folder")));
+	}
+
+	@Test
+	void filesAreReadInFullWithinTheLimits(@TempDir Path dir) throws IOException {
+		Path data = recipes(dir, 5);
+
+		GameRecipes.Snapshot snapshot = GameRecipes.fromFiles(List.of(data), ops, GameRecipes.Limits.DEFAULT);
+
+		assertTrue(snapshot.complete());
+		assertEquals(5, snapshot.byId().size());
+	}
+
+	@Test
+	void tooManyEntriesStopTheWalk(@TempDir Path dir) throws IOException {
+		Path data = recipes(dir, 50);
+
+		GameRecipes.Snapshot snapshot = GameRecipes.fromFiles(List.of(data), ops, limits(10, 16, 1024, 1 << 20, 64));
+
+		assertFalse(snapshot.complete());
+		assertTrue(snapshot.byId().size() < 10, "read " + snapshot.byId().size());
+	}
+
+	@Test
+	void theByteBudgetStopsReading(@TempDir Path dir) throws IOException {
+		Path data = recipes(dir, 50);
+		long fileSize = Files.size(data.resolve("minecraft/recipe/r0.json"));
+
+		GameRecipes.Snapshot snapshot = GameRecipes.fromFiles(List.of(data), ops, limits(1000, 16, 1024, fileSize * 3, 64));
+
+		assertFalse(snapshot.complete());
+		assertEquals(3, snapshot.byId().size());
+	}
+
+	@Test
+	void anOversizedOrTooDeepFileIsSkipped(@TempDir Path dir) throws IOException {
+		Path data = recipes(dir, 2);
+		Files.writeString(data.resolve("minecraft/recipe/big.json"), " ".repeat(2000) + "{}");
+		Files.writeString(data.resolve("minecraft/recipe/deep.json"), "[".repeat(100) + "]".repeat(100));
+
+		GameRecipes.Snapshot snapshot = GameRecipes.fromFiles(List.of(data), ops, limits(1000, 16, 1024, 1 << 20, 64));
+
+		assertFalse(snapshot.complete());
+		assertEquals(2, snapshot.byId().size());
+	}
+
+	@Test
+	void foldersPastTheDepthLimitArentRead(@TempDir Path dir) throws IOException {
+		Path data = recipes(dir, 1);
+		Path deep = data.resolve("minecraft/recipe/a/b/c/d");
+		Files.createDirectories(deep);
+		Files.writeString(deep.resolve("stick.json"), stickRecipe());
+
+		GameRecipes.Snapshot snapshot = GameRecipes.fromFiles(List.of(data), ops, limits(1000, 3, 1024, 1 << 20, 64));
+
+		assertFalse(snapshot.complete());
+		assertEquals(1, snapshot.byId().size());
+	}
+
+	@Test
+	void anInterruptStopsReading(@TempDir Path dir) throws IOException {
+		Path data = recipes(dir, 5);
+		Thread.currentThread().interrupt();
+
+		try {
+			GameRecipes.Snapshot snapshot = GameRecipes.fromFiles(List.of(data), ops, GameRecipes.Limits.DEFAULT);
+
+			assertFalse(snapshot.complete());
+			assertEquals(0, snapshot.byId().size());
+		} finally {
+			Thread.interrupted();
+		}
+	}
+
+	private static GameRecipes.Limits limits(int entries, int depth, int fileBytes, long totalBytes, int jsonDepth) {
+		return new GameRecipes.Limits(entries, depth, fileBytes, totalBytes, jsonDepth, Duration.ofSeconds(30));
+	}
+
+	/** {@code count} stick recipes, r0 to r(count - 1), under {@code dir}/data; returns the data folder. */
+	private static Path recipes(Path dir, int count) throws IOException {
+		Path recipeDir = dir.resolve("data/minecraft/recipe");
+		Files.createDirectories(recipeDir);
+
+		for (int i = 0; i < count; i++) {
+			Files.writeString(recipeDir.resolve("r" + i + ".json"), stickRecipe());
+		}
+
+		return dir.resolve("data");
+	}
+
+	private static String stickRecipe() {
+		return """
+			{"type": "minecraft:crafting_shaped", "key": {"#": "minecraft:oak_planks"}, "pattern": ["#", "#"],
+			 "result": {"count": 4, "id": "minecraft:stick"}}
+			""";
 	}
 
 	private static GameRecipe parse(String path, String json) {
