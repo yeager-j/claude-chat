@@ -17,10 +17,11 @@ public final class SystemPrompt {
 	 * @param gameState         {@link GameContext#describe}, captured when the question was asked
 	 * @param worldOpen         whether the single-player world tools are offered
 	 * @param waypoints         whether waypoint buttons work ({@link Waypoints#available})
+	 * @param policy            the question's permissions: the tier's paragraph, and whether it can search the web
 	 * @param referenceFiles    {@link KnowledgeBase#describeForPrompt}
 	 * @param extraInstructions the player's own addition from the config, or empty
 	 */
-	public record Parts(String gameState, boolean worldOpen, boolean waypoints, PermissionTier tier, String referenceFiles,
+	public record Parts(String gameState, boolean worldOpen, boolean waypoints, Policy policy, String referenceFiles,
 		String extraInstructions) {
 	}
 
@@ -30,7 +31,7 @@ public final class SystemPrompt {
 	private static final String INTRO = """
 		You are answering a question typed into Minecraft chat by the player. Your reply is shown in the game's chat box.
 		- Answer for the exact game version and mods listed below. Mechanics change between versions, so don't trust memory
-		  for specifics: check the reference files below, or search the web if they don't cover it.
+		  for specifics: check the reference files below%s.
 		- "This", "here" or "it" usually means the held item or the block the player is looking at.
 		- Simple questions (recipes, drops, what something does): 1-3 short sentences.
 		- Mechanics questions (spawning, AI, redstone timing, formulas): research the source until you are confident,
@@ -42,7 +43,14 @@ public final class SystemPrompt {
 		  to call tools (including your first call), first write one status line under 8 words saying what you're doing,
 		  e.g. "Searching the crafter code" or "Found it, checking hopper logic". It is shown live in chat.
 		  Your final message is the answer; don't begin it with a status line.
-		""".formatted(KnowledgeBase.NOT_DECOMPILED);
+		""";
+
+	/** Completes INTRO's "check the reference files below" sentence. */
+	private static final String WEB_ON = ", or search the web if they don't cover it";
+	/** Shell commands could still reach the network in Ask and Full, so this asks Claude not to rather than saying it can't. */
+	private static final String WEB_OFF = ". Web access is off: don't search the web or fetch pages by any means, shell"
+		+ " commands included (the player can turn it on with /claude web on). If the reference files don't cover"
+		+ " something, say so rather than guess";
 
 	private static final String WORLD_TOOLS = """
 
@@ -96,7 +104,8 @@ public final class SystemPrompt {
 	 */
 	public static String build(Parts parts, Set<String> tools) {
 		StringBuilder prompt = new StringBuilder();
-		prompt.append(withToolNames(INTRO, tools));
+		String research = parts.policy().web() ? WEB_ON : WEB_OFF;
+		prompt.append(withToolNames(INTRO.formatted(research, KnowledgeBase.NOT_DECOMPILED), tools));
 		prompt.append(PromptData.RULE);
 		prompt.append('\n').append(ChatMarkup.PROMPT);
 
@@ -107,7 +116,7 @@ public final class SystemPrompt {
 		prompt.append("\nCurrent game state:\n").append(PromptData.block("game state", parts.gameState()));
 		prompt.append(parts.worldOpen() ? withToolNames(WORLD_TOOLS, tools) : NO_WORLD_TOOLS);
 		prompt.append(withToolNames(LOOK, tools));
-		prompt.append(parts.tier().prompt(parts.worldOpen()));
+		prompt.append(parts.policy().tier().prompt(parts.worldOpen()));
 		prompt.append('\n').append(parts.referenceFiles());
 
 		if (!parts.extraInstructions().isEmpty()) {
