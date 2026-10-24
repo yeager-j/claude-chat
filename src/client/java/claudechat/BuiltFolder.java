@@ -41,8 +41,8 @@ final class BuiltFolder {
 	}
 
 	/**
-	 * Fills a new build. {@code out} becomes the published folder. {@code work} is empty scratch space, deleted after
-	 * publishing and kept after a failure, so logs written there can be read.
+	 * Fills a new build. {@code out} becomes the published folder, and is deleted if the build fails. {@code work} is
+	 * empty scratch space, deleted after publishing and kept after a failure, so logs written there can be read.
 	 */
 	@FunctionalInterface
 	interface Contents {
@@ -147,10 +147,10 @@ final class BuiltFolder {
 
 	/**
 	 * Builds the folder from scratch into a partial folder, then publishes it in place of the current one. Must hold
-	 * {@link #locked}. On failure the published folder is left as it was, progress becomes FAILED, and the exception
-	 * is rethrown. Refuses to build when a link leads the folder outside the knowledge root, before deleting or
-	 * creating anything: everything {@code contents} writes is below the partial and work folders beside it, in folders
-	 * this build creates.
+	 * {@link #locked}. On failure the published folder is left as it was, the partial folder is deleted, progress
+	 * becomes FAILED, and the exception is rethrown. Refuses to build when a link leads the folder outside the knowledge
+	 * root, before deleting or creating anything: everything {@code contents} writes is below the partial and work
+	 * folders beside it, in folders this build creates.
 	 */
 	void build(Content target, Contents contents) throws IOException, InterruptedException {
 		requireLock();
@@ -164,11 +164,13 @@ final class BuiltFolder {
 		Path partial = sibling(PARTIAL_SUFFIX);
 		// Beside the partial folder, not in it: Windows won't rename a folder holding files that are still being deleted.
 		Path work = sibling(WORK_SUFFIX);
+		boolean checked = false;
 
 		try {
 			Files.createDirectories(root);
 			// The partial and work folders are siblings of the published one, so checking its parent covers all three.
 			KnowledgeFiles.requireRealLocationInside(root, dir.getParent());
+			checked = true;
 			KnowledgeFiles.deleteTree(partial);
 			KnowledgeFiles.deleteTree(work);
 			Files.createDirectories(partial);
@@ -183,6 +185,12 @@ final class BuiltFolder {
 		} catch (IOException | InterruptedException | RuntimeException e) {
 			failure = e.getMessage() != null ? e.getMessage() : e.toString();
 			progress.set(Progress.FAILED);
+			// Whatever was copied before a limit stopped the build: a failed build mustn't keep taking disk space. Only
+			// once the location is known to be inside the root, so a refused build deletes nothing.
+			if (checked) {
+				deleteLeftover(partial);
+			}
+
 			throw e;
 		}
 

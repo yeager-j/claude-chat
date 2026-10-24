@@ -13,11 +13,12 @@ import java.io.IOException;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -26,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -164,6 +167,16 @@ public class KnowledgeBase {
 	private static final Set<String> GENERIC_WORDS = Set.of("fabric", "mod", "mods", "api", "lib", "library");
 	/** Files older versions of this mod kept in the knowledge root. */
 	private static final List<String> LEGACY_FILES = List.of("build.log", "vineflower-libraries.cfg");
+	/** World packs read at most; a world selecting more loses its lowest-priority ones, and the prompt says so. */
+	static final int MAX_WORLD_PACKS = 128;
+	/**
+	 * One world's packs together. Each pack also has {@link DataPackCopy.Limits#DEFAULT}, so without this a world could
+	 * fill the disk with many packs that are each within it.
+	 */
+	private static final DataPackCopy.Limits WORLD_PACK_LIMITS =
+		new DataPackCopy.Limits(1 << 18, DataPackCopy.Limits.DEFAULT.maxFileBytes(), 1L << 30);
+	private static final String WORLD_PACKS = "the world's data packs together";
+	private static final String ONE_PACK = "the pack";
 
 	/** A data pack from the current world's datapacks folder, as a folder or a zip. */
 	private record WorldPack(String name, Path location, BuiltFolder folder) {
@@ -189,6 +202,10 @@ public class KnowledgeBase {
 		return thread;
 	});
 	private volatile List<WorldPack> worldPacks = List.of();
+	/** Enabled world packs left out by {@link #MAX_WORLD_PACKS}. */
+	private volatile int omittedPacks;
+	/** What each copied world pack takes, charged to {@link #WORLD_PACK_LIMITS}; measured once for packs copied before. */
+	private final Map<BuiltFolder, DataPackCopy.Usage> packUsage = new ConcurrentHashMap<>();
 	private volatile String worldName = "";
 	/** The folders whose data the game loads, highest priority first; see {@link #dataRoots()}. */
 	private volatile List<BuiltFolder> dataOrder;
@@ -339,23 +356,23 @@ public class KnowledgeBase {
 	 * The single-player world's enabled packs changed (world opened, or /reload). {@code selectedIds} is the server's
 	 * enabled pack list in load order: "vanilla" is Minecraft, "file/..." a pack in the world's datapacks folder, and a
 	 * mod's pack has the mod's id. It sets the order of {@link #dataRoots()}. A world pack is copied again whenever its
-	 * files change.
+	 * files change. At most {@link #MAX_WORLD_PACKS} packs are read, the highest-priority ones, and listing their files
+	 * shares one entry budget. Other worlds' copies are deleted once the new world's packs are queued.
 	 */
 	public void setWorldPacks(String world, Path datapackDir, List<String> selectedIds) {
 		String worldFolder = KnowledgeFiles.folderName(datapackDir.toAbsolutePath().getParent().getFileName().toString());
 		Map<String, WorldPack> packsById = new HashMap<>();
+		DataPackCopy.Budget listed = new DataPackCopy.Budget(WORLD_PACK_LIMITS, WORLD_PACKS);
+		// Highest priority (loaded last) first, so a world with too many packs loses its lowest-priority ones.
+		List<String> worldPackIds = selectedIds.reversed().stream().filter(id -> id.startsWith(WORLD_PACK_PREFIX)).toList();
 
-		for (String id : selectedIds) {
-			if (!id.startsWith(WORLD_PACK_PREFIX)) {
-				continue;
-			}
-
+		for (String id : worldPackIds.subList(0, Math.min(worldPackIds.size(), MAX_WORLD_PACKS))) {
 			String name = id.substring(WORLD_PACK_PREFIX.length());
 			Optional<Path> location = KnowledgeFiles.resolveInside(datapackDir, name).filter(Files::exists);
 
 			if (location.isPresent()) {
 				String dir = "datapacks/" + worldFolder + "/" + KnowledgeFiles.folderName(name);
-				packsById.put(id, new WorldPack(name, location.get(), packFolder(dir, packKey(location.get()))));
+				packsById.put(id, new WorldPack(name, location.get(), packFolder(dir, packKey(location.get(), listed))));
 			}
 		}
 
@@ -363,6 +380,8 @@ public class KnowledgeBase {
 		List<WorldPack> packs = inPackOrder(selectedIds, id -> Optional.ofNullable(packsById.get(id)));
 		worldName = world;
 		worldPacks = packs;
+		omittedPacks = Math.max(0, worldPackIds.size() - MAX_WORLD_PACKS);
+		packUsage.keySet().retainAll(packs.stream().map(WorldPack::folder).collect(Collectors.toSet()));
 		dataOrder = inPackOrder(selectedIds, id -> dataFolderOfPack(id, packsById));
 		generation.incrementAndGet();
 
@@ -371,10 +390,14 @@ public class KnowledgeBase {
 				executor.execute(() -> extractPack(pack));
 			}
 		}
+
+		// After the copies: a world's packs share one budget, so the last world's copies go rather than add up.
+		executor.execute(this::removeSuperseded);
 	}
 
 	public void clearWorldPacks() {
 		worldPacks = List.of();
+		omittedPacks = 0;
 		worldName = "";
 		dataOrder = defaultDataOrder();
 		generation.incrementAndGet();
@@ -441,6 +464,13 @@ public class KnowledgeBase {
 
 			for (WorldPack pack : packs) {
 				world.append("- ").append(pack.name()).append(": ").append(describePack(pack.folder())).append('\n');
+			}
+
+			int omitted = omittedPacks;
+
+			if (omitted > 0) {
+				world.append("- ").append(omitted).append(" more, lower-priority packs: not read (only ").append(MAX_WORLD_PACKS)
+					.append(" packs are)\n");
 			}
 
 			sb.append("Data packs enabled in this world, highest priority first. A file here replaces the file at the same path")
@@ -565,8 +595,11 @@ public class KnowledgeBase {
 
 		try {
 			folder.build(target, (out, work) -> {
+				// A mod can be anyone's download, so its data, nested jars included, shares one bounded copy.
+				DataPackCopy.Budget budget = new DataPackCopy.Budget(DataPackCopy.Limits.DEFAULT, "its data and lang files");
+
 				for (ModContainer container : source.dataContainers()) {
-					extractData(container, out);
+					extractData(container, out, budget);
 				}
 
 				if (withCode) {
@@ -640,7 +673,14 @@ public class KnowledgeBase {
 
 		folder.locked(() -> {
 			try {
-				folder.build(Content.DATA, (out, work) -> copyPackData(pack.location(), out.resolve(BuiltFolder.DATA)));
+				folder.build(Content.DATA, (out, work) -> {
+					// The pack gets what's left of the world's budget after its other packs.
+					DataPackCopy.Budget world = new DataPackCopy.Budget(WORLD_PACK_LIMITS, WORLD_PACKS);
+					world.charge(usageOfOtherPacks(pack));
+					DataPackCopy.Budget budget = new DataPackCopy.Budget(DataPackCopy.Limits.DEFAULT, ONE_PACK, world);
+					copyPackData(pack.location(), out.resolve(BuiltFolder.DATA), budget);
+					packUsage.put(folder, budget.usage());
+				});
 			} catch (IOException | RuntimeException e) {
 				ClaudeChatClient.LOGGER.warn("Could not read world data pack {}", pack.name(), e);
 				return;
@@ -656,20 +696,45 @@ public class KnowledgeBase {
 	}
 
 	/** A pack can be anyone's download, so its copy is bounded and doesn't follow links (see {@link DataPackCopy}). */
-	private static void copyPackData(Path location, Path target) throws IOException {
+	private static void copyPackData(Path location, Path target, DataPackCopy.Budget budget) throws IOException {
 		if (Files.isDirectory(location)) {
-			DataPackCopy.fromFolder(location.resolve(PACK_DATA), target, DataPackCopy.Limits.DEFAULT);
+			DataPackCopy.fromFolder(location.resolve(PACK_DATA), target, budget);
 			return;
 		}
 
-		DataPackCopy.fromZip(location, PACK_DATA, target, DataPackCopy.Limits.DEFAULT);
+		DataPackCopy.fromZip(location, PACK_DATA, target, budget);
+	}
+
+	/** What the current world's other copied packs take, so that one pack's copy gets only what the world has left. */
+	private DataPackCopy.Usage usageOfOtherPacks(WorldPack pack) throws IOException {
+		DataPackCopy.Usage total = DataPackCopy.Usage.NONE;
+
+		for (WorldPack other : worldPacks) {
+			BuiltFolder folder = other.folder();
+
+			if (other.equals(pack) || folder.content() == Content.NONE) {
+				continue;
+			}
+
+			DataPackCopy.Usage used = packUsage.get(folder);
+
+			// Copied in an earlier session.
+			if (used == null) {
+				used = DataPackCopy.measure(folder.data());
+				packUsage.put(folder, used);
+			}
+
+			total = total.plus(used);
+		}
+
+		return total;
 	}
 
 	/**
 	 * Describes a pack's files, so an edited pack is copied again: size and time for a zip; each data file's path,
-	 * size and time for a folder.
+	 * size and time for a folder, listed within the pack's entry limit and {@code listed}, the world's.
 	 */
-	private static String packKey(Path location) {
+	private static String packKey(Path location, DataPackCopy.Budget listed) {
 		try {
 			if (!Files.isDirectory(location)) {
 				return "zip:" + Files.size(location) + ":" + Files.getLastModifiedTime(location).toMillis();
@@ -682,14 +747,11 @@ public class KnowledgeBase {
 			}
 
 			// The files the copy reads: links (Windows junctions too) aren't entered.
-			List<String> listing = new ArrayList<>();
-
-			for (Path file : KnowledgeFiles.regularFiles(data)) {
-				listing.add(data.relativize(file) + "\t" + Files.size(file) + "\t" + Files.getLastModifiedTime(file).toMillis());
-			}
-
-			Collections.sort(listing);
-			return "folder:" + KnowledgeFiles.sha256(String.join("\n", listing));
+			return "folder:" + DataPackCopy.fingerprint(data, new DataPackCopy.Budget(DataPackCopy.Limits.DEFAULT, ONE_PACK, listed));
+		} catch (TooLargeException e) {
+			// Too many files to list. A key that never matches has the pack copied each time, which its limits refuse
+			// (unless other packs made the world's listing run out), rather than kept while its files change.
+			return "unlisted:" + UUID.randomUUID();
 		} catch (IOException e) {
 			// Copying will fail too, and report why.
 			return "unreadable";
@@ -761,29 +823,33 @@ public class KnowledgeBase {
 			.collect(Collectors.joining(","));
 	}
 
-	/** Copies data/ and English translations out of a mod, through the loader's view of its files (works for nested jars). */
-	private static void extractData(ModContainer container, Path out) throws IOException {
+	/**
+	 * Copies data/ and English translations out of a mod, through the loader's view of its files (works for nested
+	 * jars), charging {@code budget}.
+	 */
+	private static void extractData(ModContainer container, Path out, DataPackCopy.Budget budget) throws IOException {
 		for (Path rootPath : container.getRootPaths()) {
-			KnowledgeFiles.copyTree(rootPath.resolve(PACK_DATA), out.resolve(BuiltFolder.DATA), file -> true);
-			copyEnglishNames(rootPath.resolve("assets"), out.resolve(BuiltFolder.LANG));
+			DataPackCopy.fromFolder(rootPath.resolve(PACK_DATA), out.resolve(BuiltFolder.DATA), budget);
+			copyEnglishNames(rootPath.resolve("assets"), out.resolve(BuiltFolder.LANG), budget);
 		}
 	}
 
-	/** assets/&lt;namespace&gt;/lang/en_us.json to lang/&lt;namespace&gt;.json. */
-	private static void copyEnglishNames(Path assets, Path langDir) throws IOException {
+	/** assets/&lt;namespace&gt;/lang/en_us.json to lang/&lt;namespace&gt;.json. Each namespace is an entry of {@code budget}. */
+	private static void copyEnglishNames(Path assets, Path langDir, DataPackCopy.Budget budget) throws IOException {
 		if (!Files.isDirectory(assets)) {
 			return;
 		}
 
-		try (Stream<Path> namespaces = Files.list(assets)) {
-			for (Path namespace : namespaces.toList()) {
+		try (DirectoryStream<Path> namespaces = Files.newDirectoryStream(assets)) {
+			for (Path namespace : namespaces) {
+				budget.entry();
 				Path english = namespace.resolve("lang").resolve("en_us.json");
 				// Folder names from a jar's file system can end with a slash.
 				String name = namespace.getFileName().toString().replace("/", "");
 				Optional<Path> target = KnowledgeFiles.resolveInside(langDir, name + ".json");
 
-				if (Files.isRegularFile(english) && target.isPresent()) {
-					KnowledgeFiles.copyFile(english, target.get());
+				if (Files.isRegularFile(english, LinkOption.NOFOLLOW_LINKS) && target.isPresent()) {
+					DataPackCopy.copyFile(english, target.get(), "assets/" + name + "/lang/en_us.json", budget);
 				}
 			}
 		}
