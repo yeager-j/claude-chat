@@ -4,8 +4,10 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 
 ## Build and run (Windows, PowerShell 5.1)
 
-- **Java:** JDK 25 is a portable install at `C:\Users\jackson\.jdks\jdk-25.0.4.1+1`. Gradle finds it via `org.gradle.java.home` in `gradle.properties`, but the wrapper itself needs `JAVA_HOME`:
+- **Java:** JDK 25 is a portable install at `C:\Users\jackson\.jdks\jdk-25.0.4.1+1`. The build declares a Java toolchain (`java_version` in `gradle.properties`) and the JVM running Gradle counts as a candidate, so pointing `JAVA_HOME` at it is enough, and the wrapper needs `JAVA_HOME` anyway:
   `$env:JAVA_HOME="$env:USERPROFILE\.jdks\jdk-25.0.4.1+1"; .\gradlew.bat build`
+  Running Gradle on a different JDK needs a JDK 25 that toolchain detection can find, or one registered as `org.gradle.java.installations.paths=<jdk folder>` in the user-level `~\.gradle\gradle.properties` (never the project's).
+- **Versions:** Java, Minecraft, Fabric Loader and Fabric API versions are set only in `gradle.properties`; `processResources` fills them into `fabric.mod.json` and the mixin config.
 - **Output:** the jar is `build\libs\claudechat-<version>.jar` (Vineflower is bundled inside it).
 - **Git:** not on PATH in agent shells. Call `& "C:\Program Files\Git\cmd\git.exe"`. The author is set repo-locally.
 - **Commit messages:** write them to a file and use `git commit -F <file>`. PowerShell 5.1 passes here-strings to native commands as arguments, which breaks `-F -`.
