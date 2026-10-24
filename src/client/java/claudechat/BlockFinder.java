@@ -6,7 +6,6 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.NbtOps;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.world.level.block.Block;
@@ -16,30 +15,31 @@ import net.minecraft.world.level.block.state.properties.Property;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.level.chunk.PalettedContainer;
+import net.minecraft.world.level.chunk.PalettedContainerFactory;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.PriorityQueue;
+import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
- * Finds the blocks nearest the player that match a block id or tag, block state properties ("charges=4") and text in
- * the block entity's data ("skeleton" in a spawner). Loaded chunks are scanned live on the server thread; saved chunks
+ * Finds the blocks nearest a point that match a block id or tag, block state properties ("charges=4") and text in the
+ * block entity's data ("skeleton" in a spawner). {@link LiveChunks} are scanned on the server thread; saved chunks
  * are re-read from the region files, but only those whose palettes say they can hold the block (see
- * {@link WorldIndex#savedChunksContaining}), nearest first, stopping once no closer match is possible.
+ * {@link WorldIndex.Snapshot#savedChunksContaining}), nearest first, stopping once no closer match is possible.
  */
 public final class BlockFinder {
 	/** Re-reading a chunk takes about a millisecond; this bounds a search for something common or absent. */
 	private static final int MAX_SAVED_CHUNKS = 4000;
+	private static final Duration LIVE_SCAN_TIMEOUT = Duration.ofSeconds(30);
 
 	public record Query(Set<Block> blocks, Map<String, String> properties, String data) {
 		boolean matches(BlockState state) {
@@ -59,9 +59,13 @@ public final class BlockFinder {
 		boolean matchesData(CompoundTag blockEntity) {
 			return data.isEmpty() || (blockEntity != null && blockEntity.toString().toLowerCase(Locale.ROOT).contains(data));
 		}
+
+		Set<String> blockIds() {
+			return blocks.stream().map(block -> BuiltInRegistries.BLOCK.getKey(block).toString()).collect(Collectors.toSet());
+		}
 	}
 
-	public record Found(BlockPos pos, BlockState state, CompoundTag blockEntity, boolean live, double distance) {
+	public record Found(BlockPos pos, BlockState state, CompoundTag blockEntity, Provenance provenance, double distance) {
 		public String id() {
 			return BlockFinder.id(state);
 		}
@@ -76,7 +80,7 @@ public final class BlockFinder {
 
 	/** Blocks matching a query: an id, a tag, or a word ("anchor" → respawn_anchor); see {@link RegistryQuery#resolve}. */
 	public static List<Block> resolve(RegistryAccess access, String query) {
-		return RegistryQuery.resolve(access, Registries.BLOCK, query).stream().map(Holder::value).toList();
+		return RegistryQuery.resolve(access, Registries.BLOCK, query, RegistryQuery.Precedence.ID_FIRST).stream().map(Holder::value).toList();
 	}
 
 	public static String id(BlockState state) {
@@ -93,76 +97,82 @@ public final class BlockFinder {
 	}
 
 	/**
-	 * The {@code limit} nearest matches in {@code level} within {@code maxDistance} of {@code origin}. Call from a
-	 * background thread: it blocks on the server thread for the loaded chunks and reads region files itself.
+	 * The {@code limit} nearest matches in {@code level} within {@code maxDistance} of {@code origin}, which must be
+	 * in that level. Not on the server thread: it waits for it for the live chunks and reads region files itself.
 	 */
-	public static Result find(WorldIndex index, ServerLevel level, Query query, double ox, double oy, double oz, int maxDistance,
+	public static Result find(WorldIndex.Snapshot snapshot, ServerLevel level, Query query, Origin origin, int maxDistance,
 		int limit) throws Exception {
 		MinecraftServer server = level.getServer();
-		String dimension = WorldIndex.dimensionName(level.dimension());
-		Nearest nearest = new Nearest(limit, maxDistance);
+		ServerTasks.requireOffServerThread(server);
+		if (!origin.dimension().equals(level.dimension())) {
+			throw new IllegalArgumentException("The origin is in " + origin.dimension().identifier() + ", not " + level.dimension().identifier());
+		}
 
-		Set<WorldIndex.ChunkKey> loaded = server.submit(() -> {
-			Set<WorldIndex.ChunkKey> keys = new HashSet<>();
-			for (LevelChunk chunk : WorldIndex.loadedChunks(server, level)) {
-				keys.add(new WorldIndex.ChunkKey(dimension, chunk.getPos().x(), chunk.getPos().z(), false));
-				LevelChunkSection[] sections = chunk.getSections();
-				for (int i = 0; i < sections.length; i++) {
-					if (!sections[i].maybeHas(query::matches)) {
-						continue;
-					}
-					int baseY = chunk.getSectionYFromSectionIndex(i) * 16;
-					scanSection(sections[i].getStates(), chunk.getPos().getMinBlockX(), baseY, chunk.getPos().getMinBlockZ(), query,
-						ox, oy, oz, nearest, pos -> {
-							// Not chunk.getBlockEntity(pos): that can create a missing block entity, and searches stay read-only.
-							BlockEntity blockEntity = chunk.getBlockEntities().get(pos);
-							return blockEntity == null ? null : blockEntity.saveWithFullMetadata(server.registryAccess());
-						}, true);
-				}
-			}
-			return keys;
-		}).get(30, TimeUnit.SECONDS);
+		NearestFirst.TopK<Found> nearest = new NearestFirst.TopK<>(limit, maxDistance);
+		Set<WorldIndex.ChunkKey> live = ServerTasks.call(server, () -> scanLive(level, query, origin, nearest),
+			LIVE_SCAN_TIMEOUT, "Searching the loaded chunks");
 
-		Set<String> ids = query.blocks().stream().map(b -> BuiltInRegistries.BLOCK.getKey(b).toString()).collect(Collectors.toSet());
-		List<WorldIndex.ChunkKey> candidates = new ArrayList<>(index.savedChunksContaining(dimension, ids));
-		candidates.removeIf(loaded::contains);
-		candidates.sort(Comparator.comparingDouble(key -> chunkDistance(key, ox, oz)));
-		var codec = level.palettedContainerFactory().blockStatesContainerCodec();
+		Set<String> ids = query.blockIds();
+		List<WorldIndex.ChunkKey> candidates = new ArrayList<>(snapshot.savedChunksContaining(level.dimension(), ids));
+		candidates.removeIf(live::contains);
+		candidates.sort(Comparator.comparingDouble(key -> chunkDistance(key, origin)));
+		PalettedContainerFactory factory = level.palettedContainerFactory();
 		int read = 0;
-		boolean truncated = false;
 		for (WorldIndex.ChunkKey key : candidates) {
-			if (!nearest.couldAccept(chunkDistance(key, ox, oz))) {
+			if (!nearest.couldAccept(chunkDistance(key, origin))) {
 				break;
 			}
 			if (read >= MAX_SAVED_CHUNKS) {
-				truncated = true;
-				break;
+				return new Result(nearest.sorted(), read, true);
 			}
 			read++;
-			CompoundTag chunk;
+
+			Optional<SavedChunk> chunk;
 			try {
-				chunk = index.readSavedChunk(key);
+				chunk = snapshot.readSavedChunk(key);
 			} catch (Exception e) {
 				ClaudeChatClient.LOGGER.debug("Skipping chunk {} in block search", key, e);
 				continue;
 			}
-			if (chunk == null) {
-				continue;
-			}
-			Map<BlockPos, CompoundTag> blockEntities = new HashMap<>();
-			chunk.getListOrEmpty("block_entities").compoundStream().forEach(tag -> blockEntities.put(
-				new BlockPos(tag.getIntOr("x", 0), tag.getIntOr("y", 0), tag.getIntOr("z", 0)), tag));
-			chunk.getListOrEmpty("sections").compoundStream().forEach(section -> section.getCompound("block_states")
-				.filter(states -> states.getListOrEmpty("palette").stream().anyMatch(entry -> ids.contains(WorldIndex.paletteName(entry))))
-				.flatMap(states -> codec.parse(NbtOps.INSTANCE, states).result())
-				.ifPresent(states -> scanSection(states, key.x() * 16, section.getByteOr("Y", (byte) 0) * 16, key.z() * 16, query,
-					ox, oy, oz, nearest, blockEntities::get, false)));
+			chunk.ifPresent(saved -> scanSaved(saved, key, ids, factory, query, origin, nearest));
 		}
-		return new Result(nearest.sorted(), read, truncated);
+		return new Result(nearest.sorted(), read, false);
+	}
+
+	/** Server thread: offers the matches in the live chunks, and returns which chunks those are. */
+	private static Set<WorldIndex.ChunkKey> scanLive(ServerLevel level, Query query, Origin origin, NearestFirst.TopK<Found> nearest) {
+		MinecraftServer server = level.getServer();
+		Set<WorldIndex.ChunkKey> keys = new HashSet<>();
+		for (LevelChunk chunk : LiveChunks.in(level)) {
+			keys.add(new WorldIndex.ChunkKey(level.dimension(), chunk.getPos().x(), chunk.getPos().z()));
+			// Not chunk.getBlockEntity(pos): that can create a missing block entity, and searches stay read-only.
+			Function<BlockPos, CompoundTag> blockEntity = pos -> {
+				BlockEntity found = chunk.getBlockEntities().get(pos);
+				return found == null ? null : found.saveWithFullMetadata(server.registryAccess());
+			};
+			LevelChunkSection[] sections = chunk.getSections();
+			for (int i = 0; i < sections.length; i++) {
+				if (sections[i].maybeHas(query::matches)) {
+					int baseY = chunk.getSectionYFromSectionIndex(i) * 16;
+					scanSection(sections[i].getStates(), chunk.getPos().getMinBlockX(), baseY, chunk.getPos().getMinBlockZ(), query,
+						origin, nearest, blockEntity, Provenance.LIVE);
+				}
+			}
+		}
+		return keys;
+	}
+
+	private static void scanSaved(SavedChunk chunk, WorldIndex.ChunkKey key, Set<String> ids, PalettedContainerFactory factory,
+		Query query, Origin origin, NearestFirst.TopK<Found> nearest) {
+		Map<BlockPos, CompoundTag> blockEntities = chunk.blockEntities();
+		for (int sectionY : chunk.sectionsListing(ids)) {
+			chunk.blockStates(sectionY, factory).ifPresent(states -> scanSection(states, key.x() * 16, sectionY * 16, key.z() * 16,
+				query, origin, nearest, blockEntities::get, Provenance.SAVED));
+		}
 	}
 
 	private static void scanSection(PalettedContainer<BlockState> states, int baseX, int baseY, int baseZ, Query query,
-		double ox, double oy, double oz, Nearest nearest, Function<BlockPos, CompoundTag> blockEntity, boolean live) {
+		Origin origin, NearestFirst.TopK<Found> nearest, Function<BlockPos, CompoundTag> blockEntity, Provenance provenance) {
 		if (!states.maybeHas(query::matches)) {
 			return;
 		}
@@ -173,15 +183,14 @@ public final class BlockFinder {
 					if (!query.matches(state)) {
 						continue;
 					}
-					double distance = Math.sqrt(Math.pow(baseX + x + 0.5 - ox, 2) + Math.pow(baseY + y + 0.5 - oy, 2)
-						+ Math.pow(baseZ + z + 0.5 - oz, 2));
+					double distance = origin.distanceTo(baseX + x + 0.5, baseY + y + 0.5, baseZ + z + 0.5);
 					if (!nearest.couldAccept(distance)) {
 						continue;
 					}
 					BlockPos pos = new BlockPos(baseX + x, baseY + y, baseZ + z);
 					CompoundTag data = blockEntity.apply(pos);
 					if (query.matchesData(data)) {
-						nearest.offer(new Found(pos, state, data, live, distance));
+						nearest.offer(new Found(pos, state, data, provenance, distance), distance);
 					}
 				}
 			}
@@ -189,39 +198,10 @@ public final class BlockFinder {
 	}
 
 	/** Horizontal distance from the origin to the nearest point of a chunk: no block in it can be closer. */
-	private static double chunkDistance(WorldIndex.ChunkKey key, double ox, double oz) {
-		double dx = Math.max(0, Math.max(key.x() * 16 - ox, ox - (key.x() * 16 + 16)));
-		double dz = Math.max(0, Math.max(key.z() * 16 - oz, oz - (key.z() * 16 + 16)));
+	private static double chunkDistance(WorldIndex.ChunkKey key, Origin origin) {
+		double dx = Math.max(0, Math.max(key.x() * 16 - origin.x(), origin.x() - (key.x() * 16 + 16)));
+		double dz = Math.max(0, Math.max(key.z() * 16 - origin.z(), origin.z() - (key.z() * 16 + 16)));
 		return Math.sqrt(dx * dx + dz * dz);
-	}
-
-	/** The closest {@code limit} matches so far, so searching for something common ("stone") stays cheap. */
-	private static final class Nearest {
-		private final PriorityQueue<Found> queue = new PriorityQueue<>(Comparator.comparingDouble(Found::distance).reversed());
-		private final int limit;
-		private final double maxDistance;
-
-		Nearest(int limit, double maxDistance) {
-			this.limit = limit;
-			this.maxDistance = maxDistance;
-		}
-
-		boolean couldAccept(double distance) {
-			return distance <= maxDistance && (queue.size() < limit || distance < queue.peek().distance());
-		}
-
-		void offer(Found found) {
-			queue.add(found);
-			if (queue.size() > limit) {
-				queue.poll();
-			}
-		}
-
-		List<Found> sorted() {
-			List<Found> list = new ArrayList<>(queue);
-			list.sort(Comparator.comparingDouble(Found::distance));
-			return list;
-		}
 	}
 
 	private static <T extends Comparable<T>> String valueName(BlockState state, Property<T> property) {

@@ -43,12 +43,16 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while Xaero's Minimap is loaded) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
-| `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes |
-| `StructureFinder` | Multi-result `/locate` with visited filtering; builds a structure's pieces in memory (`Structure.generate`) to name them (template id, or class for hand-coded pieces, via `mixin/*Accessor`) and sample the biomes they occupy |
+| `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players (the host by UUID), per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes. Per-world state is an object made on world start and dropped on stop. A `Snapshot` (`Detail.VISITS` or `HOLDERS`) also reads saved chunks |
+| `RegionFiles`, `SavedChunk`, `HolderReader`, `VisitsFile` | Region file layout; the parsed chunk view (the only reader of chunk NBT keys); block entity/entity/player NBT → holders; `claudechat-visits.txt` |
+| `LiveChunks` | The one rule for which chunks are read live rather than from the save |
+| `Visit`, `Dimensions`, `Origin`, `Provenance` | Values the world tools parse arguments into: visit state and the `visited` filter, dimension names and which dimensions a search covers, the search origin (translated x/8 into the Nether), live/saved/predicted |
+| `NearestFirst`, `ServerTasks` | Ring walk and top-k for the nearest-first searches; server-thread calls with timeouts and asserted thread rules |
+| `StructureFinder` | Multi-result `/locate` with visited filtering, in short slices on the server thread with a timeout. Pieces come from the saved start where there is one, else are built in memory exactly as generation would (`Structure.generate`, including a structure set's weighted pick); never generates chunks. Names pieces (template id, or class for hand-coded pieces, via `mixin/*Accessor`) and samples the biomes they occupy |
 | `BlockFinder` | Nearest blocks by id/tag, state properties and block entity text; re-reads only saved chunks whose palette has the block |
 | `BiomeFinder` | Multi-result `/locate biome` from the seed, off the server thread |
 | `LocationInspector` | Block and biome at a position: live, from the save, or predicted from the seed (base terrain only) |
-| `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks and biomes |
+| `RegistryQuery` | Id, `#tag` or word → registry entries, for blocks, biomes and structures (structures prefer the tag) |
 | `StructureTemplates` | Structure `.nbt` templates read through the server's resource manager (data-fixed), indexed per reload for block search; traces template → pools → structures |
 | `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
 | `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` and `approve` always, the eleven world tools and `run_command` only while a single-player world is open |
@@ -108,9 +112,9 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 - **"Generated" chunks:** structure searches (ours and `/locate`'s) leave `structure_starts` chunks on disk. Only `Status: minecraft:full` counts as generated.
 - **InhabitedTime:**
   - It advances only while a player is within 128 blocks of the chunk and the chunk is within simulation distance (`ServerChunkCache.tickSpawningChunk`). So a structure's time is the most of any chunk its pieces cover: an end city in the user's world had 0 s at its start chunk and 101 s in its pieces.
-  - It doesn't mark the chunk unsaved, so the game writes it only when something else in the chunk changes. `WorldIndex` records it on chunk unload (and every 10 s near players) and keeps what the save lacks in `<world>/claudechat-visits.txt`.
+  - It doesn't mark the chunk unsaved, so the game writes it only when something else in the chunk changes. `WorldIndex` records it on chunk unload (and every 10 s near players) and keeps what the save lacks in `<world>/claudechat-visits.txt` (lines start with the full dimension id). A recorded time counts only while the save shows the chunk fully generated (or it's live), and is pruned once the chunk is gone.
   - "Visited" is ≥ 1 s.
-- **Section palettes:** in 26.x a palette entry is a bare string (`"minecraft:spawner"`) when the block is in its default state, otherwise `{id, properties}`, no longer `{Name, Properties}`. Use `WorldIndex.paletteName`.
+- **Section palettes:** in 26.x a palette entry is a bare string (`"minecraft:spawner"`) when the block is in its default state, otherwise `{id, properties}`, no longer `{Name, Properties}`. `SavedChunk` handles both.
 - **26.x paths:** player data is in `players/data`, and dimensions are under `dimensions/<ns>/<path>/{region,entities}`. Use `DimensionType.getStorageFolder`.
 
 **Game commands**
