@@ -4,7 +4,6 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import org.junit.jupiter.api.BeforeAll;
-import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -158,7 +157,6 @@ class RegionFilesTest {
 	 * compression id with its high bit set. readChunk refuses every record of length 1 before it looks at that bit.
 	 */
 	@Test
-	@Disabled("RegionFiles.readChunk rejects the length-1 stub of an oversized chunk, so its .mcc branch is unreachable")
 	void oversizedChunkIsReadFromItsExternalFile() throws IOException {
 		byte[] stub = ByteBuffer.allocate(5).putInt(1).put((byte) (RegionFileVersion.VERSION_DEFLATE.getId() | 0x80)).array();
 		writeRegion(dir.resolve("r.0.0.mca"), 0, stub, 1, true);

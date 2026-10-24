@@ -96,10 +96,6 @@ final class RegionFiles {
 		readFully(channel, prefix, offset);
 		int length = prefix.getInt(0);
 		byte type = prefix.get(4);
-		if (length <= 1 || length > (location & 0xFF) * SECTOR) {
-			return Optional.empty();
-		}
-
 		RegionFileVersion version = RegionFileVersion.fromId(type & 0x7F);
 		if (version == null) {
 			return Optional.empty();
@@ -107,9 +103,17 @@ final class RegionFiles {
 
 		InputStream raw;
 		if ((type & 0x80) != 0) {
-			// Oversized chunk stored next to the region file as c.<x>.<z>.mcc
-			raw = Files.newInputStream(region.file().resolveSibling("c." + chunkX + "." + chunkZ + ".mcc"));
+			// An oversized chunk lives next to the region file as c.<x>.<z>.mcc, leaving only its compression byte
+			// here (length 1), so this has to be decided before the inline length check below.
+			Path external = region.file().resolveSibling("c." + chunkX + "." + chunkZ + ".mcc");
+			if (!Files.isRegularFile(external)) {
+				return Optional.empty();
+			}
+			raw = Files.newInputStream(external);
 		} else {
+			if (length <= 1 || length > (location & 0xFF) * SECTOR) {
+				return Optional.empty();
+			}
 			ByteBuffer data = ByteBuffer.allocate(4 + length);
 			readFully(channel, data, offset);
 			raw = new ByteArrayInputStream(data.array(), 5, length - 1);
