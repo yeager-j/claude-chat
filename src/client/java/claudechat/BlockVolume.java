@@ -41,6 +41,9 @@ public final class BlockVolume {
 	/** Positions a volume may hold: 128 MB of cells. Bigger boxes are refused rather than risk running out of memory. */
 	public static final long MAX_POSITIONS = 1L << 26;
 
+	/** Different block states a volume may hold: as many as its cells can index. Also the limit on a file's palette. */
+	public static final int MAX_STATES = Short.MAX_VALUE;
+
 	private static final short ABSENT = -1;
 
 	private final Vec3i size;
@@ -118,6 +121,31 @@ public final class BlockVolume {
 		return list;
 	}
 
+	/**
+	 * The number of positions in a box of {@code size}, checked before a reader spends work on a file of that size.
+	 *
+	 * @throws IOException if a side is negative
+	 * @throws TooLargeException if the box has more than {@link #MAX_POSITIONS} positions
+	 */
+	public static long requireFits(Vec3i size) throws IOException {
+		if (size.getX() < 0 || size.getY() < 0 || size.getZ() < 0) {
+			throw new IOException("Negative size " + size.toShortString());
+		}
+
+		long positions = positions(size);
+		TooLargeException.requireAtMost(positions, MAX_POSITIONS, "positions");
+		return positions;
+	}
+
+	/** Positions in a box with non-negative sides. Three int sides can overflow a long, so this saturates at Long.MAX_VALUE. */
+	private static long positions(Vec3i size) {
+		try {
+			return Math.multiplyExact((long) size.getX() * size.getY(), size.getZ());
+		} catch (ArithmeticException overflow) {
+			return Long.MAX_VALUE;
+		}
+	}
+
 	private static boolean inside(Vec3i size, int x, int y, int z) {
 		return x >= 0 && y >= 0 && z >= 0 && x < size.getX() && y < size.getY() && z < size.getZ();
 	}
@@ -138,19 +166,10 @@ public final class BlockVolume {
 		private final Map<BlockPos, CompoundTag> blockEntities = new LinkedHashMap<>();
 		private final List<Entity> entities = new ArrayList<>();
 
-		/** @throws IOException if a side is negative or the box has more than {@link #MAX_POSITIONS} positions */
+		/** @throws IOException if the size doesn't fit (see {@link #requireFits}) */
 		public Builder(Vec3i size) throws IOException {
-			if (size.getX() < 0 || size.getY() < 0 || size.getZ() < 0) {
-				throw new IOException("Negative size " + size.toShortString());
-			}
-
-			long positions = (long) size.getX() * size.getY() * size.getZ();
-			if (positions > MAX_POSITIONS) {
-				throw new IOException("Too large to read: " + positions + " positions (at most " + MAX_POSITIONS + ")");
-			}
-
 			this.size = size;
-			this.cells = new short[(int) positions];
+			this.cells = new short[(int) requireFits(size)];
 			Arrays.fill(cells, ABSENT);
 		}
 
@@ -186,9 +205,7 @@ public final class BlockVolume {
 				return known;
 			}
 
-			if (palette.size() == Short.MAX_VALUE) {
-				throw new IOException("More than " + Short.MAX_VALUE + " different block states");
-			}
+			TooLargeException.requireAtMost(palette.size() + 1L, MAX_STATES, "different block states");
 
 			short added = (short) palette.size();
 			palette.add(state);

@@ -13,8 +13,6 @@ import java.io.IOException;
 import java.io.Reader;
 import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.FileSystem;
-import java.nio.file.FileSystems;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -684,15 +682,14 @@ public class KnowledgeBase {
 		});
 	}
 
+	/** A pack can be anyone's download, so its copy is bounded and doesn't follow links (see {@link DataPackCopy}). */
 	private static void copyPackData(Path location, Path target) throws IOException {
 		if (Files.isDirectory(location)) {
-			KnowledgeFiles.copyTree(location.resolve(PACK_DATA), target, file -> true);
+			DataPackCopy.fromFolder(location.resolve(PACK_DATA), target, DataPackCopy.Limits.DEFAULT);
 			return;
 		}
 
-		try (FileSystem zip = FileSystems.newFileSystem(location)) {
-			KnowledgeFiles.copyTree(zip.getPath("/" + PACK_DATA), target, file -> true);
-		}
+		DataPackCopy.fromZip(location, PACK_DATA, target, DataPackCopy.Limits.DEFAULT);
 	}
 
 	/**
