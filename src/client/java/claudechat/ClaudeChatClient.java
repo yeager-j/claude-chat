@@ -159,7 +159,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 						return 1;
 					})))
 			.then(ClientCommands.literal("preview").executes(ctx -> {
-				showAnswer(formatter.format(PREVIEW), PREVIEW);
+				showAnswer(formatter.format(PREVIEW));
 				return 1;
 			}))
 			.then(ClientCommands.literal("reset").executes(ctx -> {
@@ -316,7 +316,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 
 		cli.ask(question, gameContext, mentionText, onProgress).whenComplete((answer, error) -> {
 			// Format off the render thread: recipes are read from disk.
-			List<Component> lines = null;
+			ChatFormatter.Answer lines = null;
 			Throwable failure = error;
 			if (failure == null) {
 				try {
@@ -325,7 +325,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 					failure = e;
 				}
 			}
-			List<Component> finalLines = lines;
+			ChatFormatter.Answer finalLines = lines;
 			Throwable finalFailure = failure;
 			mc.execute(() -> {
 				busy.set(false);
@@ -335,16 +335,17 @@ public class ClaudeChatClient implements ClientModInitializer {
 					LOGGER.warn("Claude request failed", cause);
 					send(prefix().append(Component.literal(String.valueOf(cause.getMessage())).withStyle(ChatFormatting.RED)));
 				} else {
-					showAnswer(finalLines, answer);
+					showAnswer(finalLines);
 				}
 			});
 		});
 	}
 
-	private static void showAnswer(List<Component> lines, String raw) {
+	private static void showAnswer(ChatFormatter.Answer answer) {
+		List<Component> lines = answer.lines();
 		String plain = String.join("\n", lines.stream().map(Component::getString).toList());
 		// A recipe grid needs every row to start at the same x, so it can't share a line with the [Claude] prefix.
-		boolean prefixOwnLine = ChatFormatter.startsWithRecipe(raw);
+		boolean prefixOwnLine = answer.startsWithGrid();
 		if (prefixOwnLine) {
 			send(prefix());
 		}

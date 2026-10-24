@@ -40,8 +40,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `ClaudeCli` | Runs `claude -p`: system prompt, stream-json parsing, progress notes, MCP config |
 | `ClaudeConfig` | `config/claudechat.properties`; `configVersion` drives migrations |
 | `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand) with Vineflower in a separate JVM; extracts data and lang files; world data packs; the prompt's file map |
-| `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
-| `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while Xaero's Minimap is loaded) |
+| `ChatMarkup`, `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset parsed into lines (pure, unit-tested) → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON, with tags from the game's merged tag registry |
+| `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while a known-good version of Xaero's Minimap is loaded: `KNOWN_GOOD_VERSIONS`) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
 | `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players, per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes |
 | `StructureFinder` | Multi-result `/locate` with visited filtering; builds a structure's pieces in memory (`Structure.generate`) to name them (template id, or class for hand-coded pieces, via `mixin/*Accessor`) and sample the biomes they occupy |
