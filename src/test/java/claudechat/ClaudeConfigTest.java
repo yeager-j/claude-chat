@@ -55,6 +55,19 @@ class ClaudeConfigTest {
 		assertEquals("opus", saved.getProperty("modle"));
 	}
 
+	/** Before version 3 the web tools were on in every tier; upgrading turns them off until the player says otherwise. */
+	@Test
+	void webIsOffUnlessTheFileTurnsItOn() {
+		ClaudeConfig upgraded = ClaudeConfig.fromProperties(file("configVersion", "2", "permissions", "ask"));
+
+		assertFalse(ClaudeConfig.fromProperties(new Properties()).web);
+		assertFalse(upgraded.web);
+		assertTrue(upgraded.fileOutdated());
+		assertEquals("false", upgraded.toProperties().getProperty("web"));
+		assertEquals("3", upgraded.toProperties().getProperty("configVersion"));
+		assertTrue(ClaudeConfig.fromProperties(file("web", "true")).web);
+	}
+
 	@Test
 	void effortIgnoresCase() {
 		ClaudeConfig config = ClaudeConfig.fromProperties(file("effort", "High"));
@@ -122,6 +135,7 @@ class ClaudeConfigTest {
 		config.effort = ClaudeConfig.Effort.MAX;
 		config.timeoutSeconds = 60;
 		config.permissions = PermissionTier.ASK;
+		config.web = true;
 		config.knowledgeExclude.add("jei");
 
 		ClaudeConfig reread = ClaudeConfig.fromProperties(config.toProperties());
@@ -131,6 +145,7 @@ class ClaudeConfigTest {
 		assertEquals(ClaudeConfig.Effort.MAX, reread.effort);
 		assertEquals(60, reread.timeoutSeconds);
 		assertEquals(PermissionTier.ASK, reread.permissions);
+		assertTrue(reread.web);
 		assertEquals(Set.of("jei"), reread.knowledgeExclude);
 		assertFalse(reread.fileOutdated());
 	}
