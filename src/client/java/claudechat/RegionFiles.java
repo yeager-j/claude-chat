@@ -13,7 +13,6 @@ import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
-import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -75,7 +74,7 @@ final class RegionFiles {
 			return List.of();
 		}
 		try (Stream<Path> files = Files.list(dir)) {
-			return files.map(RegionFiles::region).flatMap(Optional::stream).filter(region -> isPlainFile(region.file())).toList();
+			return files.map(RegionFiles::region).flatMap(Optional::stream).filter(region -> KnowledgeFiles.isPlainFile(region.file())).toList();
 		} catch (UncheckedIOException e) {
 			// The stream reports a failure while iterating the folder unchecked; callers handle it like one opening it.
 			throw e.getCause();
@@ -96,26 +95,11 @@ final class RegionFiles {
 		if (!KnowledgeFiles.isPlainDirectory(dir)) {
 			return false;
 		}
-		try {
-			Path root = worldRoot.toAbsolutePath().normalize();
-			Path relative = root.relativize(dir.toAbsolutePath().normalize());
-			boolean unlinked = dir.toRealPath().equals(root.toRealPath().resolve(relative));
-			if (!unlinked) {
-				ClaudeChatClient.LOGGER.info("Not reading {}: a link leads it elsewhere", dir);
-			}
-			return unlinked;
-		} catch (IOException | IllegalArgumentException e) {
-			return false;
+		boolean unlinked = KnowledgeFiles.isUnlinkedInside(worldRoot, dir);
+		if (!unlinked) {
+			ClaudeChatClient.LOGGER.info("Not reading {}: a link leads it elsewhere", dir);
 		}
-	}
-
-	/** A regular file, not a link; false when it can't be checked. */
-	private static boolean isPlainFile(Path file) {
-		try {
-			return Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).isRegularFile();
-		} catch (IOException e) {
-			return false;
-		}
+		return unlinked;
 	}
 
 	/**
@@ -188,7 +172,7 @@ final class RegionFiles {
 			// An oversized chunk lives next to the region file as c.<x>.<z>.mcc, leaving only its compression byte
 			// here (length 1), so this has to be decided before the inline length check below.
 			Path external = region.file().resolveSibling("c." + chunkX + "." + chunkZ + ".mcc");
-			if (!isPlainFile(external)) {
+			if (!KnowledgeFiles.isPlainFile(external)) {
 				return Optional.empty();
 			}
 			TooLargeException.requireAtMost(Files.size(external), CHUNK_BYTES, "bytes in its external chunk file");
@@ -212,7 +196,7 @@ final class RegionFiles {
 	 */
 	static Optional<CompoundTag> readChunk(Path worldRoot, Path dir, int chunkX, int chunkZ, NbtBudget budget) throws IOException {
 		Region region = new Region(dir.resolve("r." + (chunkX >> 5) + "." + (chunkZ >> 5) + ".mca"), chunkX >> 5, chunkZ >> 5);
-		if (!isUnlinkedFolder(worldRoot, dir) || !isPlainFile(region.file())) {
+		if (!isUnlinkedFolder(worldRoot, dir) || !KnowledgeFiles.isPlainFile(region.file())) {
 			return Optional.empty();
 		}
 		try (FileChannel channel = open(region)) {

@@ -31,6 +31,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 /**
@@ -453,6 +454,28 @@ final class Game {
 			}
 			throw e;
 		}
+	}
+
+	/**
+	 * A Windows directory junction at {@code link} to the folder {@code target}, or empty elsewhere: a link that a
+	 * downloaded world can hold and that Java and the game don't report as one. Delete it (Files.delete removes only the
+	 * junction) before the world is deleted, since deleting a world walks into junctions.
+	 */
+	static Optional<Path> junction(Path link, Path target) throws IOException {
+		if (!System.getProperty("os.name", "").startsWith("Windows")) {
+			LOGGER.info("Not checking links through {}: junctions exist only on Windows", link);
+			return Optional.empty();
+		}
+
+		Process mklink = new ProcessBuilder("cmd", "/c", "mklink", "/J", link.toString(), target.toString()).redirectErrorStream(true).start();
+		String output = new String(mklink.getInputStream().readAllBytes());
+		try {
+			check(mklink.waitFor(30, TimeUnit.SECONDS) && mklink.exitValue() == 0, "mklink /J failed: " + output);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IOException("interrupted while making a junction", e);
+		}
+		return Optional.of(link);
 	}
 
 	static void check(boolean condition, String message) {

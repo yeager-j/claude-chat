@@ -37,6 +37,7 @@ import net.minecraft.world.level.storage.LevelResource;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.Duration;
@@ -741,6 +742,9 @@ public final class StructureTemplates {
 
 		private final StructureTemplateManager manager;
 		private final ResourceManager resources;
+		/** The world's folder: its saved templates and folder packs must really be inside it. */
+		private final Path worldRoot;
+		private final Path datapacks;
 		private final TemplatePathFactory worldPaths;
 		/** Lists the world's templates; they are read through {@link #worldPaths}. */
 		private final TemplateSource world;
@@ -750,6 +754,8 @@ public final class StructureTemplates {
 			DataFixer fixer = server.getFixerUpper();
 			HolderGetter<Block> blocks = server.registryAccess().lookupOrThrow(Registries.BLOCK);
 			Path generated = server.getWorldPath(LevelResource.GENERATED_DIR).normalize();
+			this.worldRoot = server.getWorldPath(LevelResource.ROOT).normalize();
+			this.datapacks = server.getWorldPath(LevelResource.DATAPACK_DIR).normalize();
 			this.manager = server.getStructureTemplateManager();
 			this.resources = server.getResourceManager();
 			this.worldPaths = new TemplatePathFactory(generated);
@@ -766,7 +772,11 @@ public final class StructureTemplates {
 		 */
 		Optional<Loaded> load(Identifier id, ReadLimits limits) throws TooLargeException {
 			Optional<Path> worldFile = worldFile(id);
-			if (worldFile.isPresent()) {
+			// The game checks only these files' names and follows links, so a link in the world could lead to any NBT file.
+			boolean linkedWorldFile = worldFile.isPresent() && !KnowledgeFiles.isUnlinkedInside(worldRoot, worldFile.get());
+			if (linkedWorldFile) {
+				ClaudeChatClient.LOGGER.info("Not reading saved structure {}: a link leads {} out of the world folder", id, worldFile.get());
+			} else if (worldFile.isPresent() && KnowledgeFiles.isPlainFile(worldFile.get())) {
 				Optional<CompoundTag> structure = readOrSkip(id, () -> limits.nbt().read(worldFile.get()), limits.maxPositions());
 				if (structure.isPresent()) {
 					return Optional.of(new Loaded(structure.get(), new SavedInWorld()));
@@ -780,8 +790,13 @@ public final class StructureTemplates {
 				}
 			}
 
-			Optional<Resource> packFile = resources.getResource(TEMPLATE_FILES.idToFile(id));
-			if (packFile.isPresent()) {
+			Identifier fileId = TEMPLATE_FILES.idToFile(id);
+			Optional<Resource> packFile = resources.getResource(fileId);
+			boolean linkedPackFile = packFile.isPresent() && !isUnlinkedPackFile(packFile.get().sourcePackId(), fileId);
+			if (linkedPackFile) {
+				ClaudeChatClient.LOGGER.info("Not reading structure {} from {}: a link inside the pack leads out of the world folder", id,
+					packFile.get().sourcePackId());
+			} else if (packFile.isPresent()) {
 				Optional<CompoundTag> structure = readOrSkip(id, () -> {
 					try (InputStream in = packFile.get().open()) {
 						return limits.nbt().read(in);
@@ -790,6 +805,11 @@ public final class StructureTemplates {
 				if (structure.isPresent()) {
 					return Optional.of(new Loaded(structure.get(), new Pack(packFile.get().sourcePackId())));
 				}
+			}
+
+			// The manager reads the same world and pack files, following links.
+			if (linkedWorldFile || linkedPackFile) {
+				return Optional.empty();
 			}
 
 			// Mods can add sources to the manager (Fabric's game test API does); ask it for the few ids none of these has.
@@ -816,12 +836,34 @@ public final class StructureTemplates {
 			}
 		}
 
+		/** Where the world saves the template {@code id}, when something is there (a link too). */
 		private Optional<Path> worldFile(Identifier id) {
 			try {
-				return Optional.of(worldPaths.createAndValidatePathToStructure(id, TEMPLATE_FILES)).filter(Files::isRegularFile);
+				return Optional.of(worldPaths.createAndValidatePathToStructure(id, TEMPLATE_FILES))
+					.filter(file -> Files.exists(file, LinkOption.NOFOLLOW_LINKS));
 			} catch (RuntimeException invalidPath) {
 				return Optional.empty();
 			}
+		}
+
+		/**
+		 * Whether a pack's file is where its names say. Only a folder pack of the world's needs checking: the game opens
+		 * its files through any link inside it, while a zip's entries can't be links, and mods' and the game's own packs
+		 * aren't someone's download. A world pack that is itself a link fails too, folder or zip.
+		 */
+		private boolean isUnlinkedPackFile(String packId, Identifier file) {
+			if (!packId.startsWith(KnowledgeBase.WORLD_PACK_PREFIX)) {
+				return true;
+			}
+			Optional<Path> pack = KnowledgeFiles.resolveInside(datapacks, packId.substring(KnowledgeBase.WORLD_PACK_PREFIX.length()));
+			if (pack.isEmpty()) {
+				return false;
+			}
+			if (KnowledgeFiles.isPlainFile(pack.get())) {
+				// A zip: its entries can't be links, but the datapacks folder holding it can be.
+				return KnowledgeFiles.isUnlinkedInside(worldRoot, pack.get());
+			}
+			return KnowledgeFiles.isUnlinkedInside(worldRoot, pack.get().resolve(KnowledgeBase.PACK_DATA).resolve(file.getNamespace()).resolve(file.getPath()));
 		}
 
 		/** Modification times of the templates saved in the world. */
@@ -829,7 +871,8 @@ public final class StructureTemplates {
 			Map<Identifier, FileTime> stamps = new HashMap<>();
 			world.list().forEach(id -> {
 				try {
-					stamps.put(id, Files.getLastModifiedTime(worldPaths.createAndValidatePathToStructure(id, TEMPLATE_FILES)));
+					// A file replaced by a link changes its time too, so it's read again (and refused).
+					stamps.put(id, Files.getLastModifiedTime(worldPaths.createAndValidatePathToStructure(id, TEMPLATE_FILES), LinkOption.NOFOLLOW_LINKS));
 				} catch (IOException | RuntimeException e) {
 					ClaudeChatClient.LOGGER.debug("Could not check saved structure {}", id, e);
 				}
