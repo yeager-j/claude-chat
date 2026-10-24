@@ -12,7 +12,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 
 ## Test
 
-`.\gradlew.bat test` runs the fast unit tests in `src/test/java` (JUnit 5, no game client). `fabric-loader-junit` loads Minecraft classes, but nothing is bootstrapped, so keep logic under test free of registries and client state.
+`.\gradlew.bat test` runs the fast unit tests in `src/test/java` (JUnit 5, no game client). `fabric-loader-junit` loads Minecraft classes, but nothing is bootstrapped and there is no client: a test that needs registries or the command tree calls `SharedConstants.tryDetectVersion()` and `Bootstrap.bootStrap()` itself (see `CommandRulesTest`).
 
 `.\gradlew.bat runClientGameTest` starts the real client, creates a world, types into chat, and saves screenshots to `build\run\clientGameTest\screenshots\`. Read them to check rendering. The test is `src/gametest/java/claudechat/test/ClaudeChatClientGameTest.java`; optional steps are switched on with environment variables:
 
@@ -53,7 +53,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `Schematics`, `Materials` | Schematic files (`.litematic`, `.schem`, `.nbt`) from Litematica's folder; material lists, recipe breakdown and container comparison |
 | `McpServer`, `ModTools`, `WorldTools` | MCP on 127.0.0.1 with a random port and bearer token, for the whole game session: `decompile_mod` and `approve` always, the eleven world tools and `run_command` only while a single-player world is open |
 | `ViewSnapshot` | `look`, in any world (multiplayer too): rays through the screen grid (refined on edges) plus an entity line-of-sight pass, reporting what's visible with image positions, and a screenshot of the same frame as MCP image content |
-| `GameCommands` | `run_command`: parses with the server's dispatcher, follows `execute … run`, and checks the words against its read-only list (runs in every tier) and destructive list (red warning). Player's own source, or GAMEMASTER level with cheats on |
+| `GameCommands`, `CommandRules` | `run_command`: parses with the server's dispatcher; `CommandRules` walks the parse's contexts (each `execute` modifier, `run`, alias) and allows a command unasked only if every modifier is a non-writing vanilla one and the final command is vanilla and on its read-only list. Runs as the host player's own source, or GAMEMASTER level with cheats on |
 | `Approvals`, `ChatActions` | Ask for approval: chat request with [Allow]/[Deny], the `approve` tool for `--permission-prompt-tool`. Buttons run `/claude action <random id>` so no chat message can carry a working copy |
 
 ## Conventions

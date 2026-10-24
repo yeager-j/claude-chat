@@ -3,12 +3,11 @@ package claudechat;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
+import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.ParseResults;
 import com.mojang.brigadier.context.CommandContextBuilder;
 import com.mojang.brigadier.context.ParsedArgument;
-import com.mojang.brigadier.context.ParsedCommandNode;
 import com.mojang.brigadier.exceptions.CommandSyntaxException;
-import com.mojang.brigadier.tree.LiteralCommandNode;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.commands.CommandSource;
@@ -27,44 +26,20 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
-import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
  * The run_command tool: Claude runs a game command as the player, in single-player only. Which commands need the
  * player's OK isn't left to Claude Code's permission system, which can't judge game commands (an auto mode test let
- * a 41×38×41 /fill to air through). Instead every command is parsed with the server's own dispatcher, following
- * {@code execute … run} and aliases to the command that really runs, and checked against {@link #READ_ONLY}: those
- * run in every tier; anything else, including every mod command, is refused in Read only and asked about in Ask for
- * approval. {@link #DESTRUCTIVE} only adds a warning to the request.
+ * a 41×38×41 /fill to air through). Instead every command is parsed with the server's own dispatcher and judged by
+ * {@link CommandRules}: read-only commands run in every tier; anything else, including every mod command, is refused
+ * in Read only and asked about in Ask for approval. A destructive or opaque command only adds a warning to the request.
  * <p>
  * Cheats off: the player's own command source, so Claude can run exactly what the player could type. Cheats on: the
  * same source raised to command block level (GAMEMASTER), so still "@s" and "~" are the player.
  */
 public class GameCommands {
 	public static final String TOOL = "run_command";
-
-	/**
-	 * Commands that change nothing. Words are literal parts of the command, "*" is any one part, and a trailing "$"
-	 * means nothing may follow (so "gamerule keep_inventory" reads, "gamerule keep_inventory true" doesn't).
-	 */
-	static final List<String> READ_ONLY = List.of(
-		"help", "list", "seed", "locate", "version", "time query", "time of * query", "data get", "tick query", "team list",
-		"bossbar list", "bossbar get", "forceload query", "datapack list", "worldborder get", "experience query", "xp query",
-		"scoreboard objectives list", "scoreboard players list", "scoreboard players get",
-		"attribute * * get", "attribute * * base get", "attribute * * modifier value get",
-		"difficulty$", "gamerule *$");
-
-	/** Commands that destroy or overwrite something the player can't easily get back: the request says so in red. */
-	static final List<String> DESTRUCTIVE = List.of(
-		"clear", "kill", "fill", "fillbiome", "clone", "setblock", "place", "item", "data modify", "data merge",
-		"data remove", "gamerule * *", "experience set", "xp set", "worldborder set", "worldborder add",
-		"worldborder center", "forceload", "damage", "spreadplayers", "effect clear", "attribute * * base set",
-		"attribute * * modifier remove", "loot replace", "scoreboard players reset", "scoreboard objectives remove",
-		"team remove", "datapack disable");
-
-	/** Data pack code whose effect can't be told from the command line. */
-	static final List<String> OPAQUE = List.of("function", "reload", "schedule");
 
 	private final ClaudeConfig config;
 	private final WorldIndex index;
@@ -102,7 +77,7 @@ public class GameCommands {
 	}
 
 	/** What a command would do, worked out on the server thread before running it. */
-	record Check(String error, List<String> tokens, boolean readOnly, String warning, boolean needsCheats) {
+	record Check(String error, boolean readOnly, String warning, boolean needsCheats) {
 	}
 
 	public JsonElement call(JsonObject args) throws Exception {
@@ -141,7 +116,7 @@ public class GameCommands {
 
 	/** Parses with the permissions Claude will run with; works out whether the command reads only. Server thread. */
 	Check check(MinecraftServer server, String command) {
-		ServerPlayer player = player(server);
+		ServerPlayer player = host(server);
 		CommandSourceStack own = player.createCommandSourceStack();
 		CommandSourceStack source = source(player);
 		ParseResults<CommandSourceStack> parse = server.getCommands().getDispatcher().parse(command, source);
@@ -156,15 +131,16 @@ public class GameCommands {
 						+ " setting is off. Tell the player instead; they can allow it with /claude cheats on.";
 				}
 			}
-			return new Check(problem.getMessage() + hint, List.of(), false, null, false);
+			return new Check(problem.getMessage() + hint, false, null, false);
 		}
-		List<String> tokens = tokens(parse.getContext());
+		List<CommandRules.Segment> segments = CommandRules.segments(parse.getContext());
 		boolean needsCheats = config.cheats && Commands.getParseException(server.getCommands().getDispatcher().parse(command, own)) != null;
-		return new Check(null, tokens, readOnly(tokens), warning(tokens, parse.getContext(), source), needsCheats);
+		String warning = warning(CommandRules.risk(segments), parse.getContext(), source);
+		return new Check(null, CommandRules.readOnly(segments), warning, needsCheats);
 	}
 
 	private JsonElement run(MinecraftServer server, String command, Check check) {
-		ServerPlayer player = player(server);
+		ServerPlayer player = host(server);
 		List<String> output = Collections.synchronizedList(new ArrayList<>());
 		boolean[] success = {false};
 		int[] result = {0};
@@ -251,69 +227,28 @@ public class GameCommands {
 		return server;
 	}
 
-	/** The local player: in single-player the only one, unless the world is open to LAN. */
-	private static ServerPlayer player(MinecraftServer server) {
-		Minecraft mc = Minecraft.getInstance();
-		UUID id = mc.player != null ? mc.player.getUUID() : null;
-		for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-			if (id == null || p.getUUID().equals(id)) {
-				return p;
-			}
-		}
-		throw new IllegalStateException("The player isn't in the world.");
-	}
-
-	// --- classification -------------------------------------------------------------------------------------------
-
 	/**
-	 * The parsed command as words: literals by name, arguments as "&lt;name&gt;". Follows redirects, so for
-	 * "execute as @a run kill @s" this is [execute, as, &lt;targets&gt;, run, kill, &lt;targets&gt;].
+	 * The player whose world this is, as the integrated server records it. Never anyone else: with the world open to
+	 * LAN, a guest could be first in the player list. Server thread.
 	 */
-	static List<String> tokens(CommandContextBuilder<CommandSourceStack> context) {
-		List<String> tokens = new ArrayList<>();
-		for (CommandContextBuilder<CommandSourceStack> c = context; c != null; c = c.getChild()) {
-			for (ParsedCommandNode<CommandSourceStack> node : c.getNodes()) {
-				tokens.add(node.getNode() instanceof LiteralCommandNode<?> literal
-					? literal.getLiteral().toLowerCase(Locale.ROOT)
-					: "<" + node.getNode().getName() + ">");
+	private static ServerPlayer host(MinecraftServer server) {
+		GameProfile host = server.getSingleplayerProfile();
+		ServerPlayer player = host == null ? null : server.getPlayerList().getPlayer(host.id());
+		if (player == null) {
+			throw new IllegalStateException("The player who owns this world isn't in it, so game commands can't run.");
+		}
+		return player;
+	}
+
+	private static String warning(CommandRules.Risk risk, CommandContextBuilder<CommandSourceStack> context, CommandSourceStack source) {
+		return switch (risk) {
+			case NONE -> null;
+			case OPAQUE -> "Runs data pack code: what it does can't be checked in advance.";
+			case DESTRUCTIVE -> {
+				long blocks = volume(context, source);
+				yield blocks > 0 ? String.format(Locale.ROOT, "Changes up to %,d blocks. This can't be undone.", blocks) : "This can't be undone.";
 			}
-		}
-		return tokens;
-	}
-
-	/** The command that actually runs: what follows the last "run" of an execute, or the whole command. */
-	static List<String> effective(List<String> tokens) {
-		if (!tokens.isEmpty() && tokens.getFirst().equals("execute")) {
-			int run = tokens.lastIndexOf("run");
-			if (run >= 0) {
-				return tokens.subList(run + 1, tokens.size());
-			}
-		}
-		return tokens;
-	}
-
-	static boolean readOnly(List<String> tokens) {
-		List<String> command = effective(tokens);
-		if (command.isEmpty()) {
-			return false;
-		}
-		// An execute without "run" only tests conditions, unless it stores the result or summons something.
-		if (command.getFirst().equals("execute")) {
-			return !command.contains("store") && !command.contains("summon");
-		}
-		return READ_ONLY.stream().anyMatch(pattern -> matches(pattern, command));
-	}
-
-	private static String warning(List<String> tokens, CommandContextBuilder<CommandSourceStack> context, CommandSourceStack source) {
-		List<String> command = effective(tokens);
-		if (OPAQUE.stream().anyMatch(pattern -> matches(pattern, command))) {
-			return "Runs data pack code: what it does can't be checked in advance.";
-		}
-		if (DESTRUCTIVE.stream().noneMatch(pattern -> matches(pattern, command))) {
-			return null;
-		}
-		long blocks = volume(context, source);
-		return blocks > 0 ? String.format(Locale.ROOT, "Changes up to %,d blocks. This can't be undone.", blocks) : "This can't be undone.";
+		};
 	}
 
 	/** Blocks in a fill, fillbiome or clone area; 0 for other commands. */
@@ -335,20 +270,5 @@ public class GameCommands {
 	private static BlockPos position(CommandContextBuilder<CommandSourceStack> context, String name, CommandSourceStack source) {
 		ParsedArgument<CommandSourceStack, ?> argument = context.getArguments().get(name);
 		return argument != null && argument.getResult() instanceof Coordinates coordinates ? coordinates.getBlockPos(source) : null;
-	}
-
-	/** "data get" matches [data, get, entity, ...]; "gamerule *$" matches exactly two words; "*" is any word. */
-	static boolean matches(String pattern, List<String> command) {
-		boolean exact = pattern.endsWith("$");
-		String[] words = (exact ? pattern.substring(0, pattern.length() - 1) : pattern).split(" ");
-		if (command.size() < words.length || (exact && command.size() != words.length)) {
-			return false;
-		}
-		for (int i = 0; i < words.length; i++) {
-			if (!words[i].equals("*") && !words[i].equals(command.get(i))) {
-				return false;
-			}
-		}
-		return true;
 	}
 }

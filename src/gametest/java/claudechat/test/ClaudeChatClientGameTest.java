@@ -491,6 +491,14 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				JsonObject r = runCommand(context, command);
 				check(r.has("error") && r.get("error").getAsString().contains("Read only"), "changing command not refused: " + command + " -> " + r);
 			}
+			// Execute modifiers that write, ahead of a "run" whose command only reads.
+			List<String> writingModifiers = List.of("execute summon minecraft:pig run seed",
+				"execute store result entity @s Air short 1 run data get entity @s Air",
+				"execute store result score @s x run time query time", "execute if function ns:x", "execute if function ns:x run seed");
+			for (String command : writingModifiers) {
+				JsonObject r = runCommand(context, command);
+				check(r.has("error") && r.get("error").getAsString().contains("Read only"), "writing execute not refused: " + command + " -> " + r);
+			}
 
 			// Cheats off: the player's own permissions, which in this world can't run cheat commands at all.
 			config.cheats = false;
@@ -508,6 +516,10 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			config.permissions = ClaudeConfig.Permissions.ASK;
 			Component before = Approvals.lastAllow;
 			check(!runCommand(context, "time query time").has("error") && Approvals.lastAllow == before, "a read-only command asked");
+			for (String command : writingModifiers) {
+				JsonObject r = withApproval(context, command, false, null);
+				check(r.has("error") && r.get("error").getAsString().contains("denied"), "writing execute didn't ask: " + command + " -> " + r);
+			}
 			var below = server.computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition().below());
 			JsonObject denied = withApproval(context, "setblock ~ ~-1 ~ minecraft:gold_block", false, "claudechat-approval-setblock");
 			check(denied.has("error") && denied.get("error").getAsString().contains("denied"), "denied setblock ran: " + denied);
@@ -578,14 +590,16 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		return r;
 	}
 
-	/** Waits for a new approval request, screenshots it and clicks. */
+	/** Waits for a new approval request, screenshots it (unless {@code screenshot} is null) and clicks. */
 	private static void answer(ClientGameTestContext context, boolean allow, String screenshot) {
 		Component before = Approvals.lastAllow;
 		context.waitFor(mc -> Approvals.lastAllow != before, 10 * SECONDS);
 		context.waitTicks(5);
-		openChat(context);
-		context.takeScreenshot(screenshot);
-		context.getInput().pressKey(KEY_ESCAPE);
+		if (screenshot != null) {
+			openChat(context);
+			context.takeScreenshot(screenshot);
+			context.getInput().pressKey(KEY_ESCAPE);
+		}
 		click(context, allow ? Approvals.lastAllow : Approvals.lastDeny);
 	}
 
