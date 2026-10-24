@@ -124,8 +124,15 @@ class DecompilerTest {
 		return descendants().stream().filter(process -> !before.contains(process)).toList();
 	}
 
+	/**
+	 * The stand-in decompilers below this JVM: only processes running its java, since on Windows each console child
+	 * gets a conhost.exe of its own.
+	 */
 	private static Set<ProcessHandle> descendants() {
-		return ProcessHandle.current().descendants().filter(ProcessHandle::isAlive).collect(Collectors.toSet());
+		String java = java();
+		return ProcessHandle.current().descendants()
+			.filter(process -> process.isAlive() && process.info().command().filter(java::equals).isPresent())
+			.collect(Collectors.toSet());
 	}
 
 	private static void killNew(Set<ProcessHandle> before) {
