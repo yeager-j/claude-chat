@@ -26,6 +26,22 @@ final class StructureNbt {
 	/** The data version assumed when a file records none: the oldest the fixers know, and what the game assumes for structure files. */
 	static final int UNKNOWN_VERSION = 500;
 
+	/**
+	 * Palettes (block variants) a structure file may have. Vanilla's most is 8 (shipwrecks), and summarizing a template
+	 * builds one volume per palette.
+	 */
+	static final int MAX_PALETTES = 64;
+
+	/**
+	 * Block entities a file may carry; each one goes through the data fixers, which are slow for old files. The most
+	 * among 7,218 structure templates in a heavily modded game is 3,107; a schematic of a large storage build may have
+	 * tens of thousands.
+	 */
+	static final int MAX_BLOCK_ENTITIES = 1 << 18;
+
+	/** Entities a file may carry, for the same reason. The most among those templates is 226. */
+	static final int MAX_ENTITIES = 1 << 16;
+
 	/** A block entry: its position, palette index and block entity data (null if it has none). */
 	record Entry(BlockPos pos, int state, CompoundTag nbt) {
 	}
@@ -60,9 +76,30 @@ final class StructureNbt {
 	private StructureNbt() {
 	}
 
-	/** Brings a structure-format tag from {@code dataVersion} up to the running version. Doesn't modify {@code structure}. */
-	static CompoundTag upgrade(CompoundTag structure, int dataVersion) {
+	/**
+	 * Brings a structure-format tag from {@code dataVersion} up to the running version. Doesn't modify {@code structure}.
+	 *
+	 * @throws TooLargeException if the tag is over the limits on palettes, palette entries, block entities or entities,
+	 *     checked first so the fixers never see it
+	 */
+	static CompoundTag upgrade(CompoundTag structure, int dataVersion) throws TooLargeException {
+		requireWithinLimits(structure);
 		return DataFixTypes.STRUCTURE.updateToCurrentVersion(DataFixers.getDataFixer(), structure.copy(), dataVersion);
+	}
+
+	private static void requireWithinLimits(CompoundTag structure) throws TooLargeException {
+		List<ListTag> palettes = structure.getList("palettes")
+			.map(list -> list.stream().map(palette -> palette instanceof ListTag states ? states : new ListTag()).toList())
+			.orElseGet(() -> List.of(structure.getListOrEmpty("palette")));
+		TooLargeException.requireAtMost(palettes.size(), MAX_PALETTES, "palettes");
+
+		for (ListTag palette : palettes) {
+			TooLargeException.requireAtMost(palette.size(), BlockVolume.MAX_STATES, "block states in a palette");
+		}
+
+		long blockEntities = structure.getListOrEmpty("blocks").compoundStream().filter(block -> block.contains("nbt")).count();
+		TooLargeException.requireAtMost(blockEntities, MAX_BLOCK_ENTITIES, "block entities");
+		TooLargeException.requireAtMost(structure.getListOrEmpty("entities").size(), MAX_ENTITIES, "entities");
 	}
 
 	/** The data version a structure file records, or {@link #UNKNOWN_VERSION}. */
@@ -112,7 +149,7 @@ final class StructureNbt {
 	 * form), block entities ({@link #blockEntityEntry}) and entities ({@link #entityEntry}). The result has one palette;
 	 * its blocks are the block entity entries.
 	 */
-	static Contents upgradeParts(ListTag palette, ListTag blockEntities, ListTag entities, int dataVersion) {
+	static Contents upgradeParts(ListTag palette, ListTag blockEntities, ListTag entities, int dataVersion) throws TooLargeException {
 		CompoundTag structure = new CompoundTag();
 		structure.put("palette", palette);
 		structure.put("blocks", blockEntities);

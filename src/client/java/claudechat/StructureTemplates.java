@@ -13,6 +13,7 @@ import net.minecraft.resources.FileToIdConverter;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.resources.IoSupplier;
 import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.server.packs.resources.ResourceManager;
 import net.minecraft.world.level.block.Block;
@@ -27,12 +28,12 @@ import net.minecraft.world.level.levelgen.structure.structures.JigsawStructure;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager;
 import net.minecraft.world.level.levelgen.structure.templatesystem.loader.DirectoryTemplateSource;
-import net.minecraft.world.level.levelgen.structure.templatesystem.loader.ResourceManagerTemplateSource;
 import net.minecraft.world.level.levelgen.structure.templatesystem.loader.TemplatePathFactory;
 import net.minecraft.world.level.levelgen.structure.templatesystem.loader.TemplateSource;
 import net.minecraft.world.level.storage.LevelResource;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
@@ -62,7 +63,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Structure templates: the .nbt files that jigsaw structures (villages, ancient cities, most modded structures) and
  * code-placed ones (igloos, shipwrecks) are built from. They are gzipped NBT, so Claude can't read them as files.
- * One template is read from the game's {@link StructureTemplateManager}, so it is exactly what the game places.
+ * A template is read from the game's own sources in the game's order, so it is what the game places; files are read
+ * within the limits on imported files ({@link NbtBudget}), since a pack can be anyone's.
  * <p>
  * For searching by block, every template is summarized once per resource reload, and templates saved with a
  * structure block are summarized again when their file changes. Which structures can place a template is traced
@@ -183,17 +185,22 @@ public final class StructureTemplates {
 	}
 
 	/**
-	 * A template by id, from the game's template manager (and cached there, as when the game places it), or empty if
-	 * no source has it.
+	 * A template by id, from the first of the game's sources that has it (see {@link Sources}), or empty if none has it.
+	 *
+	 * @throws TooLargeException if the template is over {@link NbtBudget#FILE} or another limit on imported files
 	 */
 	public static Optional<Template> load(MinecraftServer server, Identifier id) throws IOException {
-		Optional<StructureTemplate> template = server.getStructureTemplateManager().get(id);
-		if (template.isEmpty()) {
-			return Optional.empty();
-		}
+		try {
+			Optional<Sources.Loaded> loaded = new Sources(server).load(id, NbtBudget.FILE);
+			if (loaded.isEmpty()) {
+				return Optional.empty();
+			}
 
-		StructureNbt.Contents contents = StructureNbt.read(template.get().save(new CompoundTag()));
-		return Optional.of(new Template(id, new Sources(server).origin(id), contents.palettes().size(), contents.volume(0)));
+			StructureNbt.Contents contents = StructureNbt.read(loaded.get().structure());
+			return Optional.of(new Template(id, loaded.get().origin(), contents.palettes().size(), contents.volume(0)));
+		} catch (TooLargeException e) {
+			throw new TooLargeException("Structure template " + id + " is too large to read: " + e.getMessage());
+		}
 	}
 
 	/** "minecraft:stone_bricks". */
@@ -373,17 +380,39 @@ public final class StructureTemplates {
 		}
 	}
 
-	/** Summarizes a template, or empty if no source can read it. */
-	private static Optional<Summary> summarize(Sources sources, Identifier id) {
-		Optional<Sources.Loaded> loaded = sources.load(id);
-		if (loaded.isEmpty()) {
-			return Optional.empty();
-		}
+	/** What reading one template for the index may use: its NBT, and the positions of its box (a summary builds a volume per palette). */
+	private record ReadLimits(NbtBudget nbt, long maxPositions) {
+	}
 
+	/**
+	 * Summarizes a template, or empty if no source has it or it can't be read (which is logged).
+	 *
+	 * @throws TooLargeException if it is over {@code limits}
+	 */
+	private static Optional<Summary> summarize(Sources sources, Identifier id, ReadLimits limits) throws TooLargeException {
 		try {
-			return Optional.of(summarize(id, loaded.get().origin(), StructureNbt.read(loaded.get().template().save(new CompoundTag()))));
+			Optional<Sources.Loaded> loaded = sources.load(id, limits.nbt());
+			if (loaded.isEmpty()) {
+				return Optional.empty();
+			}
+
+			StructureNbt.Contents contents = StructureNbt.read(loaded.get().structure());
+			TooLargeException.requireAtMost(BlockVolume.requireFits(contents.size()), limits.maxPositions(), "positions");
+			return Optional.of(summarize(id, loaded.get().origin(), contents));
+		} catch (TooLargeException | CancellationException e) {
+			throw e;
 		} catch (IOException | RuntimeException e) {
 			ClaudeChatClient.LOGGER.warn("Could not read structure template {}: {}", id, e.toString());
+			return Optional.empty();
+		}
+	}
+
+	/** {@link #summarize(Sources, Identifier, ReadLimits)}, where a template over the limits is logged as unreadable. */
+	private static Optional<Summary> summarizeOrSkip(Sources sources, Identifier id, ReadLimits limits) {
+		try {
+			return summarize(sources, id, limits);
+		} catch (TooLargeException e) {
+			ClaudeChatClient.LOGGER.warn("Structure template {} is too large to read: {}", id, e.getMessage());
 			return Optional.empty();
 		}
 	}
@@ -421,9 +450,19 @@ public final class StructureTemplates {
 	 * so a structure block save shows up in the next search.
 	 */
 	private static final class Build {
+		/**
+		 * Templates are read in parallel within these limits, so that the reads in flight together stay small: 32 MiB of
+		 * NBT and a 4M-position box (8 MB per volume) per thread. Nearly every template fits; the largest seen in a
+		 * heavily modded game needs 59 MB. Those that don't fit are read afterwards, one at a time, within {@link #fullLimits}.
+		 */
+		private static final long PARALLEL_BYTES = 32L << 20;
+		private static final long PARALLEL_POSITIONS = 1L << 22;
+
 		final ResourceManager resources;
 		final CompletableFuture<Index> future;
 		private final AtomicBoolean cancelled = new AtomicBoolean();
+		private final ReadLimits parallelLimits = new ReadLimits(new NbtBudget(PARALLEL_BYTES, cancelled::get), PARALLEL_POSITIONS);
+		private final ReadLimits fullLimits = new ReadLimits(new NbtBudget(NbtBudget.FILE_BYTES, cancelled::get), BlockVolume.MAX_POSITIONS);
 		private final Sources sources;
 		private Map<Identifier, FileTime> worldFiles;
 		private Index latest;
@@ -443,7 +482,10 @@ public final class StructureTemplates {
 			}, POOL);
 		}
 
-		/** Stops the build at the next template; it holds the server until then. */
+		/**
+		 * Stops the build: before the next template, or within a template's read, which checks as it goes. Data fixing a
+		 * template that has been read can't be stopped; it is bounded by the read's limits.
+		 */
 		void cancel() {
 			cancelled.set(true);
 			future.cancel(false);
@@ -453,15 +495,34 @@ public final class StructureTemplates {
 			List<Identifier> ids = server.getStructureTemplateManager().listTemplates().toList();
 			Map<Identifier, Summary> summaries = new ConcurrentHashMap<>();
 			Set<Identifier> unreadable = ConcurrentHashMap.newKeySet();
+			Set<Identifier> large = ConcurrentHashMap.newKeySet();
 			// Independent per file; this runs inside POOL, so the parallel stream uses its threads.
 			ids.parallelStream().forEach(id -> {
-				if (cancelled.get()) {
-					throw new CancellationException("Template index build cancelled");
-				}
+				requireNotCancelled();
 
-				summarize(sources, id).ifPresentOrElse(s -> summaries.put(id, s), () -> unreadable.add(id));
+				try {
+					record(id, summarize(sources, id, parallelLimits), summaries, unreadable);
+				} catch (TooLargeException e) {
+					large.add(id);
+				}
 			});
+
+			for (Identifier id : large) {
+				requireNotCancelled();
+				record(id, summarizeOrSkip(sources, id, fullLimits), summaries, unreadable);
+			}
+
 			return Index.traced(server, summaries, unreadable);
+		}
+
+		private void requireNotCancelled() {
+			if (cancelled.get()) {
+				throw new CancellationException("Template index build cancelled");
+			}
+		}
+
+		private static void record(Identifier id, Optional<Summary> summary, Map<Identifier, Summary> summaries, Set<Identifier> unreadable) {
+			summary.ifPresentOrElse(s -> summaries.put(id, s), () -> unreadable.add(id));
 		}
 
 		/** The built index, with world-saved templates whose files changed since summarized again. */
@@ -482,7 +543,7 @@ public final class StructureTemplates {
 				// A deleted world file uncovers the pack's template of the same id, if there is one.
 				summaries.remove(id);
 				unreadable.remove(id);
-				summarize(sources, id).ifPresentOrElse(s -> summaries.put(id, s), () -> {
+				summarizeOrSkip(sources, id, fullLimits).ifPresentOrElse(s -> summaries.put(id, s), () -> {
 					if (now.containsKey(id)) {
 						unreadable.add(id);
 					}
@@ -497,14 +558,17 @@ public final class StructureTemplates {
 
 	/**
 	 * The game's template sources in {@link StructureTemplateManager}'s order: templates saved in the world, game test
-	 * files (only when running game tests), then data packs, mods and Minecraft through the resource manager. Reading
-	 * and data fixing are the game's own; the index reads through these rather than the manager so that it doesn't fill
-	 * the manager's cache, which would keep thousands of templates in memory for the rest of the session. Only ids
-	 * none of them has go to the manager itself. The pack id, which the manager doesn't keep, comes from the resource
-	 * manager.
+	 * files (only when running game tests), then data packs, mods and Minecraft through the resource manager. As in the
+	 * game, a file that can't be read is skipped for the next source.
+	 * <p>
+	 * World and pack files are read here, within an {@link NbtBudget}, since the game reads them with no limit; data
+	 * fixing is the game's own. Reading here rather than through the manager also keeps the manager's cache from filling
+	 * with thousands of templates for the rest of the session. Game test files (text, written by this mod's developers)
+	 * and ids none of the sources has (a mod's code can add sources) are left to the game.
 	 */
 	private static final class Sources {
-		record Loaded(StructureTemplate template, Origin origin) {
+		/** A template as an up-to-date structure tag (see {@link StructureNbt#upgrade}), and where it came from. */
+		record Loaded(CompoundTag structure, Origin origin) {
 		}
 
 		/** structure/<path>.nbt, the layout of both world saves and packs (the manager's own lister for packs is private). */
@@ -513,10 +577,9 @@ public final class StructureTemplates {
 		private final StructureTemplateManager manager;
 		private final ResourceManager resources;
 		private final TemplatePathFactory worldPaths;
+		/** Lists the world's templates; they are read through {@link #worldPaths}. */
 		private final TemplateSource world;
-		private final TemplatePathFactory gameTestPaths;
 		private final TemplateSource gameTests;
-		private final TemplateSource packs;
 
 		Sources(MinecraftServer server) {
 			DataFixer fixer = server.getFixerUpper();
@@ -527,46 +590,69 @@ public final class StructureTemplates {
 			this.worldPaths = new TemplatePathFactory(generated);
 			this.world = new DirectoryTemplateSource(fixer, blocks, generated, TEMPLATE_FILES, false);
 			Path gameTestDir = StructureUtils.testStructuresSourceDir;
-			this.gameTestPaths = gameTestDir == null ? null : new TemplatePathFactory(gameTestDir, PackType.SERVER_DATA);
 			this.gameTests = gameTestDir == null ? null : new DirectoryTemplateSource(fixer, blocks, gameTestDir, PackType.SERVER_DATA,
 				StructureTemplateManager.RESOURCE_TEXT_STRUCTURE_LISTER, true);
-			this.packs = new ResourceManagerTemplateSource(fixer, blocks, resources, TEMPLATE_FILES);
 		}
 
-		/** The first source that reads the template, as the game's manager picks it. */
-		Optional<Loaded> load(Identifier id) {
-			Optional<StructureTemplate> fromWorld = world.load(id);
-			if (fromWorld.isPresent()) {
-				return Optional.of(new Loaded(fromWorld.get(), new SavedInWorld()));
+		/**
+		 * The first source that reads the template, as the game's manager picks it.
+		 *
+		 * @throws TooLargeException if the file found is over {@code budget} or another limit on imported files
+		 */
+		Optional<Loaded> load(Identifier id, NbtBudget budget) throws TooLargeException {
+			Optional<Path> worldFile = worldFile(id);
+			if (worldFile.isPresent()) {
+				Optional<CompoundTag> structure = readOrSkip(id, () -> budget.read(worldFile.get()));
+				if (structure.isPresent()) {
+					return Optional.of(new Loaded(structure.get(), new SavedInWorld()));
+				}
 			}
 
 			if (gameTests != null) {
 				Optional<StructureTemplate> fromTests = gameTests.load(id);
 				if (fromTests.isPresent()) {
-					return Optional.of(new Loaded(fromTests.get(), new GameTestFiles()));
+					return Optional.of(new Loaded(fromTests.get().save(new CompoundTag()), new GameTestFiles()));
 				}
 			}
 
-			Optional<StructureTemplate> fromPacks = packs.load(id);
-			if (fromPacks.isPresent()) {
-				return Optional.of(new Loaded(fromPacks.get(), packOrigin(id)));
+			Optional<Resource> packFile = resources.getResource(TEMPLATE_FILES.idToFile(id));
+			if (packFile.isPresent()) {
+				Optional<CompoundTag> structure = readOrSkip(id, () -> {
+					try (InputStream in = packFile.get().open()) {
+						return budget.read(in);
+					}
+				});
+				if (structure.isPresent()) {
+					return Optional.of(new Loaded(structure.get(), new Pack(packFile.get().sourcePackId())));
+				}
 			}
 
 			// Mods can add sources to the manager (Fabric's game test API does); ask it for the few ids none of these has.
-			return manager.get(id).map(template -> new Loaded(template, new ManagerOnly()));
+			return manager.get(id).map(template -> new Loaded(template.save(new CompoundTag()), new ManagerOnly()));
 		}
 
-		/** Which source has a file for the template, in the game's order; {@link ManagerOnly} if none. */
-		Origin origin(Identifier id) {
-			if (fileExists(worldPaths, id, TEMPLATE_FILES)) {
-				return new SavedInWorld();
+		/**
+		 * Reads a template file and upgrades it, or empty if it can't be read (logged). A file over the limits is an error
+		 * rather than skipped: the game would read it.
+		 */
+		private static Optional<CompoundTag> readOrSkip(Identifier id, IoSupplier<CompoundTag> file) throws TooLargeException {
+			try {
+				CompoundTag structure = file.get();
+				return Optional.of(StructureNbt.upgrade(structure, StructureNbt.dataVersion(structure)));
+			} catch (TooLargeException | CancellationException e) {
+				throw e;
+			} catch (IOException | RuntimeException e) {
+				ClaudeChatClient.LOGGER.warn("Could not read structure template {}: {}", id, e.toString());
+				return Optional.empty();
 			}
+		}
 
-			if (gameTestPaths != null && fileExists(gameTestPaths, id, StructureTemplateManager.RESOURCE_TEXT_STRUCTURE_LISTER)) {
-				return new GameTestFiles();
+		private Optional<Path> worldFile(Identifier id) {
+			try {
+				return Optional.of(worldPaths.createAndValidatePathToStructure(id, TEMPLATE_FILES)).filter(Files::isRegularFile);
+			} catch (RuntimeException invalidPath) {
+				return Optional.empty();
 			}
-
-			return resources.getResource(packFile(id)).isPresent() ? packOrigin(id) : new ManagerOnly();
 		}
 
 		/** Modification times of the templates saved in the world. */
@@ -580,22 +666,6 @@ public final class StructureTemplates {
 				}
 			});
 			return stamps;
-		}
-
-		private Origin packOrigin(Identifier id) {
-			return new Pack(resources.getResource(packFile(id)).map(Resource::sourcePackId).orElse("?"));
-		}
-
-		private static Identifier packFile(Identifier id) {
-			return TEMPLATE_FILES.idToFile(id);
-		}
-
-		private static boolean fileExists(TemplatePathFactory paths, Identifier id, FileToIdConverter lister) {
-			try {
-				return Files.isRegularFile(paths.createAndValidatePathToStructure(id, lister));
-			} catch (RuntimeException invalidPath) {
-				return false;
-			}
 		}
 	}
 }

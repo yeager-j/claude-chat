@@ -7,8 +7,6 @@ import net.minecraft.core.BlockPos;
 import net.minecraft.core.Vec3i;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.nbt.ListTag;
-import net.minecraft.nbt.NbtAccounter;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.StringTag;
 import net.minecraft.nbt.visitors.CollectFields;
 import net.minecraft.nbt.visitors.FieldSelector;
@@ -24,6 +22,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.concurrent.CancellationException;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
@@ -31,7 +30,9 @@ import java.util.stream.Stream;
  * Schematic files from the player's schematics folder (Litematica's, or the game's schematics/ folder): Litematica
  * .litematic, Sponge .schem (WorldEdit) and vanilla structure .nbt. All are gzipped NBT, which Claude can't read as
  * files. Listing reads only each file's description; loading reads every block, upgraded from the version the file
- * was saved in (see {@link StructureNbt#upgrade}), so old schematics use today's names.
+ * was saved in (see {@link StructureNbt#upgrade}), so old schematics use today's names. Schematics are often
+ * downloaded, so both read within {@link NbtBudget#FILE}, and a file over any limit fails with a
+ * {@link TooLargeException} naming the file and the limit.
  */
 public final class Schematics {
 	/** A schematic's own description, read without its blocks. {@code recordedBlocks} is the block count the file stores, if it stores one. */
@@ -143,6 +144,8 @@ public final class Schematics {
 				String path = dir.relativize(file).toString().replace('\\', '/');
 				try {
 					entries.add(new Readable(file, path, info(file)));
+				} catch (CancellationException e) {
+					throw e;
 				} catch (IOException | RuntimeException e) {
 					entries.add(new Unreadable(file, path, String.valueOf(e.getMessage())));
 				}
@@ -189,19 +192,43 @@ public final class Schematics {
 		return entry instanceof Readable readable ? Optional.of(readable.info().name().toLowerCase(Locale.ROOT)) : Optional.empty();
 	}
 
-	/** A schematic's description, reading only the fields its format needs. */
+	/**
+	 * A schematic's description, reading only the fields its format needs.
+	 *
+	 * @throws TooLargeException if the file is over {@link NbtBudget#FILE}
+	 */
 	public static Info info(Path file) throws IOException {
 		Format format = format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
 		CollectFields fields = new CollectFields(format.infoFields().toArray(FieldSelector[]::new));
-		NbtIo.parseCompressed(file, fields, NbtAccounter.unlimitedHeap());
+
+		try {
+			NbtBudget.FILE.parse(file, fields);
+		} catch (TooLargeException e) {
+			throw tooLarge(file, e);
+		}
+
 		CompoundTag tag = fields.getResult() instanceof CompoundTag compound ? compound : new CompoundTag();
 		return format.info(tag, stem(file));
 	}
 
-	/** Every block of a schematic. */
+	/**
+	 * Every block of a schematic.
+	 *
+	 * @throws TooLargeException if the file is over {@link NbtBudget#FILE} or over a limit of the volume model (positions,
+	 *     block states) or of {@link StructureNbt} (palettes, block entities, entities)
+	 */
 	public static Schematic load(Path file) throws IOException {
 		Format format = format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
-		return format.read(NbtIo.readCompressed(file, NbtAccounter.unlimitedHeap()), stem(file));
+
+		try {
+			return format.read(NbtBudget.FILE.read(file), stem(file));
+		} catch (TooLargeException e) {
+			throw tooLarge(file, e);
+		}
+	}
+
+	private static TooLargeException tooLarge(Path file, TooLargeException limit) {
+		return new TooLargeException(file.getFileName() + " is too large to read: " + limit.getMessage());
 	}
 
 	private static Optional<Format> format(Path file) {
@@ -236,7 +263,12 @@ public final class Schematics {
 		ListTag entities = new ListTag();
 		entities.add(StructureNbt.entityEntry(0, 0, 0, pig));
 		structure.put("entities", entities);
-		StructureNbt.upgrade(structure, 1343);
+
+		try {
+			StructureNbt.upgrade(structure, 1343);
+		} catch (TooLargeException e) {
+			throw new IllegalStateException("A one-block structure is within every limit", e);
+		}
 	}
 
 	/** Vanilla structure files saved with a structure block: the same layout as structure templates. */
@@ -256,6 +288,7 @@ public final class Schematics {
 		@Override
 		public Schematic read(CompoundTag root, String fileStem) throws IOException {
 			Info info = info(root, fileStem);
+			BlockVolume.requireFits(info.size());
 			BlockVolume volume = StructureNbt.read(StructureNbt.upgrade(root, StructureNbt.dataVersion(root))).volume(0);
 			return new Schematic(info, List.of(new Region("main", BlockPos.ZERO, info.size())), volume);
 		}

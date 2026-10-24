@@ -46,6 +46,7 @@ import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -56,8 +57,16 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CompletableFuture;
+import java.util.zip.GZIPOutputStream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.IntTag;
+import net.minecraft.nbt.ListTag;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtUtils;
+import net.minecraft.nbt.Tag;
+import net.minecraft.server.MinecraftServer;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.fabric.api.client.gametest.v1.FabricClientGameTest;
 import net.fabricmc.fabric.api.client.gametest.v1.context.ClientGameTestContext;
@@ -198,6 +207,17 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					JsonObject tower = logTool(context, "inspect_structure_template", "{\"template\": \"claudechat:test_tower\", \"layers\": true}");
 					check(tower.get("solid_blocks").getAsInt() == 3 && tower.get("from").getAsString().startsWith("this world"),
 						"inspect doesn't match the save: " + tower);
+
+					// Limits on imported templates: after a reload the index is rebuilt with a wide template, too big for the
+					// parallel pass but fine alone, and one whose data would need a gigabyte, which is refused.
+					writeOversizedTemplates(singleplayer.getServer().computeOnServer(server -> server.getWorldPath(LevelResource.GENERATED_DIR)));
+					reloadResources(context, singleplayer);
+					JsonObject wide = logTool(context, "search_structure_templates", "{\"blocks\": [\"emerald_block\"], \"query\": \"claudechat:\"}");
+					check(wide.get("templates_indexed").getAsInt() > 500, "too few templates indexed after adding oversized ones");
+					check(wide.getAsJsonArray("results").get(0).getAsJsonObject().get("template").getAsString().equals("claudechat:wide_slab"),
+						"the wide template wasn't indexed one at a time: " + wide);
+					String bomb = toolError(context, "inspect_structure_template", "{\"template\": \"claudechat:bomb\"}");
+					check(bomb.contains("too large") && bomb.contains("256 MiB"), "the oversized template isn't refused by its limit: " + bomb);
 					String question = System.getenv("CLAUDECHAT_TEMPLATE_QUESTION");
 					if (question != null && !question.isBlank()) {
 						chat(context, "@claude " + question);
@@ -229,6 +249,9 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 						check(spawner.getAsJsonArray("block_entities").toString().contains("\"spawns\":\"minecraft:skeleton\""),
 							"the 1.12 spawner wasn't upgraded: " + spawner);
 						check(files.toString().matches(".*\"old/Broken.litematic\",\"error\":\"unreadable.*"), "the broken file isn't marked unreadable");
+						check(files.toString().contains("Bomb.schem is too large to read"), "listing doesn't refuse the decompression bomb by its limit");
+						String bomb = toolError(context, "inspect_schematic", "{\"schematic\": \"Bomb\"}");
+						check(bomb.contains("too large") && bomb.contains("256 MiB"), "inspecting the decompression bomb isn't refused by its limit: " + bomb);
 					}
 					String file = files.get(0).getAsJsonObject().get("file").getAsString();
 					JsonObject schematic = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"layers\": true}");
@@ -892,6 +915,61 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			return server.getStructureTemplateManager().save(id);
 		});
 		check(saved, "couldn't save the test tower");
+	}
+
+	/**
+	 * Writes two templates into the world's generated folder: claudechat:wide_slab, 2049×1×2048 with one emerald block
+	 * (more positions than the index reads in parallel), and claudechat:bomb, whose only tag claims a 1 GiB byte array
+	 * (the game's own reader would allocate it before finding the data missing).
+	 */
+	private static void writeOversizedTemplates(Path generated) {
+		try {
+			Path structures = Files.createDirectories(generated.resolve("claudechat/structure"));
+			CompoundTag wide = new CompoundTag();
+			NbtUtils.addCurrentDataVersion(wide);
+			ListTag size = new ListTag();
+			List.of(2049, 1, 2048).forEach(side -> size.add(IntTag.valueOf(side)));
+			wide.put("size", size);
+			ListTag palette = new ListTag();
+			palette.add(NbtUtils.writeBlockState(Blocks.EMERALD_BLOCK.defaultBlockState()));
+			wide.put("palette", palette);
+			CompoundTag block = new CompoundTag();
+			ListTag origin = new ListTag();
+			List.of(0, 0, 0).forEach(coordinate -> origin.add(IntTag.valueOf(coordinate)));
+			block.put("pos", origin);
+			block.putInt("state", 0);
+			ListTag blocks = new ListTag();
+			blocks.add(block);
+			wide.put("blocks", blocks);
+			wide.put("entities", new ListTag());
+			NbtIo.writeCompressed(wide, structures.resolve("wide_slab.nbt"));
+
+			try (DataOutputStream out = new DataOutputStream(new GZIPOutputStream(Files.newOutputStream(structures.resolve("bomb.nbt"))))) {
+				out.writeByte(Tag.TAG_COMPOUND);
+				out.writeUTF("");
+				out.writeByte(Tag.TAG_BYTE_ARRAY);
+				out.writeUTF("data");
+				out.writeInt(1 << 30);
+			}
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	/** Runs /reload and waits until the server has its new resource manager. */
+	private static void reloadResources(ClientGameTestContext context, TestSingleplayerContext singleplayer) {
+		Object before = singleplayer.getServer().computeOnServer(MinecraftServer::getResourceManager);
+		singleplayer.getServer().runCommand("reload");
+
+		for (int tick = 0; tick < 60 * SECONDS; tick++) {
+			if (singleplayer.getServer().computeOnServer(MinecraftServer::getResourceManager) != before) {
+				return;
+			}
+
+			context.waitTick();
+		}
+
+		throw new AssertionError("/reload didn't finish");
 	}
 
 	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {

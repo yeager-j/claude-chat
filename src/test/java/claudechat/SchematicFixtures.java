@@ -8,13 +8,17 @@ import net.minecraft.nbt.ListTag;
 import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.Tag;
 
+import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.GZIPOutputStream;
 
 /**
  * Small schematic and structure files, built the way each format's writer lays them out. {@link #writeAll} writes the
@@ -186,7 +190,91 @@ final class SchematicFixtures {
 		return litematicRoot(currentVersion(), "Redstone Test", 4, 3, 1, 11, regions);
 	}
 
-	/** Writes the game test's schematics folder: several formats, a subfolder, and two names that "witch" both match. */
+	/** A Sponge v3 file claiming 1024×1024×1024 positions, with no block data. */
+	static CompoundTag oversizedSponge() {
+		CompoundTag schematic = spongeSize(1024, 1024, 1024);
+		schematic.putInt("Version", 3);
+		schematic.putInt("DataVersion", currentVersion());
+		schematic.put("Blocks", new CompoundTag());
+		CompoundTag root = new CompoundTag();
+		root.put("Schematic", schematic);
+		return root;
+	}
+
+	/** A current-version structure file, 1×1×1, with {@code count} palettes of one stone block each. */
+	static CompoundTag structureWithPalettes(int count) {
+		ListTag palettes = new ListTag();
+		for (int i = 0; i < count; i++) {
+			palettes.add(list(state("minecraft:stone")));
+		}
+
+		CompoundTag root = new CompoundTag();
+		root.putInt("DataVersion", currentVersion());
+		root.put("size", ints(1, 1, 1));
+		root.put("palettes", palettes);
+		root.put("blocks", list(block(0, 0, 0, 0, null)));
+		root.put("entities", new ListTag());
+		return root;
+	}
+
+	/**
+	 * A Litematica file with two regions over the same 512×256×257 box: each fits in a volume, but reading both visits
+	 * more positions than one volume holds. There is no block data; the limit applies before it is read.
+	 */
+	static CompoundTag overlappingLitematic() {
+		CompoundTag regions = new CompoundTag();
+		regions.put("first", litematicRegion(0, 0, 0, 512, 256, 257, List.of(state("minecraft:air")), new int[0], List.of(), List.of()));
+		regions.put("second", litematicRegion(0, 0, 0, 512, 256, 257, List.of(state("minecraft:air")), new int[0], List.of(), List.of()));
+		return litematicRoot(currentVersion(), "Overlapping", 512, 256, 257, 0, regions);
+	}
+
+	/** A one-block Litematica file whose region lists {@code count} chests as block entities. */
+	static CompoundTag litematicWithBlockEntities(int count) {
+		List<CompoundTag> chests = new ArrayList<>();
+		for (int i = 0; i < count; i++) {
+			CompoundTag chest = new CompoundTag();
+			chest.putString("id", "minecraft:chest");
+			chests.add(chest);
+		}
+
+		CompoundTag regions = new CompoundTag();
+		regions.put("main", litematicRegion(0, 0, 0, 1, 1, 1, List.of(state("minecraft:chest")), new int[] {0}, chests, List.of()));
+		return litematicRoot(currentVersion(), "Many Chests", 1, 1, 1, 1, regions);
+	}
+
+	/**
+	 * Writes a Sponge v2 file, 1×1×1, whose block data is {@code bytes} zeros: a few hundred kilobytes that decompress
+	 * to {@code bytes}. Streamed as raw NBT, so the test never holds the array.
+	 */
+	static void writeZeroBomb(Path file, long bytes) throws IOException {
+		Files.createDirectories(file.getParent());
+
+		try (DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new GZIPOutputStream(Files.newOutputStream(file))))) {
+			out.writeByte(Tag.TAG_COMPOUND);
+			out.writeUTF("");
+
+			for (String side : List.of("Width", "Height", "Length")) {
+				out.writeByte(Tag.TAG_SHORT);
+				out.writeUTF(side);
+				out.writeShort(1);
+			}
+
+			out.writeByte(Tag.TAG_BYTE_ARRAY);
+			out.writeUTF("BlockData");
+			out.writeInt(Math.toIntExact(bytes));
+			byte[] zeros = new byte[1 << 20];
+			for (long left = bytes; left > 0; left -= zeros.length) {
+				out.write(zeros, 0, (int) Math.min(left, zeros.length));
+			}
+
+			out.writeByte(Tag.TAG_END);
+		}
+	}
+
+	/**
+	 * Writes the game test's schematics folder: several formats, a subfolder, two names that "witch" both match, a
+	 * broken file, and one that decompresses to more than {@link NbtBudget#FILE_BYTES}.
+	 */
 	static void writeAll(Path dir) throws IOException {
 		write(dir.resolve("Redstone Test.litematic"), redstoneBuild());
 		write(dir.resolve("farms/Witch Farm.litematic"), litematic());
@@ -194,6 +282,7 @@ final class SchematicFixtures {
 		write(dir.resolve("old/Old Spawner.nbt"), oldStructure());
 		write(dir.resolve("old/Sponge Two.schem"), spongeV2());
 		Files.write(dir.resolve("old/Broken.litematic"), new byte[] {1, 2, 3});
+		writeZeroBomb(dir.resolve("old/Bomb.schem"), NbtBudget.FILE_BYTES + (1 << 20));
 	}
 
 	static void write(Path file, CompoundTag root) throws IOException {
