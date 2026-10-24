@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
@@ -139,23 +140,20 @@ public class ClaudeChatClient implements ClientModInitializer {
 					})))
 			.then(ClientCommands.literal("effort")
 				.executes(ctx -> {
-					info("Effort: " + effortLabel() + ". Change it with /claude effort <" + String.join("|", ClaudeConfig.EFFORT_LEVELS) + "|default>.");
+					info("Effort: " + config.effort.id + ". Change it with /claude effort <" + String.join("|", effortIds()) + ">.");
 					return 1;
 				})
 				.then(ClientCommands.argument("effort", StringArgumentType.word())
-					.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(
-						Stream.concat(ClaudeConfig.EFFORT_LEVELS.stream(), Stream.of("default")), builder))
+					.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(effortIds(), builder))
 					.executes(ctx -> {
-						String effort = StringArgumentType.getString(ctx, "effort").toLowerCase();
-						if (effort.equals("default")) {
-							effort = "";
-						} else if (!ClaudeConfig.EFFORT_LEVELS.contains(effort)) {
-							ctx.getSource().sendError(Component.literal("Effort must be one of: " + String.join(", ", ClaudeConfig.EFFORT_LEVELS) + ", default"));
+						Optional<ClaudeConfig.Effort> effort = ClaudeConfig.Effort.parse(StringArgumentType.getString(ctx, "effort"));
+						if (effort.isEmpty()) {
+							ctx.getSource().sendError(Component.literal("Effort must be one of: " + String.join(", ", effortIds())));
 							return 0;
 						}
-						config.effort = effort;
+						config.effort = effort.get();
 						config.save();
-						info("Effort set to " + effortLabel() + ".");
+						info("Effort set to " + config.effort.id + ".");
 						return 1;
 					})))
 			.then(ClientCommands.literal("preview").executes(ctx -> {
@@ -176,12 +174,13 @@ public class ClaudeChatClient implements ClientModInitializer {
 					.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(
 						Stream.of(ClaudeConfig.Permissions.values()).map(p -> p.id), builder))
 					.executes(ctx -> {
-						ClaudeConfig.Permissions mode = ClaudeConfig.Permissions.parse(StringArgumentType.getString(ctx, "mode"));
-						if (mode == null) {
-							ctx.getSource().sendError(Component.literal("Permissions must be one of: read_only, ask, full"));
+						Optional<ClaudeConfig.Permissions> mode = ClaudeConfig.Permissions.parse(StringArgumentType.getString(ctx, "mode"));
+						if (mode.isEmpty()) {
+							ctx.getSource().sendError(Component.literal("Permissions must be one of: "
+								+ String.join(", ", Stream.of(ClaudeConfig.Permissions.values()).map(p -> p.id).toList())));
 							return 0;
 						}
-						setPermissions(mode);
+						setPermissions(mode.get());
 						return 1;
 					})))
 			.then(ClientCommands.literal("cheats")
@@ -331,9 +330,10 @@ public class ClaudeChatClient implements ClientModInitializer {
 				busy.set(false);
 				status.remove();
 				if (finalFailure != null) {
-					Throwable cause = finalFailure.getCause() != null ? finalFailure.getCause() : finalFailure;
-					LOGGER.warn("Claude request failed", cause);
-					send(prefix().append(Component.literal(String.valueOf(cause.getMessage())).withStyle(ChatFormatting.RED)));
+					// ClaudeCli fails with the player's message itself, not a wrapper around it.
+					LOGGER.warn("Claude request failed", finalFailure);
+					String message = finalFailure.getMessage() != null ? finalFailure.getMessage() : finalFailure.toString();
+					send(prefix().append(Component.literal(message).withStyle(ChatFormatting.RED)));
 				} else {
 					showAnswer(finalLines, answer);
 				}
@@ -366,7 +366,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 	}
 
 	private static void showStatus() {
-		info("Ask in chat with " + config.chatPrefix + " <question>. Model: " + config.model + ", effort: " + effortLabel() + ".");
+		info("Ask in chat with " + config.chatPrefix + " <question>. Model: " + config.model + ", effort: " + config.effort.id + ".");
 		info("/claude model <name>, /claude effort <level>, /claude permissions, /claude reset (new conversation), /claude knowledge, /claude preview.");
 	}
 
@@ -419,8 +419,8 @@ public class ClaudeChatClient implements ClientModInitializer {
 				Component.literal("Claude's game commands run at command block level"), apply)));
 	}
 
-	private static String effortLabel() {
-		return config.effort.isEmpty() ? "default" : config.effort;
+	private static List<String> effortIds() {
+		return Stream.of(ClaudeConfig.Effort.values()).map(effort -> effort.id).toList();
 	}
 
 	/** Two groups: decompiled code, and data only (with why). Hover a mod for its id and state. */
