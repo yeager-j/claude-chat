@@ -163,6 +163,70 @@ class KnowledgeFilesTest {
 		assertFalse(KnowledgeFiles.isLink(folder, Files.readAttributes(folder, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS)));
 	}
 
+	@Test
+	void plainFilesAreNotFolders() throws IOException {
+		Path file = Files.writeString(temp.resolve("file.txt"), "x");
+		Path folder = Files.createDirectories(temp.resolve("plain"));
+
+		assertTrue(KnowledgeFiles.isPlainFile(file));
+		assertFalse(KnowledgeFiles.isPlainFile(folder));
+		assertFalse(KnowledgeFiles.isPlainFile(temp.resolve("missing.txt")));
+	}
+
+	@Test
+	void aSymbolicLinkToAFileIsNotAPlainFile() throws Exception {
+		Path file = Files.writeString(temp.resolve("file.txt"), "x");
+
+		assertFalse(KnowledgeFiles.isPlainFile(FileLinks.symbolicLink(temp.resolve("link.txt"), file)));
+	}
+
+	@Test
+	void filesAndFoldersWhereTheirNamesSayAreUnlinked() throws IOException {
+		Path root = Files.createDirectories(temp.resolve("root/a"));
+		Path file = Files.writeString(root.resolve("b.nbt"), "x");
+
+		assertTrue(KnowledgeFiles.isUnlinkedInside(temp.resolve("root"), file));
+		assertTrue(KnowledgeFiles.isUnlinkedInside(temp.resolve("root"), root));
+		assertTrue(KnowledgeFiles.isUnlinkedInside(temp.resolve("root"), temp.resolve("root")));
+		assertTrue(KnowledgeFiles.isUnlinkedInside(temp.resolve("root/x/.."), temp.resolve("root/a/../a/b.nbt")));
+	}
+
+	@Test
+	void missingAndOutsidePathsAreNotUnlinked() throws IOException {
+		Path root = Files.createDirectories(temp.resolve("root"));
+		Path outside = outsideFolder();
+
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, root.resolve("missing.nbt")));
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, outside.resolve("secret.txt")));
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, root.resolve("../outside/secret.txt")));
+	}
+
+	@Test
+	void aJunctionOnTheWayIsNotUnlinked() throws Exception {
+		Path root = Files.createDirectories(temp.resolve("root"));
+		Path link = FileLinks.junction(root.resolve("linked"), outsideFolder());
+
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, link));
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, link.resolve("secret.txt")));
+	}
+
+	@Test
+	void aSymbolicLinkIsNotUnlinked() throws Exception {
+		Path root = Files.createDirectories(temp.resolve("root"));
+		Path outside = outsideFolder();
+
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, FileLinks.symbolicLink(root.resolve("secret.txt"), outside.resolve("secret.txt"))));
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, FileLinks.symbolicLink(root.resolve("linked"), outside).resolve("secret.txt")));
+	}
+
+	@Test
+	void aLinkToAFileInsideTheRootIsNotUnlinkedEither() throws Exception {
+		Path root = Files.createDirectories(temp.resolve("root"));
+		Path real = Files.writeString(root.resolve("real.nbt"), "x");
+
+		assertFalse(KnowledgeFiles.isUnlinkedInside(root, FileLinks.symbolicLink(root.resolve("alias.nbt"), real)));
+	}
+
 	/** {@code outside/secret.txt}, which no operation inside the other folders may read or delete. */
 	private Path outsideFolder() throws IOException {
 		Path outside = temp.resolve("outside");

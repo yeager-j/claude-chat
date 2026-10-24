@@ -1,6 +1,7 @@
 package claudechat.test;
 
 import com.google.gson.JsonObject;
+import net.minecraft.SharedConstants;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Vec3i;
 import net.minecraft.nbt.CompoundTag;
@@ -11,13 +12,17 @@ import net.minecraft.nbt.NbtUtils;
 import net.minecraft.nbt.Tag;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.server.packs.PackType;
+import net.minecraft.server.packs.metadata.pack.PackFormat;
 import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplate;
 import net.minecraft.world.level.storage.LevelResource;
 
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.zip.GZIPOutputStream;
 
@@ -25,9 +30,16 @@ import static claudechat.test.Game.check;
 
 /**
  * Structure templates: search by blocks, trace to structures through pools, draw layers; a template saved with a
- * structure block shows up in the next search, and again after saving over it; imported templates within limits.
+ * structure block shows up in the next search, and again after saving over it; imported templates within limits; a
+ * saved or pack template reached through a junction isn't read.
  */
 final class TemplateStep {
+	/** Saved in a namespace folder that is a junction to a folder outside the world's generated folder. */
+	private static final String LINKED_TEMPLATE = "claudechat_linked:secret";
+	/** A folder pack in the world whose structure folder is a junction to templates elsewhere. */
+	private static final String LINKED_TEMPLATE_PACK = "Linked Templates";
+	private static final String LINKED_PACK_TEMPLATE = "claudechat_packlinked:secret";
+
 	private TemplateStep() {
 	}
 
@@ -74,13 +86,64 @@ final class TemplateStep {
 	 * whose data would need a gigabyte, which is refused by its limit.
 	 */
 	private static void importedLimits(Game game) throws IOException {
-		writeOversizedTemplates(game.server().computeOnServer(server -> server.getWorldPath(LevelResource.GENERATED_DIR)));
-		game.reload("reload");
-		JsonObject wide = game.tool("search_structure_templates", "{\"blocks\": [\"emerald_block\"], \"query\": \"claudechat:\"}");
-		check(wide.get("templates_indexed").getAsInt() > 500, "too few templates indexed after adding oversized ones");
-		check(Json.is(firstResult(wide), "template", "claudechat:wide_slab"), "the wide template wasn't indexed one at a time: " + wide);
-		String bomb = game.toolError("inspect_structure_template", "{\"template\": \"claudechat:bomb\"}");
-		check(bomb.contains("too large") && bomb.contains("256 MiB"), "the oversized template isn't refused by its limit: " + bomb);
+		Path generated = game.server().computeOnServer(server -> server.getWorldPath(LevelResource.GENERATED_DIR));
+		Path datapacks = game.server().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR));
+		writeOversizedTemplates(generated);
+		List<Path> junctions = new ArrayList<>();
+		try {
+			writeLinkedTemplate(generated.resolve(Identifier.parse(LINKED_TEMPLATE).getNamespace()), junctions);
+			writeLinkedPackTemplate(datapacks.resolve(LINKED_TEMPLATE_PACK), junctions);
+			game.reload("reload");
+			JsonObject wide = game.tool("search_structure_templates", "{\"blocks\": [\"emerald_block\"], \"query\": \"claudechat:\"}");
+			check(wide.get("templates_indexed").getAsInt() > 500, "too few templates indexed after adding oversized ones");
+			check(Json.is(firstResult(wide), "template", "claudechat:wide_slab"), "the wide template wasn't indexed one at a time: " + wide);
+			String bomb = game.toolError("inspect_structure_template", "{\"template\": \"claudechat:bomb\"}");
+			check(bomb.contains("too large") && bomb.contains("256 MiB"), "the oversized template isn't refused by its limit: " + bomb);
+			if (!junctions.isEmpty()) {
+				for (String id : List.of(LINKED_TEMPLATE, LINKED_PACK_TEMPLATE)) {
+					String secret = game.toolError("inspect_structure_template", "{\"template\": \"" + id + "\"}");
+					check(secret.contains("No structure template"), id + " was read through a junction: " + secret);
+					check(game.server().computeOnServer(server -> server.getStructureTemplateManager().get(Identifier.parse(id)).isPresent()),
+						"the game doesn't read " + id + " either, so refusing it shows nothing");
+				}
+			}
+		} finally {
+			for (Path junction : junctions) {
+				Files.delete(junction);
+			}
+		}
+	}
+
+	/**
+	 * A template in the world but outside its generated folder, with a junction to its namespace folder at
+	 * {@code namespace}: the game reads it by its id, but the template tools must not, since a junction there could
+	 * lead anywhere. Adds nothing to {@code junctions} without junctions.
+	 */
+	private static void writeLinkedTemplate(Path namespace, List<Path> junctions) throws IOException {
+		Path outside = namespace.getParent().resolveSibling("claudechat-outside-templates");
+		writeEmptyTemplate(outside.resolve("structure/secret.nbt"));
+		Game.junction(namespace, outside).ifPresent(junctions::add);
+	}
+
+	/**
+	 * A plain folder pack whose structure folder is a junction to templates elsewhere in the world: the pack passes, but
+	 * the game opens the template through the junction, which the template tools must not.
+	 */
+	private static void writeLinkedPackTemplate(Path pack, List<Path> junctions) throws IOException {
+		PackFormat format = SharedConstants.getCurrentVersion().packVersion(PackType.SERVER_DATA);
+		Identifier id = Identifier.parse(LINKED_PACK_TEMPLATE);
+		Path namespace = Files.createDirectories(pack.resolve("data").resolve(id.getNamespace()));
+		Files.writeString(pack.resolve("pack.mcmeta"), """
+			{"pack": {"description": "Linked templates", "min_format": [%d, %d], "max_format": [%d, %d]}}
+			""".formatted(format.major(), format.minor(), format.major(), format.minor()));
+		Path outside = pack.getParent().resolveSibling("claudechat-outside-pack-templates");
+		writeEmptyTemplate(outside.resolve(id.getPath() + ".nbt"));
+		Game.junction(namespace.resolve("structure"), outside).ifPresent(junctions::add);
+	}
+
+	private static void writeEmptyTemplate(Path file) throws IOException {
+		Files.createDirectories(file.getParent());
+		NbtIo.writeCompressed(new StructureTemplate().save(new CompoundTag()), file);
 	}
 
 	private static JsonObject firstResult(JsonObject search) {

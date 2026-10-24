@@ -16,11 +16,13 @@ import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemp
 import net.minecraft.world.level.storage.LevelResource;
 
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -30,13 +32,16 @@ import static claudechat.test.Game.check;
 /**
  * World data packs: a folder pack adding a loot table, and a zip pack overriding a vanilla loot table and the piston
  * recipe. Recipe grids, material lists and the prompt's file map follow the server's packs, and a disabled pack is gone
- * from all three.
+ * from all three. A pack reached through a junction is enabled by the game but never copied for Claude.
  */
 final class PackStep {
 	/** The zip pack, as the server names it. */
 	private static final String OVERRIDE_PACK = "file/Better Dungeons.zip";
 	private static final String OVERRIDE_NAME = "Better Dungeons";
 	private static final String FOLDER_NAME = "Secret Vaults";
+	/** A junction in the datapacks folder to a pack elsewhere. */
+	private static final String LINKED_NAME = "Linked Pack";
+	private static final String LINKED_PACK = "file/" + LINKED_NAME;
 	private static final String PISTONS_SCHEMATIC = ModStep.MOD_ID + "-pistons.nbt";
 	/** Copying a pack into the knowledge base takes a moment after the reload. */
 	private static final int PROMPT_ATTEMPTS = 30;
@@ -46,11 +51,16 @@ final class PackStep {
 
 	static void run(Game game) throws IOException {
 		Path schematic = Schematics.folder().dir().resolve(PISTONS_SCHEMATIC);
+		Path datapacks = game.server().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR));
+		Optional<Path> linkedPack = Optional.empty();
 		try {
-			writeTestPacks(game.server().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR)));
+			writeTestPacks(datapacks);
+			linkedPack = writeLinkedPack(datapacks);
 			game.reload("reload");
 			check(game.server().computeOnServer(server -> server.getPackRepository().getSelectedIds().contains(OVERRIDE_PACK)),
 				"the zip pack wasn't enabled by /reload");
+			check(linkedPack.isEmpty() || game.server().computeOnServer(server -> server.getPackRepository().getSelectedIds().contains(LINKED_PACK)),
+				"the game didn't enable the junctioned pack, so the test can't show it isn't copied");
 
 			String withPack = game.ask("answer [[recipe:minecraft:piston]]\nPistons.", "how are pistons made with the packs?").requireAnswer().text();
 			check(withPack.contains("2×") && withPack.contains("block/dirt"), "the piston grid doesn't show the pack's recipe: " + withPack);
@@ -69,7 +79,25 @@ final class PackStep {
 			check(!game.systemPrompt().contains(OVERRIDE_NAME), "the disabled pack is still in the prompt");
 		} finally {
 			Files.deleteIfExists(schematic);
+			if (linkedPack.isPresent()) {
+				Files.delete(linkedPack.get());
+			}
 		}
+	}
+
+	/**
+	 * A folder pack in the world but outside its datapacks folder, with a junction to it in datapacks: the game reads
+	 * it, but the knowledge base doesn't copy it, since a junction there could lead anywhere. Empty without junctions.
+	 */
+	private static Optional<Path> writeLinkedPack(Path datapacks) throws IOException {
+		PackFormat format = SharedConstants.getCurrentVersion().packVersion(PackType.SERVER_DATA);
+		Path outside = datapacks.resolveSibling("claudechat-outside-pack");
+		Files.createDirectories(outside.resolve("data/claudetest/loot_table/chests"));
+		Files.writeString(outside.resolve("pack.mcmeta"), """
+			{"pack": {"description": "Linked", "min_format": [%d, %d], "max_format": [%d, %d]}}
+			""".formatted(format.major(), format.minor(), format.major(), format.minor()));
+		Files.writeString(outside.resolve("data/claudetest/loot_table/chests/linked.json"), "{\"type\": \"minecraft:chest\", \"pools\": []}");
+		return Game.junction(datapacks.resolve(LINKED_NAME), outside);
 	}
 
 	/** Two pistons in a schematic: their material list must use the pack's recipe, which makes two from dirt and more. */
@@ -98,6 +126,13 @@ final class PackStep {
 		}
 
 		check(overrideFolder.isPresent(), "the prompt never listed both packs with their data: " + game.systemPrompt());
+		check(!game.systemPrompt().contains(LINKED_NAME), "the junctioned pack was copied for Claude: " + game.systemPrompt());
+		try (Stream<Path> copies = Files.walk(ClaudeConfig.dir().resolve("knowledge/datapacks"))) {
+			List<Path> linkedCopies = copies.filter(path -> path.getFileName().toString().startsWith("Linked_Pack")).toList();
+			check(linkedCopies.isEmpty(), "the junctioned pack has a copy on disk: " + linkedCopies);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 		Path lootTable = ClaudeConfig.dir().resolve("knowledge").resolve(overrideFolder.get()).resolve("minecraft/loot_table/chests/simple_dungeon.json");
 		try {
 			check(Files.readString(lootTable).contains("netherite_ingot"), "the copied pack's loot table isn't the pack's");

@@ -158,11 +158,11 @@ public class KnowledgeBase {
 
 	private static final String MINECRAFT_ID = "minecraft";
 	/** The data folder inside a jar or a data pack. */
-	private static final String PACK_DATA = "data";
+	static final String PACK_DATA = "data";
 	/** The server's pack id for Minecraft's own data. */
 	private static final String VANILLA_PACK = "vanilla";
 	/** How the server's pack ids name the world's own data packs: "file/" and the pack's file name. */
-	private static final String WORLD_PACK_PREFIX = "file/";
+	static final String WORLD_PACK_PREFIX = "file/";
 	/** Words in mod names that don't identify a mod; Minecraft's own words are added to these. */
 	private static final Set<String> GENERIC_WORDS = Set.of("fabric", "mod", "mods", "api", "lib", "library");
 	/** Files older versions of this mod kept in the knowledge root. */
@@ -179,7 +179,7 @@ public class KnowledgeBase {
 	private static final String ONE_PACK = "the pack";
 
 	/** A data pack from the current world's datapacks folder, as a folder or a zip. */
-	private record WorldPack(String name, Path location, BuiltFolder folder) {
+	private record WorldPack(String name, Path worldRoot, Path location, BuiltFolder folder) {
 	}
 
 	/** What the prompt says about a world pack. */
@@ -363,17 +363,18 @@ public class KnowledgeBase {
 		String worldFolder = KnowledgeFiles.folderName(datapackDir.toAbsolutePath().getParent().getFileName().toString());
 		Map<String, WorldPack> packsById = new HashMap<>();
 		DataPackCopy.Budget listed = new DataPackCopy.Budget(WORLD_PACK_LIMITS, WORLD_PACKS);
+		Path worldRoot = datapackDir.toAbsolutePath().getParent();
 		// Highest priority (loaded last) first, so a world with too many packs loses its lowest-priority ones.
-		List<String> worldPackIds = selectedIds.reversed().stream().filter(id -> id.startsWith(WORLD_PACK_PREFIX)).toList();
+		List<String> worldPackIds = selectedIds.reversed().stream()
+			.filter(id -> id.startsWith(WORLD_PACK_PREFIX) && isReadablePack(worldRoot, datapackDir, id.substring(WORLD_PACK_PREFIX.length())))
+			.toList();
 
 		for (String id : worldPackIds.subList(0, Math.min(worldPackIds.size(), MAX_WORLD_PACKS))) {
 			String name = id.substring(WORLD_PACK_PREFIX.length());
-			Optional<Path> location = KnowledgeFiles.resolveInside(datapackDir, name).filter(Files::exists);
-
-			if (location.isPresent()) {
-				String dir = "datapacks/" + worldFolder + "/" + KnowledgeFiles.folderName(name);
-				packsById.put(id, new WorldPack(name, location.get(), packFolder(dir, packKey(location.get(), listed))));
-			}
+			Path location = KnowledgeFiles.resolveInside(datapackDir, name).orElseThrow();
+			String dir = "datapacks/" + worldFolder + "/" + KnowledgeFiles.folderName(name);
+			String key = packKey(worldRoot, location, listed);
+			packsById.put(id, new WorldPack(name, worldRoot, location, packFolder(dir, key)));
 		}
 
 		// Highest priority (loaded last) first.
@@ -678,7 +679,7 @@ public class KnowledgeBase {
 					DataPackCopy.Budget world = new DataPackCopy.Budget(WORLD_PACK_LIMITS, WORLD_PACKS);
 					world.charge(usageOfOtherPacks(pack));
 					DataPackCopy.Budget budget = new DataPackCopy.Budget(DataPackCopy.Limits.DEFAULT, ONE_PACK, world);
-					copyPackData(pack.location(), out.resolve(BuiltFolder.DATA), budget);
+					copyPackData(pack.worldRoot(), pack.location(), out.resolve(BuiltFolder.DATA), budget);
 					packUsage.put(folder, budget.usage());
 				});
 			} catch (IOException | RuntimeException e) {
@@ -695,14 +696,43 @@ public class KnowledgeBase {
 		});
 	}
 
-	/** A pack can be anyone's download, so its copy is bounded and doesn't follow links (see {@link DataPackCopy}). */
-	private static void copyPackData(Path location, Path target, DataPackCopy.Budget budget) throws IOException {
+	/**
+	 * A pack can be anyone's download, so its copy is bounded and doesn't follow links (see {@link DataPackCopy}), the
+	 * pack itself included: it's checked again here, since its files may have changed since it was selected.
+	 */
+	private static void copyPackData(Path worldRoot, Path location, Path target, DataPackCopy.Budget budget) throws IOException {
+		if (!isUnlinkedPack(worldRoot, location)) {
+			throw new IOException("Not reading " + location + ": it's gone, or a link leads it outside " + worldRoot);
+		}
+
 		if (Files.isDirectory(location)) {
 			DataPackCopy.fromFolder(location.resolve(PACK_DATA), target, budget);
 			return;
 		}
 
 		DataPackCopy.fromZip(location, PACK_DATA, target, budget);
+	}
+
+	/** Whether the world pack {@code name} can be copied (see {@link #isUnlinkedPack}); logs why not. */
+	private static boolean isReadablePack(Path worldRoot, Path datapackDir, String name) {
+		boolean readable = KnowledgeFiles.resolveInside(datapackDir, name).filter(location -> isUnlinkedPack(worldRoot, location)).isPresent();
+
+		if (!readable) {
+			ClaudeChatClient.LOGGER.info("Not reading world data pack {}: it's missing, or a link leads it out of the world folder", name);
+		}
+
+		return readable;
+	}
+
+	/**
+	 * Whether a world pack, a folder or a zip, is really where its names say below the world's folder. A link at the
+	 * pack or at the datapacks folder (a symbolic link, or a junction, which the game doesn't refuse) could lead to any
+	 * folder or zip, whose files would be copied for Claude to read. Links inside a folder pack are left to the copy,
+	 * which doesn't enter them.
+	 */
+	static boolean isUnlinkedPack(Path worldRoot, Path location) {
+		return KnowledgeFiles.isUnlinkedInside(worldRoot, location)
+			&& (KnowledgeFiles.isPlainDirectory(location) || KnowledgeFiles.isPlainFile(location));
 	}
 
 	/** What the current world's other copied packs take, so that one pack's copy gets only what the world has left. */
@@ -734,8 +764,13 @@ public class KnowledgeBase {
 	 * Describes a pack's files, so an edited pack is copied again: size and time for a zip; each data file's path,
 	 * size and time for a folder, listed within the pack's entry limit and {@code listed}, the world's.
 	 */
-	private static String packKey(Path location, DataPackCopy.Budget listed) {
+	private static String packKey(Path worldRoot, Path location, DataPackCopy.Budget listed) {
 		try {
+			if (!isUnlinkedPack(worldRoot, location)) {
+				// Copying refuses it too, and reports why.
+				return "linked";
+			}
+
 			if (!Files.isDirectory(location)) {
 				return "zip:" + Files.size(location) + ":" + Files.getLastModifiedTime(location).toMillis();
 			}

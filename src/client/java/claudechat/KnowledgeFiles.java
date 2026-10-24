@@ -249,6 +249,36 @@ final class KnowledgeFiles {
 		}
 	}
 
+	/** A regular file, not a link (nor a Windows reparse point); false when it can't be checked. */
+	static boolean isPlainFile(Path path) {
+		try {
+			return Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).isRegularFile();
+		} catch (IOException e) {
+			return false;
+		}
+	}
+
+	/**
+	 * Whether {@code path}'s real location is where its names say: {@code root}'s real location, or below it by the
+	 * same names. A link anywhere between them, {@code path} itself included (a symbolic link, or a junction to another
+	 * folder), makes it false, as do a path that doesn't exist and one outside {@code root}. Lexical checks such as
+	 * {@link #resolveInside} can't see links, so check this right before opening someone else's file.
+	 */
+	static boolean isUnlinkedInside(Path root, Path path) {
+		try {
+			Path absoluteRoot = root.toAbsolutePath().normalize();
+			Path absolute = path.toAbsolutePath().normalize();
+
+			if (!absolute.startsWith(absoluteRoot)) {
+				return false;
+			}
+
+			return absolute.toRealPath().equals(absoluteRoot.toRealPath().resolve(absoluteRoot.relativize(absolute)));
+		} catch (IOException e) {
+			return false;
+		}
+	}
+
 	/**
 	 * Checks, before writing or deleting at {@code path}, that its real location is inside {@code root}'s: lexical
 	 * checks such as {@link #resolveInside} can't see a link on the way. {@code path} need not exist yet; its nearest
