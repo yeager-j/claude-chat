@@ -103,7 +103,7 @@ public class GameCommands {
 				+ " run commands with /claude permissions " + PermissionTier.ASK.id + ".");
 		}
 
-		return ServerTasks.call(server, () -> execute(server, prepared), RUN_TIMEOUT, "The command");
+		return ServerTasks.call(server, () -> execute(server, prepared, context), RUN_TIMEOUT, "The command");
 	}
 
 	/** Parses with the permissions the command will run with, and works out whether it only reads. Server thread. */
@@ -141,7 +141,9 @@ public class GameCommands {
 	}
 
 	/** Runs the prepared parse, the one the player saw and approved. Server thread. */
-	private JsonElement execute(MinecraftServer server, Prepared prepared) {
+	private JsonElement execute(MinecraftServer server, Prepared prepared, Tool.Context context) {
+		// The question may have ended while the player decided or this waited for the server thread.
+		context.throwIfEnded();
 		if (index.server() != server || host(server) != prepared.player()) {
 			throw new IllegalStateException("The world or the player changed before the command ran, so it didn't. Run it again"
 				+ " if it's still wanted.");

@@ -11,7 +11,6 @@ import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.sounds.SoundEvents;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Set;
@@ -212,7 +211,7 @@ public final class Approvals {
 				Arguments edit = Arguments.parse(List.of(FILE_PATH, OLD_STRING, NEW_STRING, REPLACE_ALL), input);
 				yield ask("edit " + displayPath(edit.get(FILE_PATH)),
 					withOtherFields(diff(edit.get(OLD_STRING), edit.get(NEW_STRING), edit.get(REPLACE_ALL)), input,
-						FILE_PATH, OLD_STRING, NEW_STRING, REPLACE_ALL), null);
+						FILE_PATH, OLD_STRING, NEW_STRING, REPLACE_ALL), pathWarning(edit.get(FILE_PATH)));
 			}
 			case "Write" -> {
 				Arguments write = Arguments.parse(List.of(FILE_PATH, CONTENT), input);
@@ -220,8 +219,9 @@ public final class Approvals {
 				String content = write.get(CONTENT);
 				String size = lines(content.lines().count()) + ", " + content.length() + " characters";
 				Component detail = copyable(Component.literal(size).withStyle(ChatFormatting.GRAY), withCopyHint(content), content);
-				yield ask((Files.exists(Path.of(path)) ? "overwrite " : "create ") + displayPath(path),
-					withOtherFields(detail, input, FILE_PATH, CONTENT), null);
+				// "write", not "create" or "overwrite": finding out would touch the path, and a network path would then
+				// reach that computer, perhaps with the player's Windows sign-in, before they agreed to anything.
+				yield ask("write " + displayPath(path), withOtherFields(detail, input, FILE_PATH, CONTENT), pathWarning(path));
 			}
 			default -> ask("use " + tool, code(input.toString(), null), null);
 		};
@@ -284,7 +284,20 @@ public final class Approvals {
 		return clip(text, HOVER_CHARS) + "\n\nClick to copy " + (text.length() > HOVER_CHARS ? "all of it." : "it.");
 	}
 
-	/** Paths inside the game folder relative to it: "config/foo.json" rather than a long absolute path. */
+	/**
+	 * What the player should know about a file path before allowing a change to it, or null. Works on the text alone:
+	 * nothing here may touch the path before the player allows it.
+	 */
+	static String pathWarning(String path) {
+		String p = path.strip();
+		if (p.startsWith("\\\\") || p.startsWith("//") || p.startsWith("\\/") || p.startsWith("/\\")) {
+			return "This is a network or device path, not a file on this computer.";
+		}
+
+		return null;
+	}
+
+	/** Paths inside the game folder relative to it: "config/foo.json" rather than a long absolute path. Text only. */
 	private static String displayPath(String path) {
 		Path gameDir = FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
 		Path p = Path.of(path).toAbsolutePath().normalize();
