@@ -105,6 +105,10 @@ test {
 	def testRunDir = layout.buildDirectory.dir("unitTest").get().asFile
 	workingDir testRunDir
 	doFirst { testRunDir.mkdirs() }
+
+	// VisitsFileTest writes a visits file of VisitsFile.MAX_RECORDS chunks, which with the bootstrapped game classes
+	// doesn't fit in the default 512 MiB.
+	maxHeapSize = "1g"
 }
 
 dependencies {

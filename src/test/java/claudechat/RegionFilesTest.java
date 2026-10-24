@@ -173,7 +173,8 @@ class RegionFilesTest {
 
 	@Test
 	void chunkOverItsBudgetIsRefused() throws IOException {
-		writeRegion(dir.resolve("r.0.0.mca"), 0, record(chunk("x".repeat(64 << 10)), RegionFileVersion.VERSION_DEFLATE), 1, true);
+		// 32 KiB: the game writes a string over 65,535 bytes as an empty one, which would leave nothing to refuse.
+		writeRegion(dir.resolve("r.0.0.mca"), 0, record(chunk("x".repeat(32 << 10)), RegionFileVersion.VERSION_DEFLATE), 1, true);
 		NbtBudget small = new NbtBudget(16 << 10, () -> false);
 
 		assertThrows(TooLargeException.class, () -> RegionFiles.readChunk(dir, dir, 0, 0, small));
