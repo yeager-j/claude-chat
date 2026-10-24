@@ -16,8 +16,8 @@ import java.util.stream.Stream;
 /**
  * Sets up the game test's config file before Claude Chat reads it, through the same file a player edits: every question
  * runs {@link FakeClaude}, with a timeout to suit the run ({@link TestOptions#questionTimeoutSeconds}), in Read only with
- * cheats off and no include or exclude list left by an earlier run. It also parses the {@code CLAUDECHAT_*} variables,
- * so a typo fails before the game starts.
+ * cheats and web off and no include or exclude list left by an earlier run. It also parses the {@code CLAUDECHAT_*}
+ * variables, so a typo fails before the game starts.
  * <p>
  * The test mod's decompiled code is deleted too, so the mod step finds a data-only mod to decompile on demand.
  */
@@ -58,6 +58,7 @@ public final class TestPreLaunch implements PreLaunchEntrypoint {
 		config.setProperty("timeoutSeconds", String.valueOf(timeoutSeconds));
 		config.setProperty("permissions", "read_only");
 		config.setProperty("cheats", "false");
+		config.setProperty("web", "false");
 		config.setProperty("knowledgeInclude", "");
 		config.setProperty("knowledgeExclude", "");
 		Files.createDirectories(file.getParent());

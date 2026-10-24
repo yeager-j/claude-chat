@@ -116,7 +116,7 @@ class McpServerTest {
 	}
 
 	private static Tool.Context context(PermissionTier tier) {
-		return new Tool.Context(new Policy(tier, false), new Approvals(note -> { }));
+		return new Tool.Context(new Policy(tier, false, false), new Approvals(note -> { }));
 	}
 
 	/** The Authorization header claude gets from the grant's --mcp-config; also sets {@link #port}. */

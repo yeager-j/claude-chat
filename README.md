@@ -73,6 +73,7 @@ Questions in the same world continue one conversation, so follow-ups work.
 | `/claude reset` | Start a new conversation |
 | `/claude permissions <read_only\|ask\|full>` | What Claude may do beyond reading (see [Permissions](#permissions)) |
 | `/claude cheats <on\|off>` | Whether Claude's game commands may cheat where you can't |
+| `/claude web <on\|off>` | Whether Claude may search the web and fetch pages (default: off) |
 | `/claude knowledge` | What's decompiled and what's data-only (hover a mod for details) |
 | `/claude knowledge include <mod>` | Always decompile a mod's code |
 | `/claude knowledge exclude <mod>` | Never decompile a mod (its data stays searchable) |
@@ -97,6 +98,7 @@ All of these tab-complete.
 | `extraInstructions` | | Added to Claude's instructions, e.g. `Answer like a pirate.` |
 | `permissions` | `read_only` | `read_only`, `ask` or `full` |
 | `cheats` | `false` | |
+| `web` | `false` | Web search and page fetches, in every permissions tier |
 
 ## Permissions
 
@@ -111,12 +113,13 @@ All of these tab-complete.
 - What runs after **[Allow]** is exactly what the request showed: the same parsed game command, or Claude Code's request with every field it carries. A request whose question has ended (left the world, `/claude reset`) is denied, and its buttons stop working.
 - Every game command Claude runs is shown in chat, with the game's response on hover.
 - `/claude cheats` decides *what* is possible, not whether Claude may change things. Off: Claude's commands run with your own permissions, so in a world without cheats it can't `/give` or `/gamemode` either. On: they run at command block level (or yours, if higher), always as you. The world list still shows cheats off.
-- Turning on `full` or cheats needs a click on a confirm button.
-- A question keeps the permissions and cheats setting it was asked with; changes apply from your next question. Leaving the world or `/claude reset` stops a running question, along with anything it started.
+- `/claude web` is separate from the permissions above: you can let Claude edit files without letting it reach the web. Off (the default), Claude isn't given web search or page fetching in any tier, so it answers from the game's files and your world. In `full`, shell commands can still reach the network either way.
+- Turning on `full`, cheats or web access needs a click on a confirm button.
+- A question keeps the permissions, cheats and web settings it was asked with; changes apply from your next question. Leaving the world or `/claude reset` stops a running question, along with anything it started.
 
 ## Privacy and safety
 
-- **Read-only by default.** Claude can read the reference files (and no other files on your computer, unless your own Claude Code settings allow more), search the web, and use the world tools. Unless you change `/claude permissions`, it can't edit files, run shell commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
+- **Read-only by default.** Claude can read the reference files (and no other files on your computer, unless your own Claude Code settings allow more) and use the world tools. Unless you change `/claude permissions`, it can't edit files, run shell commands, or change your world, and unless you turn on `/claude web`, it can't search the web or open pages. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
 - **Local storage and transport.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
   - The mod's tools are served on `127.0.0.1` only. Each question gets a random token of its own, which works only until that question ends. The `claude` process gets it in a file only your account can read, deleted when the question ends. Anything that has the token can use the tools while the question runs, so another program running as you could too. The world tools are offered only while a single-player world is open.

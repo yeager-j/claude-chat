@@ -69,6 +69,30 @@ final class BasicsStep {
 			"the trim recipe has no icons: " + trim);
 		game.screenshot("claudechat-recipes");
 		workingDirectory(game);
+		webSetting(game);
+	}
+
+	/**
+	 * Web access is off unless the player turns it on with a confirm click: off, a question's claude isn't offered the
+	 * web tools and its prompt says so; on, it is. Turned off again for the steps after.
+	 */
+	private static void webSetting(Game game) {
+		checkWeb(game, false);
+		game.setWeb(true);
+		game.ask("answer Web on.", "can you search the web?").requireAnswer();
+		checkWeb(game, true);
+		game.setWeb(false);
+		game.ask("answer Web off.", "can you search the web now?").requireAnswer();
+		checkWeb(game, false);
+	}
+
+	/** The last question's arguments and prompt, as the fake got them. */
+	private static void checkWeb(Game game, boolean on) {
+		String arguments = game.fakeCalls().getLast();
+		String prompt = game.systemPrompt();
+		check(arguments.contains("WebFetch") == on && arguments.contains("WebSearch") == on,
+			"web " + (on ? "on" : "off") + " but claude got: " + arguments);
+		check(prompt.contains("Web access is off") != on, "web " + (on ? "on" : "off") + " but the prompt disagrees");
 	}
 
 	/** Claude starts in the knowledge folder: the reads Read only pre-approves ({@code Read(./**)}) are relative to it. */
