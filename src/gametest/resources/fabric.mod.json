@@ -5,6 +5,9 @@
 	"name": "Claude Chat tests",
 	"environment": "client",
 	"entrypoints": {
+		"preLaunch": [
+			"claudechat.test.TestPreLaunch"
+		],
 		"fabric-client-gametest": [
 			"claudechat.test.ClaudeChatClientGameTest"
 		]

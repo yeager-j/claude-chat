@@ -1,6 +1,7 @@
 package claudechat.test;
 
 import java.io.IOException;
+import java.io.OutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -18,19 +19,35 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * A stand-in for the claude CLI, for the run step of the game test. The mod starts it exactly as it starts claude:
- * {@code claudePath} names a wrapper script ({@link #writeWrapper}) that runs this class with the scenario folder
- * followed by claude's own arguments, so the mod's argument building, process start, stream parsing and killing are
- * all real. It plays the scenario named in {@code <folder>/scenario.txt}, prints stream-json as claude does, and
- * leaves files the test reads: {@code calls.log} (one line of arguments per start), {@code started.txt} (its pid and
- * its child's), {@code mcp.txt} (the MCP url and token it was given). It waits for {@code <folder>/go} where a
- * scenario needs the test to act first.
+ * A stand-in for the claude CLI: the executable every question of the game test runs, set as {@code claudePath} by
+ * {@link TestPreLaunch}. The mod starts it exactly as it starts claude: {@code claudePath} names a wrapper script
+ * ({@link #writeWrapper}) that runs this class with the scenario folder followed by claude's own arguments, so the
+ * mod's argument building, process start, stream parsing and killing are all real. It plays the scenario named in
+ * {@code <folder>/scenario.txt}, prints stream-json as claude does, and leaves files the test reads: {@code calls.log}
+ * (one line of arguments per start), {@code started.txt} (its pid and its child's), {@code mcp.json} and
+ * {@code prompt.txt} (copies of the MCP config and system prompt it was given). It waits for {@code <folder>/go} where
+ * a scenario needs the test to act first.
  * <p>
- * Only the JDK: it runs in a plain JVM with this class alone on the class path.
+ * Scenarios, as {@code <name> <argument>}:
+ * <ul>
+ * <li>{@code answer <text>}: answers at once.</li>
+ * <li>{@code progress <text>}: a progress note and a tool call, then the answer once the test says go.</li>
+ * <li>{@code hold <text>}: waits for go, then answers; meanwhile the test plays Claude with the question's token.</li>
+ * <li>{@code error <text>}: an error result with that message.</li>
+ * <li>{@code missing-session <text>}: a resumed session is gone; a fresh one answers.</li>
+ * <li>{@code run_command <command>}: once the test says go, calls run_command and answers with what it said.</li>
+ * <li>{@code hang}: starts a child process and never ends.</li>
+ * <li>{@code late-answer <text>}: answers only once the test says go.</li>
+ * <li>{@code live <path to claude>}: hands the question to the real claude, with the same arguments.</li>
+ * </ul>
+ * Only the JDK: it runs in a plain JVM with this class alone on the class path, so the test's side of the file
+ * protocol (the static methods at the end) uses nothing else either.
  */
 public final class FakeClaude {
 	private static final String SLEEP = "--sleep";
-	private static final long GO_TIMEOUT_MILLIS = 60_000;
+	/** Only a guard against a test that died: the mod's question timeout normally ends a waiting fake first. */
+	private static final long GO_TIMEOUT_MILLIS = 600_000;
+	private static final String FOLDER = "claudechat-fake";
 
 	private final Path folder;
 	private final List<String> args;
@@ -48,6 +65,11 @@ public final class FakeClaude {
 
 		FakeClaude fake = new FakeClaude(Path.of(argv[0]), List.of(argv).subList(1, argv.length));
 		fake.play();
+	}
+
+	/** The folder the fake and the test share, in the game folder. */
+	public static Path folder(Path gameDir) {
+		return gameDir.resolve(FOLDER);
 	}
 
 	/**
@@ -84,6 +106,9 @@ public final class FakeClaude {
 		String[] scenario = Files.readString(folder.resolve("scenario.txt")).strip().split(" ", 2);
 		String argument = scenario.length > 1 ? scenario[1] : "";
 		append("calls.log", scenario[0] + " | " + String.join(" ", args) + " | " + question);
+		// Copied now: the mod deletes both files when the question ends.
+		copy(Path.of(valueAfter("--mcp-config")), "mcp.json");
+		copy(Path.of(valueAfter("--append-system-prompt-file")), "prompt.txt");
 
 		switch (scenario[0]) {
 			case "answer" -> {
@@ -97,6 +122,11 @@ public final class FakeClaude {
 				event("{\"type\":\"user\",\"message\":{\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"t1\",\"content\":\"ok\"}]}}");
 				waitForGo();
 				answer(argument, "fake-session-progress");
+			}
+			case "hold" -> {
+				started(Optional.empty());
+				waitForGo();
+				answer(argument, "fake-session-hold");
 			}
 			case "error" -> {
 				started(Optional.empty());
@@ -124,6 +154,7 @@ public final class FakeClaude {
 				waitForGo();
 				answer(argument, "fake-session-late");
 			}
+			case "live" -> System.exit(live(Path.of(argument), question));
 			default -> throw new IllegalArgumentException("Unknown scenario " + scenario[0]);
 		}
 	}
@@ -136,7 +167,6 @@ public final class FakeClaude {
 		String config = Files.readString(Path.of(valueAfter("--mcp-config")));
 		String url = match(config, "\"url\":\"([^\"]+)\"");
 		String authorization = match(config, "\"Authorization\":\"([^\"]+)\"");
-		write("mcp.txt", url + "\n" + authorization);
 		started(Optional.empty());
 		waitForGo();
 
@@ -149,6 +179,25 @@ public final class FakeClaude {
 			.build(), HttpResponse.BodyHandlers.ofString());
 		String said = unescape(match(response.body(), "\"text\":\"((?:[^\"\\\\]|\\\\.)*)\""));
 		answer("run_command said: " + said, "fake-session-command");
+	}
+
+	/**
+	 * The real claude with the arguments the mod gave, its output passed straight through; returns its exit code. The
+	 * mod kills it along with the fake, as one of the fake's descendants.
+	 */
+	private int live(Path claude, String question) throws Exception {
+		List<String> command = new ArrayList<>(List.of(claude.toString()));
+		command.addAll(args);
+		Process real = new ProcessBuilder(command)
+			.redirectOutput(ProcessBuilder.Redirect.INHERIT)
+			.redirectError(ProcessBuilder.Redirect.INHERIT)
+			.start();
+		started(Optional.of(real.pid()));
+		try (OutputStream stdin = real.getOutputStream()) {
+			stdin.write(question.getBytes(StandardCharsets.UTF_8));
+		}
+
+		return real.waitFor();
 	}
 
 	private void answer(String answer, String session) {
@@ -192,6 +241,13 @@ public final class FakeClaude {
 	private void write(String name, String content) throws IOException {
 		Path temp = folder.resolve(name + ".tmp");
 		Files.writeString(temp, content);
+		Files.move(temp, folder.resolve(name), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+	}
+
+	/** A copy of {@code file} named {@code name}, replaced in one step like {@link #write}. */
+	private void copy(Path file, String name) throws IOException {
+		Path temp = folder.resolve(name + ".tmp");
+		Files.copy(file, temp, StandardCopyOption.REPLACE_EXISTING);
 		Files.move(temp, folder.resolve(name), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
 	}
 
@@ -253,6 +309,30 @@ public final class FakeClaude {
 			}
 		}
 		return out.toString();
+	}
+
+	// --- the test's side ----------------------------------------------------------------------------------------------
+
+	/** For the test: the next question plays {@code scenario}; clears what the last one left. */
+	public static void scenario(Path folder, String scenario) throws IOException {
+		Files.deleteIfExists(folder.resolve("go"));
+		Files.deleteIfExists(folder.resolve("started.txt"));
+		Files.writeString(folder.resolve("scenario.txt"), scenario);
+	}
+
+	/** For the test: a waiting scenario may go on. */
+	public static void go(Path folder) throws IOException {
+		Files.writeString(folder.resolve("go"), "");
+	}
+
+	/** For the test: the MCP config the last question was given, as claude reads it. */
+	public static String mcpConfig(Path folder) throws IOException {
+		return Files.readString(folder.resolve("mcp.json"));
+	}
+
+	/** For the test: the system prompt the last question was given. */
+	public static String systemPrompt(Path folder) throws IOException {
+		return Files.readString(folder.resolve("prompt.txt"));
 	}
 
 	/** For the test: the lines of calls.log, oldest first. */
