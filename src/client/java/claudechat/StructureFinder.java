@@ -202,7 +202,7 @@ public final class StructureFinder {
 	 * (a fortress's StartPiece is a BridgeCrossing, a stronghold's a StairsDown) takes that name: it's the same room,
 	 * and it's what a saved structure reloads as.
 	 */
-	private static String className(Class<?> type) {
+	static String className(Class<?> type) {
 		Class<?> parent = type.getSuperclass();
 		while (parent != null && parent.getEnclosingClass() != null && parent.getEnclosingClass() == type.getEnclosingClass()
 			&& !Modifier.isAbstract(parent.getModifiers())) {
@@ -219,7 +219,7 @@ public final class StructureFinder {
 	}
 
 	/** min, min + step, ..., and always max, so a piece's corners are always sampled. */
-	private static int[] steps(int min, int max) {
+	static int[] steps(int min, int max) {
 		int count = (max - min) / SAMPLE_STEP + 1;
 		int[] steps = new int[count + 1];
 		for (int i = 0; i < count; i++) {
