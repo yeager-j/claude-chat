@@ -46,7 +46,8 @@ class PolicyTest {
 
 		assertEquals(PermissionTier.READ_TOOLS, valueAfter(flags, "--tools"));
 		assertFalse(flags.contains("--add-dir"), flags.toString());
-		assertFalse(flags.contains("--permission-mode"), flags.toString());
+		assertEquals("default", valueAfter(flags, "--permission-mode"));
+		assertFalse(flags.contains("--permission-prompt-tool"), flags.toString());
 		assertEquals(PermissionTier.APPROVE_TOOL, valueAfter(flags, "--disallowedTools"));
 		assertTrue(PermissionTier.READ_ONLY.prompt(true).contains("read only"));
 	}
@@ -58,7 +59,7 @@ class PolicyTest {
 		assertTrue(valueAfter(flags, "--tools").contains("Bash"), flags.toString());
 		assertEquals(GAME_DIR, valueAfter(flags, "--add-dir"));
 		assertEquals(PermissionTier.APPROVE_TOOL, valueAfter(flags, "--permission-prompt-tool"));
-		assertFalse(flags.contains("--permission-mode"), flags.toString());
+		assertEquals("default", valueAfter(flags, "--permission-mode"));
 		assertTrue(PermissionTier.ASK.prompt(true).contains("approves each change"));
 	}
 
@@ -69,6 +70,26 @@ class PolicyTest {
 		assertEquals("none", valueAfter(flags, "--permission-prompts"));
 		assertFalse(flags.contains("--permission-prompt-tool"), flags.toString());
 		assertFalse(valueAfter(flags, "--allowedTools").contains(McpServer.CLAUDE_PREFIX), flags.toString());
+	}
+
+	/** A bare Read, Grep or Glob rule would pre-approve reading any file the player's account can read. */
+	@ParameterizedTest
+	@CsvSource({
+		"READ_ONLY, true",
+		"READ_ONLY, false",
+		"ASK,       true",
+		"ASK,       false",
+	})
+	void fileReadsArePreApprovedOnlyInTheWorkingDirectory(PermissionTier tier, boolean toolsServer) {
+		List<String> allowed = List.of(valueAfter(tier.cliFlags(toolsServer, GAME_DIR), "--allowedTools").split(","));
+
+		for (String fileTool : List.of("Read", "Grep", "Glob")) {
+			List<String> rules = allowed.stream().filter(rule -> rule.equals(fileTool) || rule.startsWith(fileTool + "(")).toList();
+
+			assertEquals(List.of(fileTool + "(./**)"), rules, allowed.toString());
+		}
+
+		assertTrue(allowed.containsAll(List.of("WebSearch", "WebFetch")), allowed.toString());
 	}
 
 	@Test

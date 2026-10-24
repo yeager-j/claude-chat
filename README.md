@@ -102,8 +102,8 @@ All of these tab-complete.
 
 | `/claude permissions` | Files and shell | Game commands (single-player) |
 | --- | --- | --- |
-| `read_only` (default) | Read and search only | Only ones that change nothing, like `time query`, `data get` or `gamerule <name>`. Every other one is refused, cheats or not |
-| `ask` | Edits, new files and shell commands each wait for you to click **[Allow]** or **[Deny]** in chat. Commands that only read run straight away | The same: read-only ones run, every other one asks. Destructive ones (`clear`, `kill`, `fill`…) are marked in red, with the block count for `fill` and `clone` |
+| `read_only` (default) | Read and search the reference files only. Files anywhere else are refused | Only ones that change nothing, like `time query`, `data get` or `gamerule <name>`. Every other one is refused, cheats or not |
+| `ask` | Edits, new files and shell commands each wait for you to click **[Allow]** or **[Deny]** in chat, and so does reading a file outside the reference files and the game folder. Commands that only read run straight away | The same: read-only ones run, every other one asks. Destructive ones (`clear`, `kill`, `fill`…) are marked in red, with the block count for `fill` and `clone` |
 | `full` | Anything, without asking | Anything, without asking |
 
 - The mod decides which game commands need your OK; Claude Code's own judgment isn't used for them. Commands added by mods always ask.
@@ -116,7 +116,7 @@ All of these tab-complete.
 
 ## Privacy and safety
 
-- **Read-only by default.** Claude can read the reference files, search the web, and use the world tools. Unless you change `/claude permissions`, it can't edit files, run shell commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
+- **Read-only by default.** Claude can read the reference files (and no other files on your computer, unless your own Claude Code settings allow more), search the web, and use the world tools. Unless you change `/claude permissions`, it can't edit files, run shell commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
 - **Local storage and transport.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
   - The mod's tools are served on `127.0.0.1` only. Each question gets a random token of its own, which works only until that question ends. The `claude` process gets it in a file only your account can read, deleted when the question ends. Anything that has the token can use the tools while the question runs, so another program running as you could too. The world tools are offered only while a single-player world is open.
