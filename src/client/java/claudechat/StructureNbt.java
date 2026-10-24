@@ -27,8 +27,8 @@ final class StructureNbt {
 	static final int UNKNOWN_VERSION = 500;
 
 	/**
-	 * Palettes (block variants) a structure file may have. Vanilla's most is 8 (shipwrecks), and summarizing a template
-	 * builds one volume per palette.
+	 * Palettes (block variants) a structure file may have. Vanilla's most is 8 (shipwrecks), and each palette's states
+	 * are data fixed and read.
 	 */
 	static final int MAX_PALETTES = 64;
 
@@ -41,6 +41,13 @@ final class StructureNbt {
 
 	/** Entities a file may carry, for the same reason. The most among those templates is 226. */
 	static final int MAX_ENTITIES = 1 << 16;
+
+	/**
+	 * Block entries a file may carry, with or without block entity data. A file lists each position of its box once at
+	 * most, so it may also carry no more entries than its declared size has positions; both are checked before the
+	 * entries are copied and data fixed, so a small box can't carry millions of duplicate entries.
+	 */
+	static final int MAX_BLOCKS = 1 << 22;
 
 	/** A block entry: its position, palette index and block entity data (null if it has none). */
 	record Entry(BlockPos pos, int state, CompoundTag nbt) {
@@ -79,8 +86,8 @@ final class StructureNbt {
 	/**
 	 * Brings a structure-format tag from {@code dataVersion} up to the running version. Doesn't modify {@code structure}.
 	 *
-	 * @throws TooLargeException if the tag is over the limits on palettes, palette entries, block entities or entities,
-	 *     checked first so the fixers never see it
+	 * @throws TooLargeException if the tag is over the limits on palettes, palette entries, block entries, block
+	 *     entities or entities, checked first so the fixers never see it
 	 */
 	static CompoundTag upgrade(CompoundTag structure, int dataVersion) throws TooLargeException {
 		requireWithinLimits(structure);
@@ -95,6 +102,18 @@ final class StructureNbt {
 
 		for (ListTag palette : palettes) {
 			TooLargeException.requireAtMost(palette.size(), BlockVolume.MAX_STATES, "block states in a palette");
+		}
+
+		int blocks = structure.getListOrEmpty("blocks").size();
+		TooLargeException.requireAtMost(blocks, MAX_BLOCKS, "block entries");
+		ListTag size = structure.getListOrEmpty("size");
+		if (size.size() == 3) {
+			Vec3i box = new Vec3i(size.getIntOr(0, 0), size.getIntOr(1, 0), size.getIntOr(2, 0));
+			// A negative side is an error for the reader to report.
+			if (box.getX() >= 0 && box.getY() >= 0 && box.getZ() >= 0 && blocks > BlockVolume.positions(box)) {
+				throw new TooLargeException("it has " + blocks + " block entries, more than the " + BlockVolume.positions(box)
+					+ " positions of its " + box.toShortString() + " box");
+			}
 		}
 
 		long blockEntities = structure.getListOrEmpty("blocks").compoundStream().filter(block -> block.contains("nbt")).count();

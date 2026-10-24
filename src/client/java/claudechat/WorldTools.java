@@ -764,6 +764,7 @@ public final class WorldTools {
 		if (!templateIndex.unreadable().isEmpty()) {
 			out.addProperty("templates_unreadable", templateIndex.unreadable().size());
 		}
+		templateIndex.incomplete().ifPresent(reason -> out.addProperty("templates_index_incomplete", reason + "; templates past it aren't searched"));
 		out.addProperty("total_found", hits.size());
 		if (found.noneHasAll()) {
 			out.addProperty("note", "No template has all of these blocks; these have the most.");

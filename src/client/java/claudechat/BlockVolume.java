@@ -138,7 +138,7 @@ public final class BlockVolume {
 	}
 
 	/** Positions in a box with non-negative sides. Three int sides can overflow a long, so this saturates at Long.MAX_VALUE. */
-	private static long positions(Vec3i size) {
+	static long positions(Vec3i size) {
 		try {
 			return Math.multiplyExact((long) size.getX() * size.getY(), size.getZ());
 		} catch (ArithmeticException overflow) {
