@@ -49,7 +49,7 @@ Client-side Fabric mod for **Minecraft 26.3**.
 
 ## Install
 
-1. Build the mod (`./gradlew build`), or use a release jar.
+1. Build the mod with a JDK 25 (point `JAVA_HOME` at it, then `./gradlew build`), or use a release jar.
 2. Copy `claudechat-<version>.jar` into your instance's `mods` folder, next to Fabric API.
 3. Start the game. On first launch the mod decompiles Minecraft in the background and posts a chat message when it's done. You can ask questions right away; answers just get better once that finishes.
 
