@@ -982,7 +982,7 @@ public final class WorldTools {
 					+ (unread.has(ToolFormat.MORE_KEY) ? " " + unread.get(ToolFormat.MORE_KEY).getAsString() : ""));
 			}
 		};
-		Schematics.Schematic s = Schematics.load(entry.file());
+		Schematics.Schematic s = folder.load(entry.file());
 		Schematics.Info info = s.info();
 
 		JsonObject out = new JsonObject();
