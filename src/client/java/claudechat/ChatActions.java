@@ -48,12 +48,4 @@ public final class ChatActions {
 	public static void clear() {
 		actions.clear();
 	}
-
-	/** For the client game test: the id behind a button, as a player's click would send it. */
-	public static String idOf(Component button) {
-		if (button.getStyle().getClickEvent() instanceof ClickEvent.RunCommand(String command)) {
-			return command.substring(command.lastIndexOf(' ') + 1);
-		}
-		throw new IllegalArgumentException("Not a chat action button");
-	}
 }

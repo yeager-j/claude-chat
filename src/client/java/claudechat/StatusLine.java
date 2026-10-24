@@ -19,86 +19,93 @@ import java.util.List;
 public final class StatusLine {
 	private static final int TICKS_PER_UPDATE = 20;
 
-	/** The status while Claude is working; null when idle. */
-	private Active active;
+	/** The line while Claude is working; null when idle. */
+	private Handle active;
 
-	/** One run of the status line, from {@link #start} until it's removed. */
-	private static final class Active {
-		final long startedAt = System.currentTimeMillis();
-		Component note = Component.literal("Thinking");
+	/**
+	 * One question's line, from {@link #start} until it's removed. Once another question's line replaces it, or the
+	 * status line is reset, the handle does nothing, so a question that was cancelled can't touch the next one's line.
+	 */
+	public final class Handle {
+		private final long startedAt = System.currentTimeMillis();
+		private Component note = Component.literal("Thinking");
 		/** The line in chat; null while there's no chat to show it in. */
-		GuiMessage line;
-		int ticksUntilUpdate;
-	}
+		private GuiMessage line;
+		private int ticksUntilUpdate;
 
-	public boolean isActive() {
-		return active != null;
-	}
+		/** Replace the text with Claude's latest progress note. */
+		public void setNote(Component progress) {
+			if (this != active) {
+				return;
+			}
 
-	public void start() {
-		remove();
-		active = new Active();
-		show();
-	}
-
-	/** Replace the text with Claude's latest progress note. */
-	public void setNote(Component progress) {
-		if (active == null) {
-			return;
+			note = progress;
+			show();
 		}
 
-		active.note = progress;
-		show();
+		/** Takes the line out of chat; the answer replaces it. */
+		public void remove() {
+			if (this != active) {
+				return;
+			}
+
+			active = null;
+			ChatComponentAccessor chat = chat();
+			if (line != null && chat != null && chat.claudechat$allMessages().remove(line)) {
+				chat.claudechat$refreshTrimmedMessages();
+			}
+		}
+
+		private void show() {
+			ticksUntilUpdate = TICKS_PER_UPDATE;
+			ChatComponentAccessor chat = chat();
+			if (chat == null) {
+				return;
+			}
+
+			long seconds = (System.currentTimeMillis() - startedAt) / 1000;
+			MutableComponent text = ChatOutput.line(Component.empty()
+				.append(Component.empty().append(note).append("…").withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC))
+				.append(Component.literal(" " + seconds + "s").withStyle(ChatFormatting.DARK_GRAY)));
+
+			// A fresh addedTime keeps the line from fading out while Claude works; re-adding at the front keeps it newest.
+			List<GuiMessage> messages = chat.claudechat$allMessages();
+			if (line != null) {
+				messages.remove(line);
+			}
+
+			line = new GuiMessage(Minecraft.getInstance().gui.hud.getGuiTicks(), text, null, GuiMessageSource.SYSTEM_CLIENT,
+				GuiMessageTag.systemSinglePlayer());
+			messages.addFirst(line);
+			chat.claudechat$refreshTrimmedMessages();
+		}
+	}
+
+	/** Shows a new line for a question, replacing any earlier one. */
+	public Handle start() {
+		stop();
+		active = new Handle();
+		active.show();
+		return active;
 	}
 
 	/** Call every client tick to keep the timer moving. */
 	public void tick() {
 		if (active != null && --active.ticksUntilUpdate <= 0) {
-			show();
+			active.show();
 		}
 	}
 
-	public void remove() {
-		if (active == null) {
-			return;
-		}
-
-		GuiMessage line = active.line;
-		active = null;
-		ChatComponentAccessor chat = chat();
-		if (line != null && chat != null && chat.claudechat$allMessages().remove(line)) {
-			chat.claudechat$refreshTrimmedMessages();
+	/** Takes the current line, if any, out of chat. */
+	public void stop() {
+		if (active != null) {
+			active.remove();
 		}
 	}
 
 	/** Forget the line without touching chat, e.g. after leaving a world (chat is cleared anyway). */
 	public void reset() {
 		active = null;
-	}
-
-	private void show() {
-		active.ticksUntilUpdate = TICKS_PER_UPDATE;
-		Minecraft mc = Minecraft.getInstance();
-		ChatComponentAccessor chat = chat();
-		if (chat == null) {
-			return;
-		}
-
-		long seconds = (System.currentTimeMillis() - active.startedAt) / 1000;
-		MutableComponent text = Component.empty()
-			.append(Component.literal("[Claude] ").withStyle(ChatFormatting.GOLD))
-			.append(Component.empty().append(active.note).append("…").withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC))
-			.append(Component.literal(" " + seconds + "s").withStyle(ChatFormatting.DARK_GRAY));
-
-		// A fresh addedTime keeps the line from fading out while Claude works; re-adding at the front keeps it newest.
-		List<GuiMessage> messages = chat.claudechat$allMessages();
-		if (active.line != null) {
-			messages.remove(active.line);
-		}
-
-		active.line = new GuiMessage(mc.gui.hud.getGuiTicks(), text, null, GuiMessageSource.SYSTEM_CLIENT, GuiMessageTag.systemSinglePlayer());
-		messages.addFirst(active.line);
-		chat.claudechat$refreshTrimmedMessages();
 	}
 
 	private static ChatComponentAccessor chat() {

@@ -8,20 +8,20 @@ import org.jspecify.annotations.Nullable;
 import java.util.Base64;
 import java.util.List;
 import java.util.function.BooleanSupplier;
-import java.util.function.Supplier;
+import java.util.function.Function;
 
 /**
  * One MCP tool: what Claude is told about it, what it needs before it can run, and what a call does. {@link McpServer}
  * serves a list of these and knows nothing about any one of them. Availability is checked when the tools are listed
  * and again on every call, so a tool listed while a world was open can't run after it closes.
  *
- * @param description told to Claude in tools/list; read at each listing, since it may describe current settings
+ * @param description told to Claude in tools/list; read at each listing, since it may describe the question's policy
  * @param params      the arguments, in the order the schema lists them
  */
-public record Tool(String name, Supplier<String> description, List<Param<?>> params, Requirement requirement, Handler handler) {
+public record Tool(String name, Function<Context, String> description, List<Param<?>> params, Requirement requirement, Handler handler) {
 	/** A tool with a fixed description. */
 	public static Tool of(String name, String description, Requirement requirement, List<Param<?>> params, Handler handler) {
-		return new Tool(name, () -> description, params, requirement, handler);
+		return new Tool(name, context -> description, params, requirement, handler);
 	}
 
 	/** Runs a call whose arguments have been parsed. Throws with a message for Claude when the call fails. */
@@ -40,10 +40,13 @@ public record Tool(String name, Supplier<String> description, List<Param<?>> par
 	}
 
 	/**
-	 * What the server passes along with a call besides its arguments. Empty for now: per-run state, such as the run's
-	 * permission policy, belongs here so that tools take it from the call rather than from global config.
+	 * The question a call belongs to, which the server knows from the call's token. Tools take the question's
+	 * permissions and its approvals from here, never from the live settings.
+	 *
+	 * @param policy    the permissions the question started with
+	 * @param approvals where to ask the player, for this question only
 	 */
-	public record Context() {
+	public record Context(Policy policy, Approvals approvals) {
 	}
 
 	/**
@@ -84,8 +87,8 @@ public record Tool(String name, Supplier<String> description, List<Param<?>> par
 		return requirement.met().getAsBoolean();
 	}
 
-	/** The tools/list entry: name, description and input schema. */
-	public JsonObject definition() {
+	/** The tools/list entry for a question with {@code context}: name, description and input schema. */
+	public JsonObject definition(Context context) {
 		JsonObject properties = new JsonObject();
 		JsonArray required = new JsonArray();
 		for (Param<?> param : params) {
@@ -104,7 +107,7 @@ public record Tool(String name, Supplier<String> description, List<Param<?>> par
 
 		JsonObject definition = new JsonObject();
 		definition.addProperty("name", name);
-		definition.addProperty("description", description.get());
+		definition.addProperty("description", description.apply(context));
 		definition.add("inputSchema", schema);
 		return definition;
 	}

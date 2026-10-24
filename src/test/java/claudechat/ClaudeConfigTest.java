@@ -84,7 +84,7 @@ class ClaudeConfigTest {
 			"model", " "));
 
 		assertEquals(ClaudeConfig.Effort.DEFAULT, config.effort);
-		assertEquals(ClaudeConfig.Permissions.READ_ONLY, config.permissions);
+		assertEquals(PermissionTier.READ_ONLY, config.permissions);
 		assertEquals(300, config.timeoutSeconds);
 		assertTrue(config.buildKnowledge);
 		assertEquals("@claude", config.chatPrefix);
@@ -121,7 +121,7 @@ class ClaudeConfigTest {
 		config.model = "opus";
 		config.effort = ClaudeConfig.Effort.MAX;
 		config.timeoutSeconds = 60;
-		config.permissions = ClaudeConfig.Permissions.ASK;
+		config.permissions = PermissionTier.ASK;
 		config.knowledgeExclude.add("jei");
 
 		ClaudeConfig reread = ClaudeConfig.fromProperties(config.toProperties());
@@ -130,7 +130,7 @@ class ClaudeConfigTest {
 		assertEquals("opus", reread.model);
 		assertEquals(ClaudeConfig.Effort.MAX, reread.effort);
 		assertEquals(60, reread.timeoutSeconds);
-		assertEquals(ClaudeConfig.Permissions.ASK, reread.permissions);
+		assertEquals(PermissionTier.ASK, reread.permissions);
 		assertEquals(Set.of("jei"), reread.knowledgeExclude);
 		assertFalse(reread.fileOutdated());
 	}

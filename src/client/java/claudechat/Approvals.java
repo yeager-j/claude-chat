@@ -1,6 +1,5 @@
 package claudechat;
 
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
@@ -23,28 +22,37 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 /**
- * Asks the player in chat before Claude changes anything (Ask for approval). Two kinds of request come here: Claude
- * Code's own permission prompts (edits, shell commands), which claude -p hands to the {@code approve} MCP tool
- * (--permission-prompt-tool), and game commands that run_command won't run unasked. The asking thread blocks until
- * the player clicks [Allow] or [Deny]; no answer within {@link #TIMEOUT_SECONDS} counts as Deny.
+ * One question's requests for the player's OK (Ask for approval). Two kinds of request come here: Claude Code's own
+ * permission prompts (edits, shell commands), which claude -p hands to the {@code approve} MCP tool
+ * (--permission-prompt-tool), and game commands that run_command won't run unasked. The asking thread blocks until the
+ * player clicks [Allow] or [Deny]; no answer within {@link #TIMEOUT_SECONDS} counts as Deny.
+ * <p>
+ * Requests belong to their question: once it ends ({@link #close}), whatever still waits is denied, nothing new is
+ * asked, and a late click only says it's too late.
  */
 public final class Approvals {
 	public static final long TIMEOUT_SECONDS = 120;
 	public static final String TOOL = "approve";
+	/** What Claude is told when the player says no, whatever it asked about. */
+	public static final String DENIED = "The player denied this. Don't try to do it another way; if it matters, say what"
+		+ " you wanted to do and why.";
+	private static final String TOO_LATE = "Too late: that request was already answered, timed out or its question ended.";
 	private static final int SHOWN_CHARS = 300;
 	private static final int HOVER_CHARS = 1500;
 	private static final int NOTE_CHARS = 300;
 
-	private static final Set<CompletableFuture<Boolean>> pending = ConcurrentHashMap.newKeySet();
-	private static final AtomicLong waitedMillis = new AtomicLong();
-	/** Shows "waiting for you" and then the answer in the status line; set by ClaudeChatClient. */
-	public static volatile Consumer<Component> onStatus = note -> { };
-	/** For the client game test: the latest request's buttons, as the player would click them. */
-	public static volatile Component lastAllow, lastDeny;
+	private final Consumer<Component> status;
+	private final Set<CompletableFuture<Boolean>> pending = ConcurrentHashMap.newKeySet();
+	private final AtomicLong waitedMillis = new AtomicLong();
+	private volatile boolean closed;
 
-	private Approvals() {
+	/** @param status shows "waiting for you" and then the answer in the question's status line; called on any thread */
+	public Approvals(Consumer<Component> status) {
+		this.status = status;
 	}
 
 	/**
@@ -55,7 +63,7 @@ public final class Approvals {
 	 * @throws IllegalStateException on the client thread, which would have to post the request and handle the click
 	 *                               while blocked waiting for it
 	 */
-	public static boolean ask(String action, Component detail, String warning) {
+	public boolean ask(String action, Component detail, String warning) {
 		Minecraft mc = Minecraft.getInstance();
 		if (mc.isSameThread()) {
 			throw new IllegalStateException("Approvals.ask can't wait for the player on the client thread");
@@ -63,64 +71,82 @@ public final class Approvals {
 		if (mc.player == null) {
 			return false;
 		}
+
 		CompletableFuture<Boolean> answer = new CompletableFuture<>();
 		pending.add(answer);
-		long start = System.currentTimeMillis();
-		mc.execute(() -> post(action, detail, warning, answer));
-		boolean allowed = false;
-		try {
-			allowed = answer.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
-		} catch (TimeoutException e) {
-			mc.execute(() -> info("No answer within " + TIMEOUT_SECONDS / 60 + " minutes, so Claude was told no."));
-		} catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-		} catch (ExecutionException e) {
-			// Answers are only ever completed with true or false, so this is a bug; deny.
-			ClaudeChatClient.LOGGER.warn("Approval request failed", e);
-		} finally {
+		// Checked after adding: a close() from now on denies this request, and an earlier one is seen here.
+		if (closed) {
 			pending.remove(answer);
-			waitedMillis.addAndGet(System.currentTimeMillis() - start);
+			return false;
 		}
-		onStatus.accept(Component.literal(allowed ? "Allowed, continuing" : "Denied, continuing"));
+
+		mc.execute(() -> post(action, detail, warning, answer));
+		boolean allowed = await(answer);
+		status.accept(Component.literal(allowed ? "Allowed, continuing" : "Denied, continuing"));
 		return allowed;
 	}
 
 	/** Is a request waiting for the player? The answer timeout doesn't run meanwhile. */
-	public static boolean isWaiting() {
+	public boolean isWaiting() {
 		return !pending.isEmpty();
 	}
 
-	/** Total time spent waiting for the player, for the answer timeout. */
-	public static long waitedMillis() {
+	/** Total time this question spent waiting for the player, for the answer timeout. */
+	public long waitedMillis() {
 		return waitedMillis.get();
 	}
 
-	/** Deny everything still waiting: the question ended or the player left the world. */
-	public static void cancelAll() {
+	/** The question ended: deny everything still waiting, and anything asked from now on. Any thread. */
+	public void close() {
+		closed = true;
 		pending.forEach(answer -> answer.complete(false));
 	}
 
-	private static void post(String action, Component detail, String warning, CompletableFuture<Boolean> answer) {
-		Minecraft mc = Minecraft.getInstance();
-		if (mc.player == null) {
+	private boolean await(CompletableFuture<Boolean> answer) {
+		long start = System.currentTimeMillis();
+		try {
+			return answer.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+		} catch (TimeoutException e) {
+			ChatOutput.sendLater(ChatOutput.line(Component.literal("No answer within " + TIMEOUT_SECONDS / 60
+				+ " minutes, so Claude was told no.").withStyle(ChatFormatting.GRAY)));
+			return false;
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			return false;
+		} catch (ExecutionException e) {
+			// Answers are only ever completed with true or false, so this is a bug; deny.
+			ClaudeChatClient.LOGGER.warn("Approval request failed", e);
+			return false;
+		} finally {
+			// A click after a timeout or an interrupt must not read as "Allowed".
+			answer.complete(false);
+			// Counted before the request stops pending, so the wait never shows up as Claude's working time.
+			waitedMillis.addAndGet(System.currentTimeMillis() - start);
+			pending.remove(answer);
+		}
+	}
+
+	/** Client thread. */
+	private void post(String action, Component detail, String warning, CompletableFuture<Boolean> answer) {
+		// The question may have ended while this waited for the client thread.
+		if (closed || Minecraft.getInstance().player == null) {
 			answer.complete(false);
 			return;
 		}
-		send(Component.empty().append(prefix()).append(Component.literal("wants to " + action + ":").withStyle(ChatFormatting.YELLOW)));
-		send(Component.empty().append("  ").append(detail));
+
+		ChatOutput.send(ChatOutput.line(Component.literal("wants to " + action + ":").withStyle(ChatFormatting.YELLOW)));
+		ChatOutput.send(Component.empty().append("  ").append(detail));
 		if (warning != null) {
-			send(Component.literal("  " + warning).withStyle(ChatFormatting.RED));
+			ChatOutput.send(Component.literal("  " + warning).withStyle(ChatFormatting.RED));
 		}
 		Component allow = ChatActions.button("Allow", ChatFormatting.GREEN, Component.literal("Let Claude " + action), () ->
-			info(answer.complete(true) ? "Allowed." : "Too late: that request was already answered or timed out."));
+			ChatOutput.info(answer.complete(true) ? "Allowed." : TOO_LATE));
 		Component deny = ChatActions.button("Deny", ChatFormatting.RED, Component.literal("Claude is told no"), () ->
-			info(answer.complete(false) ? "Denied." : "Too late: that request was already answered or timed out."));
-		lastAllow = allow;
-		lastDeny = deny;
-		send(Component.empty().append("  ").append(allow).append(" ").append(deny));
-		mc.getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_PLING, 1.5f));
+			ChatOutput.info(answer.complete(false) ? "Denied." : TOO_LATE));
+		ChatOutput.send(Component.empty().append("  ").append(allow).append(" ").append(deny));
+		Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_PLING, 1.5f));
 		// Chat lines fade while chat is closed; the status line doesn't.
-		onStatus.accept(Component.literal("Waiting for you: open chat to Allow or Deny"));
+		status.accept(Component.literal("Waiting for you: open chat to Allow or Deny"));
 	}
 
 	// --- Claude Code's permission prompts -------------------------------------------------------------------------
@@ -145,42 +171,79 @@ public final class Approvals {
 	public static Tool tool() {
 		return Tool.of(TOOL, "Internal: answers Claude Code's permission prompts by asking the player in chat. Not for direct use.",
 			Tool.Requirement.NOTHING, List.of(TOOL_NAME, INPUT, TOOL_USE_ID),
-			(arguments, context) -> Tool.Result.of(handlePrompt(arguments.get(TOOL_NAME), arguments.get(INPUT))));
+			(arguments, context) -> Tool.Result.of(context.approvals().answerPrompt(context.policy(), arguments.get(TOOL_NAME),
+				arguments.get(INPUT))));
 	}
 
-	/** The --permission-prompt-tool contract: {behavior: allow, updatedInput} or {behavior: deny, message}. */
-	private static JsonElement handlePrompt(String tool, JsonObject input) {
-		boolean allowed = switch (tool) {
+	/**
+	 * The --permission-prompt-tool contract: {behavior: allow, updatedInput} or {behavior: deny, message}. The request
+	 * shows a copy of the input, every field of it, and an Allow returns exactly that copy, so what runs is what the
+	 * player saw.
+	 */
+	private JsonObject answerPrompt(Policy policy, String tool, JsonObject input) {
+		JsonObject out = new JsonObject();
+		// Only Ask for approval routes prompts here; a question in another tier has nothing to approve.
+		if (policy.tier().changes != PermissionTier.CommandRule.ASK) {
+			out.addProperty("behavior", "deny");
+			out.addProperty("message", "The player's permissions are " + policy.tier().label + ", which never asks them.");
+			return out;
+		}
+
+		JsonObject shown = input.deepCopy();
+		if (askAbout(tool, shown)) {
+			out.addProperty("behavior", "allow");
+			out.add("updatedInput", shown);
+		} else {
+			out.addProperty("behavior", "deny");
+			out.addProperty("message", DENIED);
+		}
+
+		return out;
+	}
+
+	private boolean askAbout(String tool, JsonObject input) {
+		return switch (tool) {
 			case "Bash", "PowerShell" -> {
 				Arguments command = Arguments.parse(List.of(COMMAND, DESCRIPTION), input);
 				yield ask("run a " + (tool.equals("Bash") ? "shell" : "PowerShell") + " command",
-					code(command.get(COMMAND), command.get(DESCRIPTION)), null);
+					withOtherFields(code(command.get(COMMAND), command.get(DESCRIPTION)), input, COMMAND, DESCRIPTION), null);
 			}
 			case "Edit" -> {
 				Arguments edit = Arguments.parse(List.of(FILE_PATH, OLD_STRING, NEW_STRING, REPLACE_ALL), input);
 				yield ask("edit " + displayPath(edit.get(FILE_PATH)),
-					diff(edit.get(OLD_STRING), edit.get(NEW_STRING), edit.get(REPLACE_ALL)), null);
+					withOtherFields(diff(edit.get(OLD_STRING), edit.get(NEW_STRING), edit.get(REPLACE_ALL)), input,
+						FILE_PATH, OLD_STRING, NEW_STRING, REPLACE_ALL), null);
 			}
 			case "Write" -> {
 				Arguments write = Arguments.parse(List.of(FILE_PATH, CONTENT), input);
 				String path = write.get(FILE_PATH);
 				String content = write.get(CONTENT);
 				String size = lines(content.lines().count()) + ", " + content.length() + " characters";
+				Component detail = copyable(Component.literal(size).withStyle(ChatFormatting.GRAY), withCopyHint(content), content);
 				yield ask((Files.exists(Path.of(path)) ? "overwrite " : "create ") + displayPath(path),
-					copyable(Component.literal(size).withStyle(ChatFormatting.GRAY), withCopyHint(content), content), null);
+					withOtherFields(detail, input, FILE_PATH, CONTENT), null);
 			}
 			default -> ask("use " + tool, code(input.toString(), null), null);
 		};
-		JsonObject out = new JsonObject();
-		if (allowed) {
-			out.addProperty("behavior", "allow");
-			out.add("updatedInput", input);
-		} else {
-			out.addProperty("behavior", "deny");
-			out.addProperty("message", "The player denied this. Don't try to do it another way; if it matters, say what you"
-				+ " wanted to do and why.");
+	}
+
+	/**
+	 * {@code detail} followed by the input's fields it doesn't show (e.g. a shell command's timeout), so an Allow never
+	 * covers a setting the player didn't see.
+	 */
+	private static Component withOtherFields(Component detail, JsonObject input, Param<?>... shown) {
+		Set<String> shownNames = Stream.of(shown).map(Param::name).collect(Collectors.toSet());
+		List<String> others = input.entrySet().stream()
+			.filter(field -> !shownNames.contains(field.getKey()))
+			.map(field -> field.getKey() + "=" + field.getValue())
+			.toList();
+		if (others.isEmpty()) {
+			return detail;
 		}
-		return out;
+
+		String text = " (also " + String.join(", ", others) + ")";
+		return Component.empty().append(detail)
+			.append(copyable(Component.literal(clip(text, SHOWN_CHARS)).withStyle(ChatFormatting.YELLOW), withCopyHint(text), text));
 	}
 
 	/**
@@ -235,20 +298,5 @@ public final class Approvals {
 	/** {@code text} cut at {@code max} characters, saying how much was cut so a cut never passes for the whole. */
 	private static String clip(String text, int max) {
 		return text.length() <= max ? text : text.substring(0, max) + "… (" + (text.length() - max) + " more characters)";
-	}
-
-	private static void info(String message) {
-		send(Component.empty().append(prefix()).append(Component.literal(message).withStyle(ChatFormatting.GRAY)));
-	}
-
-	private static Component prefix() {
-		return Component.literal("[Claude] ").withStyle(ChatFormatting.GOLD);
-	}
-
-	private static void send(Component component) {
-		Minecraft mc = Minecraft.getInstance();
-		if (mc.player != null) {
-			mc.player.sendSystemMessage(component);
-		}
 	}
 }

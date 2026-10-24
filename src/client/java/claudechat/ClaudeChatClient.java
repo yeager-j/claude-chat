@@ -25,8 +25,8 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Optional;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 public class ClaudeChatClient implements ClientModInitializer {
@@ -46,7 +46,6 @@ public class ClaudeChatClient implements ClientModInitializer {
 		[[recipe:minecraft:torch]]
 		""";
 
-	private static final AtomicBoolean busy = new AtomicBoolean(false);
 	private static ClaudeConfig config;
 	private static ClaudeCli cli;
 	private static KnowledgeBase knowledge;
@@ -55,10 +54,12 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static McpServer mcp;
 	private static WorldTools worldTools;
 	private static final StatusLine status = new StatusLine();
+	/** This world's (or server's) questions; replaced when the player leaves or resets. Client thread. */
+	private static volatile Conversation conversation = new Conversation();
 
 	/** For the client game test: is a question still being answered? */
 	public static boolean isBusy() {
-		return busy.get();
+		return conversation.busy();
 	}
 
 	/** For the client game test: has the knowledge base finished all its background builds? */
@@ -71,12 +72,12 @@ public class ClaudeChatClient implements ClientModInitializer {
 		return knowledge;
 	}
 
-	/** For the client game test: switch tiers and cheats without the confirm buttons. */
+	/** For the client game test: settings it can't reach through commands, such as claudePath and the timeout. */
 	public static ClaudeConfig config() {
 		return config;
 	}
 
-	/** For the client game test: the MCP server, to check what Claude is offered. */
+	/** For the client game test: the MCP server, to call tools with a policy of its own. */
 	public static McpServer mcp() {
 		return mcp;
 	}
@@ -90,7 +91,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		// Served for the whole session; each tool says when it's available (look in any world, the world tools and
 		// run_command only in a single-player one).
 		List<Tool> tools = Stream.of(new ModTools(knowledge).tools(), List.of(Approvals.tool(), new ViewSnapshot().tool()),
-			worldTools.tools(), List.of(new GameCommands(config, worldIndex).tool())).flatMap(List::stream).toList();
+			worldTools.tools(), List.of(new GameCommands(worldIndex).tool())).flatMap(List::stream).toList();
 		mcp = new McpServer(tools, worldTools::available);
 		mcp.start();
 		cli = new ClaudeCli(config, knowledge, mcp);
@@ -109,7 +110,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 			})
 			.then(ClientCommands.literal("model")
 				.executes(ctx -> {
-					info("Model: " + config.model + ". Change it with /claude model <" + String.join("|", ClaudeConfig.MODEL_SUGGESTIONS) + ">.");
+					ChatOutput.info("Model: " + config.model + ". Change it with /claude model <" + String.join("|", ClaudeConfig.MODEL_SUGGESTIONS) + ">.");
 					return 1;
 				})
 				.then(ClientCommands.argument("model", StringArgumentType.word())
@@ -117,12 +118,12 @@ public class ClaudeChatClient implements ClientModInitializer {
 					.executes(ctx -> {
 						config.model = StringArgumentType.getString(ctx, "model");
 						config.save();
-						info("Model set to " + config.model + ".");
+						ChatOutput.info("Model set to " + config.model + ".");
 						return 1;
 					})))
 			.then(ClientCommands.literal("effort")
 				.executes(ctx -> {
-					info("Effort: " + config.effort.id + ". Change it with /claude effort <" + String.join("|", effortIds()) + ">.");
+					ChatOutput.info("Effort: " + config.effort.id + ". Change it with /claude effort <" + String.join("|", effortIds()) + ">.");
 					return 1;
 				})
 				.then(ClientCommands.argument("effort", StringArgumentType.word())
@@ -135,7 +136,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 						}
 						config.effort = effort.get();
 						config.save();
-						info("Effort set to " + config.effort.id + ".");
+						ChatOutput.info("Effort set to " + config.effort.id + ".");
 						return 1;
 					})))
 			.then(ClientCommands.literal("preview").executes(ctx -> {
@@ -143,8 +144,10 @@ public class ClaudeChatClient implements ClientModInitializer {
 				return 1;
 			}))
 			.then(ClientCommands.literal("reset").executes(ctx -> {
-				cli.resetSession();
-				info("Started a new conversation.");
+				boolean stopped = conversation.busy();
+				endConversation();
+				status.stop();
+				ChatOutput.info(stopped ? "Stopped the question and started a new conversation." : "Started a new conversation.");
 				return 1;
 			}))
 			.then(ClientCommands.literal("permissions")
@@ -153,13 +156,11 @@ public class ClaudeChatClient implements ClientModInitializer {
 					return 1;
 				})
 				.then(ClientCommands.argument("mode", StringArgumentType.word())
-					.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(
-						Stream.of(ClaudeConfig.Permissions.values()).map(p -> p.id), builder))
+					.suggests((ctx, builder) -> SharedSuggestionProvider.suggest(PermissionTier.ids(), builder))
 					.executes(ctx -> {
-						Optional<ClaudeConfig.Permissions> mode = ClaudeConfig.Permissions.parse(StringArgumentType.getString(ctx, "mode"));
+						Optional<PermissionTier> mode = PermissionTier.parse(StringArgumentType.getString(ctx, "mode"));
 						if (mode.isEmpty()) {
-							ctx.getSource().sendError(Component.literal("Permissions must be one of: "
-								+ String.join(", ", Stream.of(ClaudeConfig.Permissions.values()).map(p -> p.id).toList())));
+							ctx.getSource().sendError(Component.literal("Permissions must be one of: " + String.join(", ", PermissionTier.ids())));
 							return 0;
 						}
 						setPermissions(mode.get());
@@ -182,7 +183,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 			.then(ClientCommands.literal("action")
 				.then(ClientCommands.argument("id", StringArgumentType.word()).executes(ctx -> {
 					if (!ChatActions.run(StringArgumentType.getString(ctx, "id"))) {
-						info("That button has expired.");
+						ChatOutput.info("That button has expired.");
 					}
 					return 1;
 				})))
@@ -193,7 +194,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 				})
 				.then(ClientCommands.literal("rebuild").executes(ctx -> {
 					knowledge.rebuildAll(ClaudeChatClient::notifyFromBackground);
-					info("Rebuilding the knowledge base in the background.");
+					ChatOutput.info("Rebuilding the knowledge base in the background.");
 					return 1;
 				}))
 				.then(ClientCommands.literal("include")
@@ -202,7 +203,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 						.executes(ctx -> {
 							withMod(ctx.getSource(), StringArgumentType.getString(ctx, "mod"), mod -> {
 								knowledge.include(mod, ClaudeChatClient::notifyFromBackground);
-								info("Decompiling " + mod.label() + " from now on" + (knowledge.hasCode(mod) ? "." : "; starting now."));
+								ChatOutput.info("Decompiling " + mod.label() + " from now on" + (knowledge.hasCode(mod) ? "." : "; starting now."));
 							});
 							return 1;
 						})))
@@ -212,7 +213,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 						.executes(ctx -> {
 							withMod(ctx.getSource(), StringArgumentType.getString(ctx, "mod"), mod -> {
 								knowledge.exclude(mod);
-								info(mod.label() + " won't be decompiled (its recipes and other data stay searchable).");
+								ChatOutput.info(mod.label() + " won't be decompiled (its recipes and other data stay searchable).");
 							});
 							return 1;
 						}))))));
@@ -232,14 +233,12 @@ public class ClaudeChatClient implements ClientModInitializer {
 			return false;
 		});
 
-		// Each world (or server) gets a fresh conversation.
+		// Each world (or server) gets a fresh conversation, and nothing of the last one keeps running.
 		ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> {
-			cli.resetSession();
+			endConversation();
 			status.reset();
-			Approvals.cancelAll();
 			ChatActions.clear();
 		});
-		Approvals.onStatus = note -> Minecraft.getInstance().execute(() -> status.setNote(note));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> status.tick());
 
@@ -267,7 +266,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
 			knowledge.clearWorldPacks();
 			knowledge.recipes().clearServer();
-			worldTools.clearTemplates();
+			worldTools.stopBackgroundWork();
 			worldIndex.stop();
 		});
 	}
@@ -278,49 +277,61 @@ public class ClaudeChatClient implements ClientModInitializer {
 		knowledge.recipes().useServer(server.getRecipeManager());
 	}
 
+	/** Cancels the running question, if any, and starts a new conversation. Client thread. */
+	private static void endConversation() {
+		Conversation ended = conversation;
+		conversation = new Conversation();
+		ended.end();
+	}
+
 	private static void ask(String question) {
 		Minecraft mc = Minecraft.getInstance();
-		if (!busy.compareAndSet(false, true)) {
-			info("Still thinking about your last question...");
+		Conversation asked = conversation;
+		if (asked.busy()) {
+			ChatOutput.info("Still thinking about your last question...");
 			return;
 		}
 
-		// Read game state now, on the client thread; the CLI call runs in the background.
-		String gameContext = GameContext.describe(mc);
-		String mentionText = question + " " + GameContext.modNamespaces(mc);
-		send(Component.literal("> " + question).withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC));
+		// Read game state and settings now, on the client thread; the CLI call runs in the background.
+		ClaudeRun.Request request = new ClaudeRun.Request(question, GameContext.describe(mc),
+			question + " " + GameContext.modNamespaces(mc), asked.session(), Policy.of(config));
+		ChatOutput.send(Component.literal("> " + question).withStyle(ChatFormatting.GRAY, ChatFormatting.ITALIC));
 		// Immediate feedback; Claude's first progress note can take several seconds.
-		status.start();
+		StatusLine.Handle line = status.start();
+		Consumer<Component> showNote = note -> mc.execute(() -> line.setNote(note));
 
-		Consumer<String> onProgress = note -> {
-			Component formatted = formatter.formatProgress(note);
-			mc.execute(() -> status.setNote(formatted));
-		};
+		ClaudeRun run = cli.start(request, note -> showNote.accept(formatter.formatProgress(note)), showNote);
+		asked.started(run);
+		run.outcome().whenComplete((result, error) -> {
+			if (run.isCancelled()) {
+				return;
+			}
 
-		cli.ask(question, gameContext, mentionText, onProgress).whenComplete((answer, error) -> {
+			// ClaudeCli always completes with an outcome; anything else is a bug, which mustn't leave the player stuck.
+			ClaudeRun.Outcome outcome = error == null ? result : ClaudeRun.Outcome.failure(error.toString());
 			// Format off the render thread: recipes are read from disk.
-			ChatFormatter.Answer lines = null;
-			Throwable failure = error;
+			Optional<ChatFormatter.Answer> lines = Optional.empty();
+			String failure = outcome.failed() ? outcome.text() : null;
 			if (failure == null) {
 				try {
-					lines = formatter.format(answer);
+					lines = Optional.of(formatter.format(outcome.text()));
 				} catch (RuntimeException e) {
-					failure = e;
+					LOGGER.warn("Couldn't format Claude's answer", e);
+					failure = e.toString();
 				}
 			}
-			ChatFormatter.Answer finalLines = lines;
-			Throwable finalFailure = failure;
+
+			Optional<ChatFormatter.Answer> answer = lines;
+			String finalFailure = failure;
 			mc.execute(() -> {
-				busy.set(false);
-				status.remove();
-				if (finalFailure != null) {
-					// ClaudeCli fails with the player's message itself, not a wrapper around it.
-					LOGGER.warn("Claude request failed", finalFailure);
-					String message = finalFailure.getMessage() != null ? finalFailure.getMessage() : finalFailure.toString();
-					send(prefix().append(Component.literal(message).withStyle(ChatFormatting.RED)));
-				} else {
-					showAnswer(finalLines);
+				// A question cancelled meanwhile belongs to a conversation that has ended: its answer is never shown.
+				if (!asked.finished(run, outcome.sessionId())) {
+					return;
 				}
+
+				line.remove();
+				answer.ifPresentOrElse(ClaudeChatClient::showAnswer, () ->
+					ChatOutput.send(ChatOutput.line(Component.literal(finalFailure).withStyle(ChatFormatting.RED))));
 			});
 		});
 	}
@@ -331,13 +342,13 @@ public class ClaudeChatClient implements ClientModInitializer {
 		// A recipe grid needs every row to start at the same x, so it can't share a line with the [Claude] prefix.
 		boolean prefixOwnLine = answer.startsWithGrid();
 		if (prefixOwnLine) {
-			send(prefix());
+			ChatOutput.send(ChatOutput.prefix());
 		}
 		for (int i = 0; i < lines.size(); i++) {
 			// Siblings, not children of the prefix, so answer text doesn't inherit its gold color.
 			MutableComponent line = Component.empty();
 			if (i == 0 && !prefixOwnLine) {
-				line.append(prefix());
+				line.append(ChatOutput.prefix());
 			}
 			line.append(lines.get(i));
 			if (i == lines.size() - 1) {
@@ -346,62 +357,61 @@ public class ClaudeChatClient implements ClientModInitializer {
 					.withClickEvent(new ClickEvent.CopyToClipboard(plain))
 					.withHoverEvent(new HoverEvent.ShowText(Component.literal("Copy answer to clipboard")))));
 			}
-			send(line);
+			ChatOutput.send(line);
 		}
 	}
 
 	private static void showStatus() {
-		info("Ask in chat with " + config.chatPrefix + " <question>. Model: " + config.model + ", effort: " + config.effort.id + ".");
-		info("/claude model <name>, /claude effort <level>, /claude permissions, /claude reset (new conversation), /claude knowledge, /claude preview.");
+		ChatOutput.info("Ask in chat with " + config.chatPrefix + " <question>. Model: " + config.model + ", effort: " + config.effort.id + ".");
+		ChatOutput.info("/claude model <name>, /claude effort <level>, /claude permissions, /claude reset (new conversation), /claude knowledge, /claude preview.");
 	}
 
 	private static void showPermissions() {
-		info("Permissions: " + config.permissions.label + ". Cheats: " + (config.cheats ? "on" : "off") + ".");
-		info("/claude permissions <read_only|ask|full>: read only; ask before each change (edits, shell and game commands);"
-			+ " or do anything without asking. /claude cheats <on|off>: whether Claude's game commands may cheat"
-			+ " where you can't.");
+		ChatOutput.info("Permissions: " + config.permissions.label + ". Cheats: " + (config.cheats ? "on" : "off") + ".");
+		String tiers = Stream.of(PermissionTier.values()).map(tier -> tier.id + " (" + tier.summary + ")")
+			.collect(Collectors.joining(", "));
+		ChatOutput.info("/claude permissions <" + String.join("|", PermissionTier.ids()) + ">: " + tiers + "."
+			+ " /claude cheats <on|off>: whether Claude's game commands may cheat where you can't."
+			+ " Changes apply from your next question.");
 	}
 
-	/** Full access only after a click on a confirm button, so neither a typo nor a link in chat can turn it on. */
-	private static void setPermissions(ClaudeConfig.Permissions mode) {
+	/** A tier that needs confirming is set only by a click on a confirm button, so neither a typo nor a link in chat can. */
+	private static void setPermissions(PermissionTier mode) {
 		if (mode == config.permissions) {
-			info("Permissions are already " + mode.label + ".");
+			ChatOutput.info("Permissions are already " + mode.label + ".");
 			return;
 		}
 		Runnable apply = () -> {
 			config.permissions = mode;
 			config.save();
-			info("Permissions set to " + mode.label + ".");
+			ChatOutput.info("Permissions set to " + mode.label + ".");
 		};
-		if (mode != ClaudeConfig.Permissions.FULL) {
-			apply.run();
-			return;
-		}
-		send(prefix().append(Component.literal("Full access lets Claude run any shell command, edit any file and run any game"
-			+ " command without asking you. Text it reads (signs, books, mod files, web pages) could try to talk it into"
-			+ " something harmful. ").withStyle(ChatFormatting.YELLOW))
-			.append(ChatActions.button("Turn on Full access", ChatFormatting.RED,
-				Component.literal("Claude stops asking before it changes anything"), apply)));
+		mode.confirmation().ifPresentOrElse(warning -> ChatOutput.send(ChatOutput.line(Component.empty()
+			.append(Component.literal(warning).withStyle(ChatFormatting.YELLOW))
+			.append(ChatActions.button("Turn on " + mode.label, ChatFormatting.RED,
+				Component.literal("Claude may " + mode.summary), apply)))), apply);
 	}
 
 	private static void setCheats(boolean on) {
 		if (on == config.cheats) {
-			info("Cheats are already " + (on ? "on" : "off") + ".");
+			ChatOutput.info("Cheats are already " + (on ? "on" : "off") + ".");
 			return;
 		}
 		Runnable apply = () -> {
 			config.cheats = on;
 			config.save();
-			info("Cheats " + (on ? "on: Claude's game commands run at command block level." : "off: Claude's game commands run with your permissions."));
+			ChatOutput.info("Cheats " + (on ? "on: Claude's game commands run at command block level at least."
+				: "off: Claude's game commands run with your permissions."));
 		};
 		if (!on) {
 			apply.run();
 			return;
 		}
-		send(prefix().append(Component.literal("With cheats on, Claude can run commands like /give, /gamemode and /fill even in"
-			+ " worlds where you can't. The world list will still show cheats off. ").withStyle(ChatFormatting.YELLOW))
+		ChatOutput.send(ChatOutput.line(Component.empty()
+			.append(Component.literal("With cheats on, Claude can run commands like /give, /gamemode and /fill even in"
+				+ " worlds where you can't. The world list will still show cheats off. ").withStyle(ChatFormatting.YELLOW))
 			.append(ChatActions.button("Turn on cheats", ChatFormatting.RED,
-				Component.literal("Claude's game commands run at command block level"), apply)));
+				Component.literal("Claude's game commands run at command block level"), apply))));
 	}
 
 	private static List<String> effortIds() {
@@ -411,20 +421,20 @@ public class ClaudeChatClient implements ClientModInitializer {
 	/** Two groups: decompiled code, and data only (with why). Hover a mod for its id and state. */
 	private static void showKnowledgeStatus() {
 		if (knowledge.sources().isEmpty()) {
-			info("No game or mod jars found.");
+			ChatOutput.info("No game or mod jars found.");
 			return;
 		}
-		info("Knowledge base: decompiled code for these (green = ready):");
-		send(modList(knowledge.sources().stream().filter(s -> knowledge.hasCode(s) || knowledge.tier(s) == KnowledgeBase.Tier.CODE).toList()));
+		ChatOutput.info("Knowledge base: decompiled code for these (green = ready):");
+		ChatOutput.send(modList(knowledge.sources().stream().filter(s -> knowledge.hasCode(s) || knowledge.tier(s) == KnowledgeBase.Tier.CODE).toList()));
 		List<KnowledgeBase.Source> dataOnly = knowledge.sources().stream()
 			.filter(s -> !knowledge.hasCode(s) && knowledge.tier(s) == KnowledgeBase.Tier.DATA).toList();
 		if (!dataOnly.isEmpty()) {
-			info("Data only; code is decompiled when a question needs it:");
-			send(modList(dataOnly));
+			ChatOutput.info("Data only; code is decompiled when a question needs it:");
+			ChatOutput.send(modList(dataOnly));
 		}
-		info("Change with /claude knowledge include|exclude <mod>.");
+		ChatOutput.info("Change with /claude knowledge include|exclude <mod>.");
 		if (!config.buildKnowledge) {
-			info("Automatic building is off (buildKnowledge=false). /claude knowledge rebuild builds it now.");
+			ChatOutput.info("Automatic building is off (buildKnowledge=false). /claude knowledge rebuild builds it now.");
 		}
 	}
 
@@ -470,22 +480,6 @@ public class ClaudeChatClient implements ClientModInitializer {
 
 	/** Progress messages from the knowledge builder: show them in chat if the player is in a world. */
 	private static void notifyFromBackground(String message) {
-		Minecraft mc = Minecraft.getInstance();
-		mc.execute(() -> info(message));
-	}
-
-	private static void info(String message) {
-		send(prefix().append(Component.literal(message).withStyle(ChatFormatting.GRAY)));
-	}
-
-	private static MutableComponent prefix() {
-		return Component.literal("[Claude] ").withStyle(ChatFormatting.GOLD);
-	}
-
-	private static void send(Component component) {
-		Minecraft mc = Minecraft.getInstance();
-		if (mc.player != null) {
-			mc.player.sendSystemMessage(component);
-		}
+		Minecraft.getInstance().execute(() -> ChatOutput.info(message));
 	}
 }

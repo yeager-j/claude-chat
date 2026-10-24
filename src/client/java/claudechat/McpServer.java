@@ -19,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -27,6 +28,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
@@ -38,19 +40,22 @@ import java.util.function.BooleanSupplier;
 
 /**
  * A minimal MCP server ("Streamable HTTP" transport, JSON responses only) that gives Claude Code the mod's
- * {@link Tool}s for the whole game session. It lists the tools that are available right now and checks again on each
- * call, so the world tools come and go with the single-player world and {@code look} with any world. Each
- * question starts a new claude process, which lists the tools afresh. Listens on 127.0.0.1 on a random port and
- * requires a random bearer token. The token reaches claude in config/claudechat/mcp.json, which exists only while a
- * question runs (and is owner-only where the file system supports that), so another local process can use the server
- * only if it can read the player's files during a question. Plain sockets rather than the JDK's HTTP server, which some
- * launchers' trimmed Java runtimes don't include.
+ * {@link Tool}s. It runs for the whole game session and lists the tools that are available right now, checking again
+ * on each call, so the world tools come and go with the single-player world and {@code look} with any world.
+ * <p>
+ * Listens on 127.0.0.1 on a random port. Each question gets a {@link Grant}: a random bearer token of its own, mapped
+ * to the question's {@link Tool.Context} and accepted only until the question ends. Whoever holds a live token can
+ * call the tools with that question's permissions; nothing checks which process sends it. The token reaches claude in
+ * a file that only the player's account can read and that is deleted when the question ends, so another local
+ * process can use the server only while a question runs, and only if it runs as the player or can read their files.
+ * <p>
+ * Plain sockets rather than the JDK's HTTP server, which some launchers' trimmed Java runtimes don't include.
  */
 public class McpServer {
 	/** MCP versions whose Streamable HTTP transport and tool calls this server implements. */
 	private static final Set<String> SUPPORTED_PROTOCOLS = Set.of("2025-03-26", "2025-06-18", "2025-11-25");
 	private static final String PREFERRED_PROTOCOL = "2025-06-18";
-	/** One claude process at a time, but it may call several tools at once, and an approval blocks for minutes. */
+	/** One question at a time, but claude may call several tools at once, and an approval blocks for minutes. */
 	private static final int MAX_WORKERS = 16;
 	private static final int READ_TIMEOUT_MILLIS = 30_000;
 	private static final int MAX_LINE_BYTES = 8 * 1024;
@@ -65,7 +70,8 @@ public class McpServer {
 	/** By name, in the order tools/list gives them. */
 	private final Map<String, Tool> tools = new LinkedHashMap<>();
 	private final BooleanSupplier worldOpen;
-	private final String token = newToken();
+	/** The live tokens: one per question that's running. */
+	private final Set<Grant> grants = ConcurrentHashMap.newKeySet();
 	private volatile ServerSocket socket;
 	private ExecutorService workers;
 
@@ -158,22 +164,76 @@ public class McpServer {
 		return socket != null;
 	}
 
-	/** The --mcp-config JSON for claude: this server as "minecraft", or no servers at all if it couldn't start. */
-	public String claudeConfig() {
-		JsonObject servers = new JsonObject();
-		ServerSocket s = socket;
-		if (s != null) {
-			JsonObject minecraft = new JsonObject();
-			minecraft.addProperty("type", "http");
-			minecraft.addProperty("url", "http://127.0.0.1:" + s.getLocalPort() + "/mcp");
-			JsonObject headers = new JsonObject();
-			headers.addProperty("Authorization", "Bearer " + token);
-			minecraft.add("headers", headers);
-			servers.add("minecraft", minecraft);
+	/** A new token for one question, whose tool calls get {@code context}. Close the grant when the question ends. */
+	public Grant grant(Tool.Context context) {
+		Grant grant = new Grant(context);
+		grants.add(grant);
+		return grant;
+	}
+
+	/**
+	 * One question's access to the tools: a token of its own and the question's {@link Tool.Context}. Closing it
+	 * revokes the token, so later requests with it are refused, and interrupts the calls it is still serving, so slow
+	 * reads (schematics, templates, searches) stop rather than finish for nobody.
+	 */
+	public final class Grant implements AutoCloseable {
+		private final String token = newToken();
+		private final Tool.Context context;
+		/** The worker threads serving this grant's requests right now. */
+		private final Set<Thread> serving = new HashSet<>();
+		private boolean closed;
+
+		private Grant(Tool.Context context) {
+			this.context = context;
 		}
-		JsonObject config = new JsonObject();
-		config.add("mcpServers", servers);
-		return config.toString();
+
+		/** The --mcp-config JSON for claude: this server as "minecraft" with this token, or no servers if it isn't running. */
+		public String claudeConfig() {
+			JsonObject servers = new JsonObject();
+			ServerSocket s = socket;
+			if (s != null) {
+				JsonObject minecraft = new JsonObject();
+				minecraft.addProperty("type", "http");
+				minecraft.addProperty("url", "http://127.0.0.1:" + s.getLocalPort() + "/mcp");
+				JsonObject headers = new JsonObject();
+				headers.addProperty("Authorization", "Bearer " + token);
+				minecraft.add("headers", headers);
+				servers.add("minecraft", minecraft);
+			}
+
+			JsonObject config = new JsonObject();
+			config.add("mcpServers", servers);
+			return config.toString();
+		}
+
+		/** Registers the current thread as serving one of this grant's requests; false once the grant is closed. */
+		private synchronized boolean enter() {
+			if (closed) {
+				return false;
+			}
+
+			serving.add(Thread.currentThread());
+			return true;
+		}
+
+		/** The request is answered. Clears an interrupt meant for it, so it can't reach the worker's next request. */
+		private void exit() {
+			synchronized (this) {
+				serving.remove(Thread.currentThread());
+			}
+
+			Thread.interrupted();
+		}
+
+		/** Revokes the token and interrupts the requests still being served. Safe to call more than once. */
+		@Override
+		public void close() {
+			grants.remove(this);
+			synchronized (this) {
+				closed = true;
+				serving.forEach(Thread::interrupt);
+			}
+		}
 	}
 
 	// --- HTTP -----------------------------------------------------------------------------------------------------
@@ -235,8 +295,9 @@ public class McpServer {
 		if (!path.startsWith("/mcp")) {
 			throw new BadRequest(404, "path " + path);
 		}
-		if (!authorized(headers.get("authorization"))) {
-			throw new BadRequest(401, "wrong or missing token");
+		Grant grant = grantFor(headers.get("authorization"));
+		if (grant == null) {
+			throw new BadRequest(401, "wrong, revoked or missing token");
 		}
 		if (method.equals("DELETE")) {
 			respond(out, 200, null);
@@ -246,7 +307,20 @@ public class McpServer {
 			// No server-to-client event stream; clients fall back to plain request/response.
 			throw new BadRequest(405, "method " + method);
 		}
+		if (!grant.enter()) {
+			throw new BadRequest(401, "token revoked");
+		}
 
+		try {
+			answer(in, out, headers, grant.context);
+		} finally {
+			grant.exit();
+		}
+	}
+
+	/** Reads a POST body of JSON-RPC messages and answers them for the question with {@code context}. */
+	private void answer(InputStream in, OutputStream out, Map<String, String> headers, Tool.Context context)
+		throws IOException, BadRequest {
 		JsonElement request;
 		try {
 			request = JsonParser.parseString(new String(readBody(in, headers), StandardCharsets.UTF_8));
@@ -258,23 +332,33 @@ public class McpServer {
 		if (request.isJsonArray()) {
 			JsonArray responses = new JsonArray();
 			for (JsonElement message : request.getAsJsonArray()) {
-				JsonObject r = handleMessage(message);
+				JsonObject r = handleMessage(message, context);
 				if (r != null) {
 					responses.add(r);
 				}
 			}
 			response = responses.isEmpty() ? null : responses;
 		} else {
-			response = handleMessage(request);
+			response = handleMessage(request, context);
 		}
 		respond(out, response == null ? 202 : 200, response == null ? null : response.toString());
 	}
 
-	/** Compares in constant time, so response timing says nothing about how much of a guess was right. */
-	private boolean authorized(String header) {
-		byte[] expected = ("Bearer " + token).getBytes(StandardCharsets.UTF_8);
+	/**
+	 * The live grant whose token the Authorization header carries, or null. Compares in constant time, so response
+	 * timing says nothing about how much of a guess was right.
+	 */
+	private Grant grantFor(String header) {
 		byte[] given = header == null ? new byte[0] : header.getBytes(StandardCharsets.UTF_8);
-		return MessageDigest.isEqual(expected, given);
+		Grant match = null;
+		for (Grant grant : grants) {
+			byte[] expected = ("Bearer " + grant.token).getBytes(StandardCharsets.UTF_8);
+			if (MessageDigest.isEqual(expected, given)) {
+				match = grant;
+			}
+		}
+
+		return match;
 	}
 
 	private static Map<String, String> readHeaders(InputStream in) throws IOException, BadRequest {
@@ -400,7 +484,7 @@ public class McpServer {
 	}
 
 	/** Returns the response, or null for notifications. */
-	private JsonObject handleMessage(JsonElement element) {
+	private JsonObject handleMessage(JsonElement element, Tool.Context context) {
 		if (!element.isJsonObject()) {
 			return error(JsonNull.INSTANCE, -32600, "Invalid Request");
 		}
@@ -433,7 +517,7 @@ public class McpServer {
 			case "ping" -> response.add("result", new JsonObject());
 			case "tools/list" -> {
 				JsonArray definitions = new JsonArray();
-				tools.values().stream().filter(Tool::available).forEach(tool -> definitions.add(tool.definition()));
+				tools.values().stream().filter(Tool::available).forEach(tool -> definitions.add(tool.definition(context)));
 				JsonObject result = new JsonObject();
 				result.add("tools", definitions);
 				response.add("result", result);
@@ -445,7 +529,7 @@ public class McpServer {
 					return error(message.get("id"), INVALID_PARAMS, "Unknown tool: " + name);
 				}
 
-				response.add("result", callTool(tool, params.get("arguments")));
+				response.add("result", callTool(tool, params.get("arguments"), context));
 			}
 			default -> {
 				return error(message.get("id"), -32601, "Method not found: " + method);
@@ -458,7 +542,7 @@ public class McpServer {
 	 * The MCP result of one call. A failure, bad arguments included, is a result with {@code isError} rather than a
 	 * JSON-RPC error, so Claude reads what went wrong and can try again.
 	 */
-	private static JsonObject callTool(Tool tool, JsonElement arguments) {
+	private static JsonObject callTool(Tool tool, JsonElement arguments, Tool.Context context) {
 		JsonObject result = new JsonObject();
 		try {
 			if (arguments != null && !arguments.isJsonNull() && !arguments.isJsonObject()) {
@@ -466,7 +550,7 @@ public class McpServer {
 			}
 
 			JsonObject given = arguments != null && arguments.isJsonObject() ? arguments.getAsJsonObject() : new JsonObject();
-			result.add("content", tool.call(given, new Tool.Context()).content());
+			result.add("content", tool.call(given, context).content());
 		} catch (Exception e) {
 			Throwable cause = rootCause(e);
 			ClaudeChatClient.LOGGER.warn("Tool {} failed", tool.name(), cause);
