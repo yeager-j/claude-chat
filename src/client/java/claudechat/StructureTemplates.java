@@ -860,8 +860,8 @@ public final class StructureTemplates {
 				return false;
 			}
 			if (KnowledgeFiles.isPlainFile(pack.get())) {
-				// A zip.
-				return true;
+				// A zip: its entries can't be links, but the datapacks folder holding it can be.
+				return KnowledgeFiles.isUnlinkedInside(worldRoot, pack.get());
 			}
 			return KnowledgeFiles.isUnlinkedInside(worldRoot, pack.get().resolve(KnowledgeBase.PACK_DATA).resolve(file.getNamespace()).resolve(file.getPath()));
 		}
