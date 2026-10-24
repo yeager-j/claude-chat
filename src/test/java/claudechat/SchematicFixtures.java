@@ -242,6 +242,17 @@ final class SchematicFixtures {
 		return litematicRoot(currentVersion(), "Many Chests", 1, 1, 1, 1, regions);
 	}
 
+	/** A Litematica file of one stone block, plus {@code empty} regions that have no positions at all. */
+	static CompoundTag litematicWithEmptyRegions(int empty) {
+		CompoundTag regions = new CompoundTag();
+		regions.put("main", litematicRegion(0, 0, 0, 1, 1, 1, List.of(state("minecraft:stone")), new int[] {0}, List.of(), List.of()));
+		for (int i = 0; i < empty; i++) {
+			regions.put("empty " + i, litematicRegion(0, 0, 0, 0, 0, 0, List.of(), new int[0], List.of(), List.of()));
+		}
+
+		return litematicRoot(currentVersion(), "Empty Regions", 1, 1, 1, 1, regions);
+	}
+
 	/**
 	 * Writes a Sponge v2 file, 1×1×1, whose block data is {@code bytes} zeros: a few hundred kilobytes that decompress
 	 * to {@code bytes}. Streamed as raw NBT, so the test never holds the array.

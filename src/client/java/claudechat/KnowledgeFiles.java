@@ -15,6 +15,7 @@ import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -70,19 +71,52 @@ final class KnowledgeFiles {
 		Files.copy(from, to, StandardCopyOption.REPLACE_EXISTING);
 	}
 
+	/** Runs for each entry a walk meets, before the walk does anything else with it; throwing stops the walk. */
+	@FunctionalInterface
+	interface EntryCheck {
+		void entry() throws IOException;
+	}
+
+	/** Takes one regular file a walk found, with its attributes read without following links. */
+	@FunctionalInterface
+	interface FileAction {
+		void accept(Path file, BasicFileAttributes attributes) throws IOException;
+	}
+
 	/**
 	 * The regular files under {@code root}, without entering links (see {@link #isLink}): a link could lead anywhere,
 	 * and these files are copied into the knowledge base for Claude to read. Links skipped are logged, once per call.
+	 * Only for trees this mod trusts the size of; for someone else's files use {@link #walkRegularFiles}, which keeps
+	 * no list.
 	 */
 	static List<Path> regularFiles(Path root) throws IOException {
 		List<Path> files = new ArrayList<>();
-		List<Path> links = new ArrayList<>();
+		walkRegularFiles(root, Integer.MAX_VALUE, () -> {
+		}, (file, attributes) -> files.add(file));
+		return files;
+	}
 
-		Files.walkFileTree(root, new SimpleFileVisitor<>() {
+	/**
+	 * Hands the regular files under {@code root} to {@code action} one at a time, without entering links (see
+	 * {@link #isLink}) and without keeping a list, since the tree can be someone else's download holding any number of
+	 * files. {@code check} runs for every entry met (folders and links too) before anything else is done with it, so a
+	 * limit it enforces stops the walk at the first entry over it. Files may be at most {@code maxDepth} levels below
+	 * {@code root}; a folder that would hold deeper ones is refused rather than skipped. Links skipped are logged, once
+	 * per call.
+	 *
+	 * @throws TooLargeException if folders nest deeper than {@code maxDepth} allows
+	 */
+	static void walkRegularFiles(Path root, int maxDepth, EntryCheck check, FileAction action) throws IOException {
+		int[] links = {0};
+		Path[] firstLink = {null};
+
+		Files.walkFileTree(root, Set.of(), maxDepth, new SimpleFileVisitor<>() {
 			@Override
-			public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attributes) {
+			public FileVisitResult preVisitDirectory(Path dir, BasicFileAttributes attributes) throws IOException {
+				check.entry();
+
 				if (isLink(dir, attributes)) {
-					links.add(dir);
+					noteLink(dir);
 					return FileVisitResult.SKIP_SUBTREE;
 				}
 
@@ -90,22 +124,31 @@ final class KnowledgeFiles {
 			}
 
 			@Override
-			public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
+			public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
+				check.entry();
+
 				if (isLink(file, attributes)) {
-					links.add(file);
+					noteLink(file);
+				} else if (attributes.isDirectory()) {
+					// The walk hands over folders at maxDepth as files instead of entering them.
+					throw new TooLargeException(root.relativize(file) + " is more than " + maxDepth + " folders deep (the limit)");
 				} else if (attributes.isRegularFile()) {
-					files.add(file);
+					action.accept(file, attributes);
 				}
 
 				return FileVisitResult.CONTINUE;
 			}
+
+			private void noteLink(Path link) {
+				if (links[0]++ == 0) {
+					firstLink[0] = link;
+				}
+			}
 		});
 
-		if (!links.isEmpty()) {
-			ClaudeChatClient.LOGGER.info("Not following {} link(s) under {}, such as {}", links.size(), root, links.getFirst());
+		if (links[0] > 0) {
+			ClaudeChatClient.LOGGER.info("Not following {} link(s) under {}, such as {}", links[0], root, firstLink[0]);
 		}
-
-		return files;
 	}
 
 	/**

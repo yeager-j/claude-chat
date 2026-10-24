@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
+import java.util.concurrent.CancellationException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -139,7 +140,7 @@ class SchematicFormatsTest {
 	void folderListsUnreadableFilesWithTheReason() throws IOException {
 		SchematicFixtures.writeAll(dir);
 
-		List<Schematics.Entry> entries = new Schematics.Folder(dir).entries();
+		List<Schematics.Entry> entries = new Schematics.Folder(dir).entries().entries();
 
 		assertEquals(List.of("Redstone Test.litematic", "farms/Witch Farm.litematic", "farms/Witch Hut.schem", "old/Bomb.schem",
 			"old/Broken.litematic", "old/Old Spawner.nbt", "old/Sponge Two.schem"), entries.stream().map(Schematics.Entry::path).toList());
@@ -187,6 +188,27 @@ class SchematicFormatsTest {
 			() -> load("chests.litematic", SchematicFixtures.litematicWithBlockEntities(StructureNbt.MAX_BLOCK_ENTITIES + 1)));
 
 		assertTrue(e.getMessage().contains("block entities"), e.getMessage());
+	}
+
+	@Test
+	void regionsAreLimitedEvenWhenEmpty() throws IOException {
+		Schematics.Schematic ok = load("ok.litematic", SchematicFixtures.litematicWithEmptyRegions(LitematicaFormat.MAX_REGIONS - 1));
+		assertEquals(Blocks.STONE, ok.volume().state(0, 0, 0).getBlock());
+
+		TooLargeException e = assertThrows(TooLargeException.class,
+			() -> load("many.litematic", SchematicFixtures.litematicWithEmptyRegions(LitematicaFormat.MAX_REGIONS)));
+		assertTrue(e.getMessage().contains("1025 regions (the limit is 1024)"), e.getMessage());
+	}
+
+	@Test
+	void interruptedLitematicaReadStopsBetweenRegions() {
+		CompoundTag root = SchematicFixtures.litematicWithEmptyRegions(10);
+		Thread.currentThread().interrupt();
+		try {
+			assertThrows(CancellationException.class, () -> new LitematicaFormat().read(root, "interrupted"));
+		} finally {
+			Thread.interrupted();
+		}
 	}
 
 	@Test

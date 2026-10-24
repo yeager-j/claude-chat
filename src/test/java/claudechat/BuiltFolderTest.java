@@ -97,6 +97,19 @@ class BuiltFolderTest {
 	}
 
 	@Test
+	void aFailedBuildDeletesWhatItCopied() {
+		BuiltFolder folder = new BuiltFolder(root, "pack", "v1");
+
+		folder.locked(() -> assertThrows(TooLargeException.class, () -> folder.build(Content.DATA, (out, work) -> {
+			Files.writeString(out.resolve("copied.json"), "{}");
+			throw new TooLargeException("over 512 MiB uncompressed in the pack (the limit)");
+		})));
+
+		assertEquals(Progress.FAILED, folder.progress());
+		assertFalse(Files.exists(root.resolve("pack.partial")));
+	}
+
+	@Test
 	void buildingWithoutTheLockIsRefused() {
 		BuiltFolder folder = new BuiltFolder(root, "pack", "v1");
 

@@ -7,16 +7,18 @@ import net.minecraft.server.permissions.PermissionSet;
 /**
  * The permissions one question runs with, captured from the settings when it's asked. Its Claude Code flags, its
  * system prompt and every game command it runs follow this, so changing {@code /claude permissions} or
- * {@code /claude cheats} mid-question only affects the next one.
+ * {@code /claude cheats} or {@code /claude web} mid-question only affects the next one.
  * <p>
  * The tier decides <em>whether</em> a game command may change the world; cheats only decide the permission level it
- * runs at. Commands always run as the player who owns the world.
+ * runs at. Commands always run as the player who owns the world. Web access is separate from the tier too: a player
+ * can let Claude edit files without letting it reach the web.
  *
  * @param cheats whether game commands run at command block level at least, even where the player can't cheat
+ * @param web    whether Claude is offered web search and page fetches
  */
-public record Policy(PermissionTier tier, boolean cheats) {
+public record Policy(PermissionTier tier, boolean cheats, boolean web) {
 	public static Policy of(ClaudeConfig config) {
-		return new Policy(config.permissions, config.cheats);
+		return new Policy(config.permissions, config.cheats, config.web);
 	}
 
 	/** What run_command does with a command: one that only reads always runs, in every tier. */

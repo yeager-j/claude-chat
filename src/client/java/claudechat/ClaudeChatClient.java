@@ -49,6 +49,8 @@ public class ClaudeChatClient implements ClientModInitializer {
 		2. Nearest end city: `1240 ~ -3380` [[waypoint:End City|1240 ~ -3380|the_end]]
 		[[recipe:minecraft:torch]]
 		""";
+	/** What /claude web off doesn't stop: Full access's shell commands aren't web tools. */
+	private static final String WEB_IN_FULL = "with Full access, shell commands can still reach the network";
 
 	private static ClaudeConfig config;
 	private static ClaudeCli cli;
@@ -161,6 +163,19 @@ public class ClaudeChatClient implements ClientModInitializer {
 				}))
 				.then(ClientCommands.literal("off").executes(ctx -> {
 					setCheats(false);
+					return 1;
+				})))
+			.then(ClientCommands.literal("web")
+				.executes(ctx -> {
+					showPermissions();
+					return 1;
+				})
+				.then(ClientCommands.literal("on").executes(ctx -> {
+					setWeb(true);
+					return 1;
+				}))
+				.then(ClientCommands.literal("off").executes(ctx -> {
+					setWeb(false);
 					return 1;
 				})))
 			// Target of ChatActions buttons; not meant to be typed.
@@ -372,11 +387,13 @@ public class ClaudeChatClient implements ClientModInitializer {
 	}
 
 	private static void showPermissions() {
-		ChatOutput.info("Permissions: " + config.permissions.label + ". Cheats: " + (config.cheats ? "on" : "off") + ".");
+		ChatOutput.info("Permissions: " + config.permissions.label + ". Cheats: " + (config.cheats ? "on" : "off")
+			+ ". Web: " + (config.web ? "on" : "off") + ".");
 		String tiers = Stream.of(PermissionTier.values()).map(tier -> tier.id + " (" + tier.summary + ")")
 			.collect(Collectors.joining(", "));
 		ChatOutput.info("/claude permissions <" + String.join("|", PermissionTier.ids()) + ">: " + tiers + "."
 			+ " /claude cheats <on|off>: whether Claude's game commands may cheat where you can't."
+			+ " /claude web <on|off>: whether Claude may search the web and fetch pages, in every tier (" + WEB_IN_FULL + ")."
 			+ " Changes apply from your next question.");
 	}
 
@@ -417,6 +434,30 @@ public class ClaudeChatClient implements ClientModInitializer {
 				+ " worlds where you can't. The world list will still show cheats off. ").withStyle(ChatFormatting.YELLOW))
 			.append(ChatActions.button("Turn on cheats", ChatFormatting.RED,
 				Component.literal("Claude's game commands run at command block level"), apply))));
+	}
+
+	/** Web on needs a confirm click, like cheats: it's how what Claude knows could leave the machine. */
+	private static void setWeb(boolean on) {
+		if (on == config.web) {
+			ChatOutput.info("Web access is already " + (on ? "on" : "off") + ".");
+			return;
+		}
+		Runnable apply = () -> {
+			config.web = on;
+			config.save();
+			ChatOutput.info("Web access " + (on ? "on: Claude can search the web and fetch pages."
+				: "off: Claude answers without web search or pages (" + WEB_IN_FULL + ")."));
+		};
+		if (!on) {
+			apply.run();
+			return;
+		}
+		ChatOutput.send(ChatOutput.line(Component.empty()
+			.append(Component.literal("With web access on, Claude can search the web and open any page without asking."
+				+ " Text it reads (signs, mod files, web pages) could try to get it to send your question, game details or"
+				+ " world data to a site. ").withStyle(ChatFormatting.YELLOW))
+			.append(ChatActions.button("Turn on web access", ChatFormatting.RED,
+				Component.literal("Claude may search the web and fetch pages"), apply))));
 	}
 
 	private static List<String> effortIds() {

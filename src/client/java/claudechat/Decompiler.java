@@ -16,15 +16,34 @@ import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Decompiles mod and game code with Vineflower, in its own JVM so a big decompile can't run the game out of memory.
  * Several decompiles may run at once (the first-launch Minecraft build and a mod a question names): they share only
  * the Vineflower jar, which is written once per session, and keep their other files in their own work folders.
+ * <p>
+ * Each decompiler JVM may take a 3 GiB heap and four threads, so at most {@link #MAX_RUNNING} run at once, whoever
+ * asks; the rest wait their turn. A decompiler never outlives the call that started it: a timeout, an interrupt (a
+ * cancelled question, a revoked token) or any other failure kills it, and anything it started, before the call
+ * returns, so the source's build lock isn't released while it still writes. Leaving the game kills any still running.
  */
 final class Decompiler {
 	private static final int TIMEOUT_MINUTES = 30;
+	/** Decompiler JVMs at once, across every source and question: two 3 GiB heaps at most. */
+	static final int MAX_RUNNING = 2;
+	/** How long a killed decompiler gets to exit before the call gives up waiting (it has been force-killed already). */
+	private static final int STOP_SECONDS = 10;
+
+	/** Fair, so a question's decompile isn't overtaken indefinitely. */
+	private static final Semaphore SLOTS = new Semaphore(MAX_RUNNING, true);
+	private static final Set<Process> RUNNING = ConcurrentHashMap.newKeySet();
+
+	static {
+		Runtime.getRuntime().addShutdownHook(new Thread(() -> RUNNING.forEach(Decompiler::stop), "Claude Chat decompiler cleanup"));
+	}
 
 	private final Path jar;
 	private boolean jarWritten;
@@ -56,19 +75,71 @@ final class Decompiler {
 		}
 	}
 
-	private static void run(List<String> command, Path log, Path input) throws IOException, InterruptedException {
-		Process process = new ProcessBuilder(command)
-			.redirectErrorStream(true)
-			.redirectOutput(Redirect.appendTo(log.toFile()))
-			.start();
+	/**
+	 * Runs one decompiler process to the end, once one of the {@link #MAX_RUNNING} slots is free. However this returns,
+	 * the process and its descendants are gone by then; an interrupt is kept for the caller.
+	 */
+	static void run(List<String> command, Path log, Path input) throws IOException, InterruptedException {
+		SLOTS.acquire();
 
-		if (!process.waitFor(TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
-			process.destroyForcibly();
-			throw new IOException("decompiling " + input.getFileName() + " took over " + TIMEOUT_MINUTES + " minutes");
+		try {
+			Process process = new ProcessBuilder(command)
+				.redirectErrorStream(true)
+				.redirectOutput(Redirect.appendTo(log.toFile()))
+				.start();
+			RUNNING.add(process);
+
+			try {
+				if (!process.waitFor(TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
+					throw new IOException("decompiling " + input.getFileName() + " took over " + TIMEOUT_MINUTES + " minutes");
+				}
+
+				if (process.exitValue() != 0) {
+					throw new IOException("decompiler exited with code " + process.exitValue() + " (see " + log + ")");
+				}
+			} finally {
+				// Nothing to do after a normal exit; on a timeout, an interrupt or any other exception it's still running.
+				stop(process);
+				RUNNING.remove(process);
+			}
+		} finally {
+			SLOTS.release();
 		}
+	}
 
-		if (process.exitValue() != 0) {
-			throw new IOException("decompiler exited with code " + process.exitValue() + " (see " + log + ")");
+	/**
+	 * Kills a process and everything it started, then waits (briefly, ignoring interrupts) for the process to exit, so
+	 * its files are no longer being written. The caller's interrupt status is kept.
+	 */
+	static void stop(Process process) {
+		// Descendants first: once the process is gone, they no longer count as its descendants.
+		List<ProcessHandle> descendants = process.descendants().toList();
+		descendants.forEach(ProcessHandle::destroyForcibly);
+		process.destroyForcibly();
+
+		boolean interrupted = false;
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(STOP_SECONDS);
+
+		try {
+			while (true) {
+				long remaining = deadline - System.nanoTime();
+
+				try {
+					if (process.waitFor(Math.max(0, remaining), TimeUnit.NANOSECONDS) || remaining <= 0) {
+						break;
+					}
+				} catch (InterruptedException e) {
+					interrupted = true;
+				}
+			}
+
+			if (process.isAlive() || descendants.stream().anyMatch(ProcessHandle::isAlive)) {
+				ClaudeChatClient.LOGGER.warn("A decompiler process (pid {}) was killed but hasn't exited yet", process.pid());
+			}
+		} finally {
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
 		}
 	}
 

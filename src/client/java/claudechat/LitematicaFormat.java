@@ -9,8 +9,11 @@ import net.minecraft.world.level.block.state.BlockState;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.OptionalLong;
+import java.util.concurrent.CancellationException;
 
 /**
  * Litematica's .litematic. Regions each have a position and a size that may be negative (the region extends from the
@@ -18,6 +21,12 @@ import java.util.OptionalLong;
  * Block states are a palette plus indices packed into longs; unlike chunk sections, an index may span two longs.
  */
 final class LitematicaFormat implements Schematics.Format {
+	/**
+	 * Regions a file may have. Litematica saves one per selection box, so real files have a handful; each region is
+	 * copied and walked even when it is empty, so their number is a limit of its own.
+	 */
+	static final int MAX_REGIONS = 1024;
+
 	/** A region's box within the schematic, before the schematic is shifted to start at 0 0 0. */
 	private record Bounds(String name, BlockPos min, Vec3i size, CompoundTag tag) {
 		BlockPos max() {
@@ -52,17 +61,17 @@ final class LitematicaFormat implements Schematics.Format {
 		BlockVolume.Builder volume = new BlockVolume.Builder(size);
 		List<Schematics.Region> regions = new ArrayList<>();
 		for (Bounds region : bounds) {
-			BlockPos offset = region.min().subtract(min);
-			regions.add(new Schematics.Region(region.name(), offset, region.size()));
-			readRegion(region, offset, dataVersion, volume);
+			regions.add(new Schematics.Region(region.name(), region.min().subtract(min), region.size()));
 		}
+		readRegions(bounds, min, dataVersion, volume);
 
 		Schematics.Info described = info(root, fileStem);
 		Schematics.Info info = new Schematics.Info(described.name(), described.author(), described.description(), size, described.recordedBlocks());
 		return new Schematics.Schematic(info, regions, volume.build());
 	}
 
-	private static List<Bounds> bounds(CompoundTag regions) {
+	private static List<Bounds> bounds(CompoundTag regions) throws TooLargeException {
+		TooLargeException.requireAtMost(regions.size(), MAX_REGIONS, "regions");
 		List<Bounds> bounds = new ArrayList<>();
 		for (String name : regions.keySet()) {
 			CompoundTag region = regions.getCompoundOrEmpty(name);
@@ -102,39 +111,78 @@ final class LitematicaFormat implements Schematics.Format {
 		TooLargeException.requireAtMost(entities, StructureNbt.MAX_ENTITIES, "entities");
 	}
 
-	/** Adds one region's blocks, block entities and entities to the volume, at {@code offset}. */
-	private static void readRegion(Bounds region, BlockPos offset, int dataVersion, BlockVolume.Builder into) throws IOException {
-		CompoundTag tag = region.tag();
-		ListTag rawPalette = tag.getListOrEmpty("BlockStatePalette");
-		PackedIndices indices = new PackedIndices(region.name(), tag.getLongArray("BlockStates").orElse(new long[0]), rawPalette.size(),
-			(long) region.size().getX() * region.size().getY() * region.size().getZ());
-
-		// Block entities are stored by position within the region; entities by position, with their full data.
+	/**
+	 * Adds every region's blocks, block entities and entities to the volume. The fixers run once for the whole file, not
+	 * once per region: the regions' palettes go in as one (each distinct state once), and block entities and entities
+	 * go in at their place in the schematic.
+	 */
+	private static void readRegions(List<Bounds> bounds, BlockPos min, int dataVersion, BlockVolume.Builder into) throws IOException {
+		ListTag palette = new ListTag();
+		Map<CompoundTag, Integer> paletteIndex = new HashMap<>();
+		List<int[]> regionPalettes = new ArrayList<>();
 		ListTag blockEntities = new ListTag();
-		tag.getListOrEmpty("TileEntities").compoundStream().forEach(be -> blockEntities.add(
-			StructureNbt.blockEntityEntry(new BlockPos(be.getIntOr("x", 0), be.getIntOr("y", 0), be.getIntOr("z", 0)), be.copy())));
 		ListTag entities = new ListTag();
-		tag.getListOrEmpty("Entities").compoundStream().forEach(e -> {
-			ListTag pos = e.getListOrEmpty("Pos");
-			entities.add(StructureNbt.entityEntry(pos.getDoubleOr(0, 0), pos.getDoubleOr(1, 0), pos.getDoubleOr(2, 0), e.copy()));
-		});
-		StructureNbt.Contents upgraded = StructureNbt.upgradeParts(rawPalette.copy(), blockEntities, entities, dataVersion);
-		List<BlockState> palette = upgraded.palettes().getFirst();
 
-		int sx = region.size().getX();
-		int sz = region.size().getZ();
-		for (long i = 0; i < indices.count(); i++) {
-			int x = (int) (i % sx);
-			int z = (int) ((i / sx) % sz);
-			int y = (int) (i / ((long) sx * sz));
-			into.set(offset.getX() + x, offset.getY() + y, offset.getZ() + z, palette.get(indices.get(i)));
+		for (Bounds region : bounds) {
+			requireNotInterrupted();
+			CompoundTag tag = region.tag();
+			BlockPos offset = region.min().subtract(min);
+			ListTag rawPalette = tag.getListOrEmpty("BlockStatePalette");
+			int[] toShared = new int[rawPalette.size()];
+			for (int i = 0; i < toShared.length; i++) {
+				CompoundTag state = rawPalette.getCompoundOrEmpty(i);
+				Integer shared = paletteIndex.get(state);
+				if (shared == null) {
+					shared = palette.size();
+					TooLargeException.requireAtMost(shared + 1L, BlockVolume.MAX_STATES, "different block states in its regions");
+					paletteIndex.put(state, shared);
+					palette.add(state.copy());
+				}
+				toShared[i] = shared;
+			}
+			regionPalettes.add(toShared);
+
+			// Block entities are stored by position within the region; entities by position, with their full data.
+			tag.getListOrEmpty("TileEntities").compoundStream().forEach(be -> blockEntities.add(StructureNbt.blockEntityEntry(
+				new BlockPos(be.getIntOr("x", 0), be.getIntOr("y", 0), be.getIntOr("z", 0)).offset(offset), be.copy())));
+			tag.getListOrEmpty("Entities").compoundStream().forEach(e -> {
+				ListTag pos = e.getListOrEmpty("Pos");
+				entities.add(StructureNbt.entityEntry(pos.getDoubleOr(0, 0) + offset.getX(), pos.getDoubleOr(1, 0) + offset.getY(),
+					pos.getDoubleOr(2, 0) + offset.getZ(), e.copy()));
+			});
+		}
+
+		StructureNbt.Contents upgraded = StructureNbt.upgradeParts(palette, blockEntities, entities, dataVersion);
+		List<BlockState> states = upgraded.palettes().getFirst();
+
+		for (int r = 0; r < bounds.size(); r++) {
+			requireNotInterrupted();
+			Bounds region = bounds.get(r);
+			int[] toShared = regionPalettes.get(r);
+			BlockPos offset = region.min().subtract(min);
+			PackedIndices indices = new PackedIndices(region.name(), region.tag().getLongArray("BlockStates").orElse(new long[0]), toShared.length,
+				(long) region.size().getX() * region.size().getY() * region.size().getZ());
+			int sx = region.size().getX();
+			int sz = region.size().getZ();
+			for (long i = 0; i < indices.count(); i++) {
+				int x = (int) (i % sx);
+				int z = (int) ((i / sx) % sz);
+				int y = (int) (i / ((long) sx * sz));
+				into.set(offset.getX() + x, offset.getY() + y, offset.getZ() + z, states.get(toShared[indices.get(i)]));
+			}
 		}
 
 		for (StructureNbt.Entry be : upgraded.blocks()) {
-			into.blockEntity(be.pos().offset(offset), be.nbt());
+			into.blockEntity(be.pos(), be.nbt());
 		}
 
-		upgraded.entities().forEach(e -> into.entity(e.pos().offset(offset), e.type()));
+		upgraded.entities().forEach(e -> into.entity(e.pos(), e.type()));
+	}
+
+	private static void requireNotInterrupted() {
+		if (Thread.currentThread().isInterrupted()) {
+			throw new CancellationException("Reading the schematic was cancelled");
+		}
 	}
 
 	/** Litematica's bit array: entry i occupies bits [i*bits, (i+1)*bits), possibly across two longs. */

@@ -24,6 +24,8 @@ import java.util.Locale;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ChatMarkupTest {
 	private static Identifier mc(String path) {
@@ -51,6 +53,14 @@ class ChatMarkupTest {
 	void recipeAloneOnItsLineIsAGridWithANormalizedId() {
 		assertEquals(List.of(new RecipeGrid(mc("crafter")), new RecipeGrid(Identifier.fromNamespaceAndPath("create", "cogwheel"))),
 			ChatMarkup.parse("  [[recipe:Crafter]]  \n[[recipe:create:cogwheel]]"));
+	}
+
+	@Test
+	void onlyARecipeTokenNeedsTheRecipes() {
+		assertFalse(ChatMarkup.usesRecipes(ChatMarkup.parse("# Pistons\n- Use [[iron_ingot]] and `/give`\n**bold** [link](https://x.y)")));
+		assertTrue(ChatMarkup.usesRecipes(ChatMarkup.parse("[[recipe:piston]]")));
+		assertTrue(ChatMarkup.usesRecipes(ChatMarkup.parse("1. Make **a [[recipe:piston]] first**")));
+		assertTrue(ChatMarkup.usesRecipes(ChatMarkup.parse("[see [[recipe:piston]]](https://x.y)")));
 	}
 
 	@Test

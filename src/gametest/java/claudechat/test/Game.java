@@ -57,7 +57,7 @@ final class Game {
 	final TestOptions options;
 	/** Shared with the fake claude. */
 	final Path fake;
-	/** The test's own MCP access: Read only, cheats off, for calls that don't depend on a question's permissions. */
+	/** The test's own MCP access: Read only, cheats and web off, for calls that don't depend on a question's permissions. */
 	private final McpClient mcp;
 	private TestSingleplayerContext world;
 	/** Numbers held questions, which must be unique within a world. */
@@ -69,7 +69,7 @@ final class Game {
 		this.fake = FakeClaude.folder(FabricLoader.getInstance().getGameDir());
 		// The one test hook left in the mod: MCP access without a question, for calls with no world open (no chat to
 		// ask in) and for steps whose tool calls outlast any question timeout short enough to test.
-		Tool.Context readOnly = new Tool.Context(new Policy(PermissionTier.READ_ONLY, false), new Approvals(note -> { }));
+		Tool.Context readOnly = new Tool.Context(new Policy(PermissionTier.READ_ONLY, false, false), new Approvals(note -> { }));
 		this.mcp = McpClient.fromClaudeConfig(ClaudeChatClient.mcp().grant(readOnly).claudeConfig());
 	}
 
@@ -201,6 +201,12 @@ final class Game {
 			"Cheats " + (on ? "on:" : "off:"), "Cheats are already " + (on ? "on" : "off") + ".");
 	}
 
+	/** /claude web, clicking the confirm button turning it on needs; waits for the mod to confirm. */
+	void setWeb(boolean on) {
+		changeSetting("/claude web " + (on ? "on" : "off"), on ? Optional.of("Turn on web access") : Optional.empty(),
+			"Web access " + (on ? "on:" : "off:"), "Web access is already " + (on ? "on" : "off") + ".");
+	}
+
 	/** Client commands run as they're sent, so whether the setting was already so is in chat right after. */
 	private void changeSetting(String command, Optional<String> confirmButton, String changed, String unchanged) {
 		long changedBefore = context.computeOnClient(mc -> ChatHistory.count(mc, changed));
@@ -315,6 +321,15 @@ final class Game {
 	String systemPrompt() {
 		try {
 			return FakeClaude.systemPrompt(fake);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
+	/** The working directory the last question started in. */
+	Path claudeWorkingDirectory() {
+		try {
+			return FakeClaude.workingDirectory(fake);
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		}

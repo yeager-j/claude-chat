@@ -102,6 +102,11 @@ public class ClaudeConfig {
 	 * allows. A question captures it when asked.
 	 */
 	public boolean cheats = false;
+	/**
+	 * Whether Claude may search the web and fetch pages, whatever the permissions tier. Off by default: web access is a
+	 * way for what Claude knows to leave the machine. Turning it on takes a confirm click. A question captures it when asked.
+	 */
+	public boolean web = false;
 
 	private static final String VERSION_KEY = "configVersion";
 
@@ -117,6 +122,8 @@ public class ClaudeConfig {
 			}
 		},
 		// Version 2 added permissions and cheats. Missing means their defaults (read only, off), so nothing to change.
+		props -> { },
+		// Version 3 added web, which had been on in every tier. Missing means off, so upgrading turns web access off.
 		props -> { });
 	static final int CURRENT_VERSION = MIGRATIONS.size();
 
@@ -136,7 +143,8 @@ public class ClaudeConfig {
 			(c, v) -> replaceAll(c.knowledgeExclude, v)),
 		// A missing or unknown tier is read only, so nobody gets more access by accident.
 		new Setting<>("permissions", PermissionTier::parse, p -> p.id, c -> c.permissions, (c, v) -> c.permissions = v),
-		new Setting<>("cheats", ClaudeConfig::bool, String::valueOf, c -> c.cheats, (c, v) -> c.cheats = v));
+		new Setting<>("cheats", ClaudeConfig::bool, String::valueOf, c -> c.cheats, (c, v) -> c.cheats = v),
+		new Setting<>("web", ClaudeConfig::bool, String::valueOf, c -> c.web, (c, v) -> c.web = v));
 
 	/** The file as loaded and migrated, including keys this version doesn't know. */
 	private Properties stored = new Properties();
@@ -274,7 +282,7 @@ public class ClaudeConfig {
 		String tiers = String.join(", ", PermissionTier.ids());
 		return "Claude Chat settings. claudePath empty = auto-detect. model: " + String.join(", ", MODEL_SUGGESTIONS)
 			+ ", or a full model ID. effort: " + efforts + ", or empty for the default. permissions: " + tiers + "."
-			+ " cheats: true lets Claude run cheat commands even where you can't.";
+			+ " cheats: true lets Claude run cheat commands even where you can't. web: true lets Claude search the web and fetch pages.";
 	}
 
 	// --- Parsers: the value, or empty if the text isn't valid ----------------------------------------------------

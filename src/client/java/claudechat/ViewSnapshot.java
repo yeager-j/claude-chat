@@ -46,8 +46,11 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 /**
@@ -74,7 +77,7 @@ import java.util.stream.Collectors;
  * </ul>
  * Carved out on purpose: mob health (the game sends it to every client, and HUD mods show it), entity names (shown when
  * the player looks at the entity), and the HUD and open screens, which cover part of the screenshot but not the data.
- * Runs on the client thread.
+ * Runs on the client thread, checking between rays and entities whether the tool call has stopped waiting for it.
  */
 public final class ViewSnapshot {
 	public static final String TOOL = "look";
@@ -85,6 +88,13 @@ public final class ViewSnapshot {
 	private static final int MAX_IMAGE_WIDTH = 1280;
 	private static final int MAX_DETAILS = 20;
 	private static final int MAX_ENTITIES = 50;
+	/**
+	 * Entities checked for line of sight, nearest first: the server decides how many the client renders, so this caps
+	 * the light and ray work per entity, not just the list.
+	 */
+	private static final int MAX_SIGHT_CANDIDATES = 256;
+	/** How long the tool waits for the client thread; past it, the capture is stopped. */
+	private static final int TIMEOUT_SECONDS = 20;
 	/** Positions kept per kind of block, to bound memory on wide views; past it, counts read "4096+". */
 	private static final int MAX_POSITIONS = 4096;
 	/** A kind of block seen at this many positions or fewer lists them; more get a count and a bounding box. */
@@ -127,15 +137,28 @@ public final class ViewSnapshot {
 	private static Tool.Result look(int requestedRange, boolean screenshot) throws Exception {
 		Minecraft mc = Minecraft.getInstance();
 		CompletableFuture<byte[]> png = new CompletableFuture<>();
+		AtomicBoolean stop = new AtomicBoolean();
 
-		JsonObject data = mc.submit(() -> {
-			JsonObject out = capture(mc, requestedRange);
+		CompletableFuture<JsonObject> task = mc.submit(() -> {
+			JsonObject out = capture(mc, requestedRange, stop);
 			if (screenshot) {
 				out.add("screenshot", startScreenshot(mc, png));
 			}
 
 			return out;
-		}).get(20, TimeUnit.SECONDS);
+		});
+		JsonObject data;
+		try {
+			data = task.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+		} catch (TimeoutException | InterruptedException e) {
+			// Nobody will read the capture: stop it if it's running, and keep it from starting if it isn't yet.
+			stop.set(true);
+			task.cancel(false);
+			if (e instanceof InterruptedException) {
+				throw e;
+			}
+			throw new IllegalStateException("look didn't finish within " + TIMEOUT_SECONDS + " s; the game may be busy.");
+		}
 
 		if (!screenshot) {
 			return Tool.Result.of(data);
@@ -190,7 +213,14 @@ public final class ViewSnapshot {
 
 	// --- the snapshot ---------------------------------------------------------------------------------------------
 
-	private static JsonObject capture(Minecraft mc, int requestedRange) {
+	/** Throws {@link CancellationException} once {@code stop} is set: the tool call stopped waiting. */
+	private static void checkStop(AtomicBoolean stop) {
+		if (stop.get()) {
+			throw new CancellationException("look was stopped.");
+		}
+	}
+
+	private static JsonObject capture(Minecraft mc, int requestedRange, AtomicBoolean stop) {
 		long start = System.nanoTime();
 		ClientLevel level = mc.level;
 		if (level == null || mc.player == null) {
@@ -204,7 +234,7 @@ public final class ViewSnapshot {
 		BlockSurfaces surfaces = new BlockSurfaces(mc, level, frame.eye(), state.optionsRenderState.cutoutLeaves);
 		SightTracer tracer = new SightTracer(level, surfaces, nightVision);
 		boolean firstPerson = state.optionsRenderState.cameraType.isFirstPerson();
-		Scan scan = scan(tracer, frame, range);
+		Scan scan = scan(tracer, frame, range, stop);
 
 		JsonObject out = new JsonObject();
 		out.add("camera", cameraJson(mc, level, frame, firstPerson, range, requestedRange));
@@ -219,7 +249,7 @@ public final class ViewSnapshot {
 			out.add("block_details", signs);
 		}
 
-		addEntities(out, visibleEntities(mc, level, frame, tracer, range, firstPerson));
+		addEntities(out, visibleEntities(mc, level, frame, tracer, range, firstPerson, stop));
 		out.addProperty("rays", scan.rays);
 		out.addProperty("ms", (System.nanoTime() - start) / 1_000_000);
 		return out;
@@ -292,7 +322,7 @@ public final class ViewSnapshot {
 	}
 
 	/** One ray per grid cell, then 3×3 more in cells on an edge. */
-	private static Scan scan(SightTracer tracer, ViewFrame frame, double range) {
+	private static Scan scan(SightTracer tracer, ViewFrame frame, double range, AtomicBoolean stop) {
 		int columns = COLUMNS;
 		int rows = Math.max(9, (int) Math.round(columns / frame.aspect()));
 		Sample[][] grid = new Sample[rows][columns];
@@ -300,6 +330,7 @@ public final class ViewSnapshot {
 		scan.cells = rows * columns;
 
 		for (int r = 0; r < rows; r++) {
+			checkStop(stop);
 			for (int c = 0; c < columns; c++) {
 				grid[r][c] = trace(tracer, frame, cellPoint(r, c, rows, columns, 0, 0), range);
 				scan.rays++;
@@ -308,6 +339,7 @@ public final class ViewSnapshot {
 
 		// Edges between different things, or distance jumps, get 3×3 samples; flat areas count their one ray for the cell.
 		for (int r = 0; r < rows; r++) {
+			checkStop(stop);
 			for (int c = 0; c < columns; c++) {
 				if (!isEdge(grid, r, c)) {
 					scan.record(grid[r][c], cellPoint(r, c, rows, columns, 0, 0), 1);
@@ -591,55 +623,78 @@ public final class ViewSnapshot {
 		}
 	}
 
-	/** Entities in view, lit, and with a line of sight to some part of them, nearest first. */
-	private static List<JsonObject> visibleEntities(Minecraft mc, ClientLevel level, ViewFrame frame, SightTracer tracer,
-		double range, boolean firstPerson) {
+	/** The entities listed, and how many more in view were left unchecked. */
+	private record Entities(List<JsonObject> visible, int unchecked) {
+	}
+
+	/**
+	 * Entities in view, lit, and with a line of sight to some part of them, nearest first. Only the nearest
+	 * {@link #MAX_SIGHT_CANDIDATES} in range and on screen are checked, and checking stops once {@link #MAX_ENTITIES}
+	 * are found, since no more are listed.
+	 */
+	private static Entities visibleEntities(Minecraft mc, ClientLevel level, ViewFrame frame, SightTracer tracer,
+		double range, boolean firstPerson, AtomicBoolean stop) {
 		Entity self = mc.getCameraEntity();
 		Vec3 eye = frame.eye();
-		Map<Entity, Integer> visible = new HashMap<>();
+		Comparator<Entity> nearestFirst = Comparator.comparingDouble((Entity e) -> e.getBoundingBox().getCenter().distanceToSqr(eye))
+			.thenComparingInt(Entity::getId);
+		NearestFirst.Closest<Entity> candidates = NearestFirst.closest(level.entitiesForRendering(),
+			entity -> !(entity == self && firstPerson) && !entity.isInvisibleTo(mc.player)
+				&& entity.getBoundingBox().getCenter().distanceTo(eye) <= range && onScreen(entity, frame),
+			nearestFirst, MAX_SIGHT_CANDIDATES, stop::get);
 
-		for (Entity entity : level.entitiesForRendering()) {
-			if ((entity == self && firstPerson) || entity.isInvisibleTo(mc.player)) {
-				continue;
+		List<JsonObject> out = new ArrayList<>();
+		int checked = 0;
+		for (Entity entity : candidates.items()) {
+			if (out.size() >= MAX_ENTITIES) {
+				break;
 			}
 
-			if (entity.getBoundingBox().getCenter().distanceTo(eye) > range || !lit(mc, level, tracer, entity)) {
+			checkStop(stop);
+			checked++;
+			if (!lit(mc, level, tracer, entity)) {
 				continue;
 			}
 
 			int points = visiblePoints(entity, frame, tracer);
 			if (points > 0) {
-				visible.put(entity, points);
+				JsonObject o = entityJson(mc, entity, frame);
+				o.addProperty("visible", points == SIGHT_POINTS ? "fully" : "partly");
+				out.add(o);
 			}
 		}
 
-		Comparator<Entity> nearestFirst = Comparator.comparingDouble((Entity e) -> e.getBoundingBox().getCenter().distanceToSqr(eye))
-			.thenComparingInt(Entity::getId);
-		List<JsonObject> out = new ArrayList<>();
-		for (Entity entity : visible.keySet().stream().sorted(nearestFirst).toList()) {
-			JsonObject o = entityJson(mc, entity, frame);
-			o.addProperty("visible", visible.get(entity) == SIGHT_POINTS ? "fully" : "partly");
-			out.add(o);
-		}
-
-		return out;
+		return new Entities(out, candidates.items().size() - checked + candidates.more());
 	}
 
-	/**
-	 * How many of the middle, top, bottom and four side points of the entity's box ({@link #SIGHT_POINTS}) are in the
-	 * image with nothing opaque between them and the camera.
-	 */
-	private static int visiblePoints(Entity entity, ViewFrame frame, SightTracer tracer) {
+	/** The middle, top, bottom and four side points of the entity's box ({@link #SIGHT_POINTS}). */
+	private static Vec3[] sightPoints(Entity entity) {
 		AABB box = entity.getBoundingBox();
 		Vec3 c = box.getCenter();
 		double dx = box.getXsize() * 0.35;
 		double dz = box.getZsize() * 0.35;
-		Vec3[] points = {c, new Vec3(c.x, box.maxY - 0.05, c.z), new Vec3(c.x, box.minY + 0.05, c.z),
+		return new Vec3[] {c, new Vec3(c.x, box.maxY - 0.05, c.z), new Vec3(c.x, box.minY + 0.05, c.z),
 			new Vec3(c.x + dx, c.y, c.z + dz), new Vec3(c.x - dx, c.y, c.z - dz), new Vec3(c.x + dx, c.y, c.z - dz),
 			new Vec3(c.x - dx, c.y, c.z + dz)};
+	}
+
+	/** Whether any of the entity's sight points is in the image: the cheap check before line of sight. */
+	private static boolean onScreen(Entity entity, ViewFrame frame) {
+		for (Vec3 point : sightPoints(entity)) {
+			ScreenPoint screen = frame.project(point);
+			if (screen != null && screen.onScreen()) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	/** How many of the entity's {@link #sightPoints} are in the image with nothing opaque between them and the camera. */
+	private static int visiblePoints(Entity entity, ViewFrame frame, SightTracer tracer) {
 		int seen = 0;
 
-		for (Vec3 point : points) {
+		for (Vec3 point : sightPoints(entity)) {
 			ScreenPoint screen = frame.project(point);
 			if (screen == null || !screen.onScreen()) {
 				continue;
@@ -664,13 +719,13 @@ public final class ViewSnapshot {
 		return tracer.bright(light);
 	}
 
-	/** "entities", nearest first, and a note on the farther ones past {@link #MAX_ENTITIES}. */
-	private static void addEntities(JsonObject out, List<JsonObject> visible) {
+	/** "entities", nearest first, and a note on the farther ones in view that weren't checked. */
+	private static void addEntities(JsonObject out, Entities found) {
 		JsonArray entities = new JsonArray();
-		visible.stream().limit(MAX_ENTITIES).forEach(entities::add);
+		found.visible().forEach(entities::add);
 		out.add("entities", entities);
-		if (visible.size() > MAX_ENTITIES) {
-			ToolFormat.noteMore(out, visible.size() - MAX_ENTITIES + " farther entities.");
+		if (found.unchecked() > 0) {
+			ToolFormat.noteMore(out, found.unchecked() + " farther entities in range and on screen, not checked for line of sight.");
 		}
 	}
 

@@ -159,6 +159,27 @@ public final class ChatMarkup {
 		return lines;
 	}
 
+	/** Whether any of the lines draws a recipe, as a grid or by name: only then are the game's recipes needed. */
+	public static boolean usesRecipes(List<Line> lines) {
+		return lines.stream().anyMatch(line -> switch (line) {
+			case RecipeGrid _ -> true;
+			case Heading(var text) -> usesRecipe(text);
+			case Bullet(_, var text) -> usesRecipe(text);
+			case Numbered(_, _, var text) -> usesRecipe(text);
+			case Paragraph(var text) -> usesRecipe(text);
+			case CodeLine _ -> false;
+		});
+	}
+
+	private static boolean usesRecipe(List<Inline> parts) {
+		return parts.stream().anyMatch(part -> switch (part) {
+			case RecipeResult _ -> true;
+			case Emphasis(_, var content) -> usesRecipe(content);
+			case Link(var label, _) -> usesRecipe(label);
+			case Text _, Item _, Waypoint _, Key _, Code _ -> false;
+		});
+	}
+
 	/** Inline Markdown and tokens in one line of text. */
 	public static List<Inline> inline(String text) {
 		List<Inline> out = new ArrayList<>();

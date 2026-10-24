@@ -67,10 +67,23 @@ public final class StructureFinder {
 	/** Spacing of the biome samples inside each piece, plus its corners. Biomes are stored per 4 blocks. */
 	private static final int SAMPLE_STEP = 8;
 	private static final int MAX_SAMPLES = 20_000;
+	/** Sample positions visited per structure, counting ones already sampled where pieces overlap. */
+	private static final int MAX_SAMPLE_VISITS = 200_000;
 	private static final int MAX_CHECKS = 60_000;
 	private static final int MAX_RINGS = 200;
 	/** How far (in chunks) a structure's pieces can reach from its start chunk: jigsaw structures are capped at 128 blocks. */
 	private static final int PIECE_REACH = 8;
+	/*
+	 * Limits on a start read from the world, whose pieces' boxes come from the save as they are: a crafted world could
+	 * otherwise make one structure's loops below span the whole world on the server thread. Far beyond any real
+	 * structure: jigsaw pieces stay within 128 blocks of the start, and vanilla's largest starts have a few hundred pieces.
+	 */
+	/** Pieces in a saved start. */
+	static final int MAX_SAVED_PIECES = 4096;
+	/** Blocks a saved piece may reach from its start chunk across, and above or below the world's height. */
+	static final int MAX_SAVED_REACH = 512;
+	/** Chunks a saved start's pieces cover, each piece's counted on its own (overlaps count again). */
+	static final long MAX_SAVED_CHUNK_COVER = 65_536;
 	/** How long the search may hold the server thread at a time, and how long it may take in all. */
 	private static final Duration SLICE = Duration.ofMillis(15);
 	private static final Duration SLICE_TIMEOUT = Duration.ofSeconds(20);
@@ -218,9 +231,45 @@ public final class StructureFinder {
 		return camel.replaceAll("([a-z0-9])([A-Z])", "$1_$2").toLowerCase(Locale.ROOT);
 	}
 
+	/**
+	 * Why a stored start's piece boxes are not a structure's, or null if they could be: every box the right way round,
+	 * within {@link #MAX_SAVED_REACH} of the start chunk and of the world's height, and together covering at most
+	 * {@link #MAX_SAVED_CHUNK_COVER} chunks. Checked before anything loops over the boxes on the server thread.
+	 */
+	static String savedGeometryProblem(List<BoundingBox> boxes, ChunkPos start, int minY, int maxY) {
+		if (boxes.size() > MAX_SAVED_PIECES) {
+			return boxes.size() + " pieces, more than " + MAX_SAVED_PIECES;
+		}
+		long west = (long) start.getMinBlockX() - MAX_SAVED_REACH;
+		long east = (long) start.getMinBlockX() + 15 + MAX_SAVED_REACH;
+		long north = (long) start.getMinBlockZ() - MAX_SAVED_REACH;
+		long south = (long) start.getMinBlockZ() + 15 + MAX_SAVED_REACH;
+		long bottom = (long) minY - MAX_SAVED_REACH;
+		long top = (long) maxY + MAX_SAVED_REACH;
+		long chunks = 0;
+		for (BoundingBox box : boxes) {
+			if (box.minX() > box.maxX() || box.minY() > box.maxY() || box.minZ() > box.maxZ()) {
+				return "a piece's box is inside out: " + box;
+			}
+			if (box.minX() < west || box.maxX() > east || box.minZ() < north || box.maxZ() > south
+				|| box.minY() < bottom || box.maxY() > top) {
+				return "a piece reaches more than " + MAX_SAVED_REACH + " blocks from its start: " + box;
+			}
+			chunks += ((long) SectionPos.blockToSectionCoord(box.maxX()) - SectionPos.blockToSectionCoord(box.minX()) + 1)
+				* ((long) SectionPos.blockToSectionCoord(box.maxZ()) - SectionPos.blockToSectionCoord(box.minZ()) + 1);
+			if (chunks > MAX_SAVED_CHUNK_COVER) {
+				return "its pieces cover more than " + MAX_SAVED_CHUNK_COVER + " chunks";
+			}
+		}
+		return null;
+	}
+
 	/** min, min + step, ..., and always max, so a piece's corners are always sampled. */
 	static int[] steps(int min, int max) {
-		int count = (max - min) / SAMPLE_STEP + 1;
+		if (min > max) {
+			throw new IllegalArgumentException("min " + min + " > max " + max);
+		}
+		int count = (int) (((long) max - min) / SAMPLE_STEP + 1);
 		int[] steps = new int[count + 1];
 		for (int i = 0; i < count; i++) {
 			steps[i] = min + i * SAMPLE_STEP;
@@ -437,18 +486,32 @@ public final class StructureFinder {
 		private Optional<StructureStart> storedStart(Candidate c) {
 			var live = LiveChunks.at(level, c.chunk.x(), c.chunk.z());
 			if (live.isPresent()) {
-				return Optional.ofNullable(live.get().getStartForStructure(c.structure.value())).filter(StructureStart::isValid);
+				// A live chunk's start was loaded from the same save, so it gets the same checks.
+				return Optional.ofNullable(live.get().getStartForStructure(c.structure.value())).filter(StructureStart::isValid)
+					.filter(start -> plausible(c, start));
 			}
 			try {
 				WorldIndex.ChunkKey key = new WorldIndex.ChunkKey(level.dimension(), c.chunk.x(), c.chunk.z());
 				Identifier id = c.structure.unwrapKey().orElseThrow().identifier();
 				return snapshot.readSavedChunk(key).flatMap(chunk -> chunk.structureStart(id))
+					.filter(tag -> tag.getListOrEmpty("Children").size() <= MAX_SAVED_PIECES)
 					.map(tag -> StructureStart.loadStaticStart(StructurePieceSerializationContext.fromLevel(level), tag, generatorState.getLevelSeed()))
-					.filter(StructureStart::isValid);
+					.filter(StructureStart::isValid)
+					.filter(start -> plausible(c, start));
 			} catch (IOException | RuntimeException e) {
 				ClaudeChatClient.LOGGER.debug("Could not read the saved start of {} at {}", c.id, c.chunk, e);
 				return Optional.empty();
 			}
+		}
+
+		/** Whether a stored start's pieces fit {@link #savedGeometryProblem}; logs the ones that don't. */
+		private boolean plausible(Candidate c, StructureStart start) {
+			List<BoundingBox> boxes = start.getPieces().stream().map(StructurePiece::getBoundingBox).toList();
+			String problem = savedGeometryProblem(boxes, c.chunk, level.getMinY(), level.getMaxY());
+			if (problem != null) {
+				ClaudeChatClient.LOGGER.warn("Skipping the saved start of {} at {}: {}", c.id, c.chunk, problem);
+			}
+			return problem == null;
 		}
 
 		/**
@@ -538,15 +601,20 @@ public final class StructureFinder {
 			}
 			Map<String, Integer> counts = new HashMap<>();
 			Set<Long> sampled = new HashSet<>();
+			int visits = 0;
+			pieces:
 			for (StructurePiece piece : c.start.getPieces()) {
 				BoundingBox box = piece.getBoundingBox();
 				for (int x : steps(box.minX(), box.maxX())) {
 					for (int y : steps(box.minY(), box.maxY())) {
 						for (int z : steps(box.minZ(), box.maxZ())) {
+							if (sampled.size() >= MAX_SAMPLES || visits++ >= MAX_SAMPLE_VISITS) {
+								break pieces;
+							}
 							int qx = QuartPos.fromBlock(x);
 							int qy = QuartPos.fromBlock(y);
 							int qz = QuartPos.fromBlock(z);
-							if (sampled.size() < MAX_SAMPLES && sampled.add(BlockPos.asLong(qx, qy, qz))) {
+							if (sampled.add(BlockPos.asLong(qx, qy, qz))) {
 								counts.merge(RegistryQuery.id(biomes.getNoiseBiome(qx, qy, qz)), 1, Integer::sum);
 							}
 						}

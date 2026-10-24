@@ -43,7 +43,7 @@ class CommandRulesTest {
 	@ValueSource(strings = {
 		"seed", "help", "help give", "list", "list uuids", "time query time", "data get entity @s",
 		"data get entity @s Health", "gamerule keep_inventory", "difficulty", "scoreboard objectives list",
-		"scoreboard players get @s points", "attribute @s minecraft:max_health get", "locate structure minecraft:village",
+		"scoreboard players get @s points", "attribute @s minecraft:max_health get", "locate biome minecraft:plains",
 		"xp query @s levels", "experience query @s points",
 		"execute if entity @s", "execute unless entity @s", "execute as @s at @s if block ~ ~-1 ~ minecraft:air",
 		"execute as @a at @s positioned ~ ~1 ~ run data get entity @s", "execute unless entity @s run time query time",
@@ -84,6 +84,9 @@ class CommandRulesTest {
 		"execute as @s run kill @s", "gamerule keep_inventory true", "give @s minecraft:diamond", "time set night",
 		"xp set @s 1", "experience add @s 5", "tp @s ~ ~1 ~", "function ns:x", "data modify entity @s Health set value 1f",
 		"setblock ~ ~-1 ~ minecraft:gold_block", "fill ~ ~ ~ ~1 ~1 ~1 minecraft:air", "reload",
+		// Structure and POI searches load chunks and save their structure starts.
+		"locate structure minecraft:village", "execute in minecraft:the_nether run locate structure minecraft:fortress",
+		"locate poi minecraft:meeting",
 		// Incomplete: nothing that runs is read-only.
 		"execute", "execute as @s"
 	})
@@ -111,7 +114,7 @@ class CommandRulesTest {
 	}
 
 	@ParameterizedTest
-	@ValueSource(strings = {"data get", "locate", "help", "list"})
+	@ValueSource(strings = {"data get", "locate biome", "help", "list"})
 	void modChildUnderReadOnlyRootIsNot(String root) {
 		CommandDispatcher<CommandSourceStack> dispatcher = vanilla();
 		String[] words = root.split(" ");
