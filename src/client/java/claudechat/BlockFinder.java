@@ -82,7 +82,8 @@ public final class BlockFinder {
 
 		/** Data matching is plain text over the block entity's SNBT, so "skeleton" finds a skeleton spawner. */
 		boolean matchesData(CompoundTag blockEntity) {
-			return data.isEmpty() || (blockEntity != null && blockEntity.toString().toLowerCase(Locale.ROOT).contains(data));
+			// Not toString(): a saved world's block entity can be any size, so only the start of its text is searched.
+			return data.isEmpty() || (blockEntity != null && NbtPreview.contains(blockEntity, data, NbtPreview.SEARCH_CHARS));
 		}
 
 		/** Full ids, as section palettes name blocks. */

@@ -12,6 +12,8 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -60,6 +62,33 @@ class NbtBudgetTest {
 		TooLargeException e = assertThrows(TooLargeException.class, () -> ONE_MIB.parse(file, missing));
 
 		assertTrue(e.getMessage().contains("decompresses to more than 1 MiB"), e.getMessage());
+	}
+
+	@Test
+	void skipNeverDecompressesPastTheBudget() throws IOException {
+		Path file = dir.resolve("bomb.schem");
+		SchematicFixtures.writeZeroBomb(file, 64 << 20);
+		CollectFields missing = new CollectFields(new FieldSelector(StringTag.TYPE, "Missing"));
+		AtomicLong used = new AtomicLong();
+
+		assertThrows(TooLargeException.class, () -> ONE_MIB.parse(file, missing, used));
+
+		// The array asks for one 64 MiB skip; it is read a chunk at a time and stops one byte past the budget.
+		assertTrue(used.get() > 1 << 20 && used.get() <= (1 << 20) + 1, "decompressed " + used.get() + " bytes");
+	}
+
+	@Test
+	void cancellationStopsALongSkip() throws IOException {
+		Path file = dir.resolve("bomb.schem");
+		SchematicFixtures.writeZeroBomb(file, 64 << 20);
+		CollectFields missing = new CollectFields(new FieldSelector(StringTag.TYPE, "Missing"));
+		AtomicInteger checks = new AtomicInteger();
+		NbtBudget cancelledSoon = new NbtBudget(128 << 20, () -> checks.incrementAndGet() > 20);
+		AtomicLong used = new AtomicLong();
+
+		assertThrows(CancellationException.class, () -> cancelledSoon.parse(file, missing, used));
+
+		assertTrue(used.get() < 2 << 20, "decompressed " + used.get() + " bytes");
 	}
 
 	@Test

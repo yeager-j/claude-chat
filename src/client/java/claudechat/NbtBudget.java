@@ -15,6 +15,7 @@ import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
 import java.util.zip.GZIPInputStream;
 
@@ -66,10 +67,23 @@ record NbtBudget(long maxBytes, BooleanSupplier cancelled) {
 
 	/** Streams a file through {@code visitor}, which may skip what it doesn't need; see {@link #read(Path)}. */
 	void parse(Path file, StreamTagVisitor visitor) throws IOException {
+		parse(file, visitor, new AtomicLong());
+	}
+
+	/**
+	 * Like {@link #parse(Path, StreamTagVisitor)}, and adds the bytes the file decompressed to to {@code used}, whether
+	 * or not the read succeeds: for a budget shared by many files.
+	 */
+	void parse(Path file, StreamTagVisitor visitor, AtomicLong used) throws IOException {
 		Accounter accounter = new Accounter(maxBytes);
 
-		try (InputStream compressed = Files.newInputStream(file); DataInputStream in = decompressed(compressed)) {
-			NbtIo.parse(in, visitor, accounter);
+		try (InputStream compressed = Files.newInputStream(file)) {
+			Limited limited = new Limited(new GZIPInputStream(compressed));
+			try (DataInputStream in = new DataInputStream(new BufferedInputStream(limited))) {
+				NbtIo.parse(in, visitor, accounter);
+			} finally {
+				used.addAndGet(limited.count);
+			}
 		} catch (RuntimeException e) {
 			throw translated(e, accounter);
 		}
@@ -120,9 +134,16 @@ record NbtBudget(long maxBytes, BooleanSupplier cancelled) {
 		}
 	}
 
-	/** Counts the decompressed bytes as they are read or skipped, and checks for cancellation on every read. */
+	/**
+	 * Counts the decompressed bytes as they are read or skipped, checking the budget and cancellation before each step.
+	 * No step asks the decompressor for more than {@link #CHUNK} bytes, or for more than one byte past the budget, so
+	 * a skip the file asks for (the parser skips arrays it doesn't need) can't make it inflate past the budget first.
+	 */
 	private final class Limited extends FilterInputStream {
+		private static final int CHUNK = 64 * 1024;
+
 		private long count;
+		private byte[] discard;
 
 		Limited(InputStream in) {
 			super(in);
@@ -130,6 +151,7 @@ record NbtBudget(long maxBytes, BooleanSupplier cancelled) {
 
 		@Override
 		public int read() throws IOException {
+			before();
 			int b = super.read();
 			counted(b < 0 ? 0 : 1);
 			return b;
@@ -137,28 +159,52 @@ record NbtBudget(long maxBytes, BooleanSupplier cancelled) {
 
 		@Override
 		public int read(byte[] buffer, int offset, int length) throws IOException {
-			int read = super.read(buffer, offset, length);
+			if (length == 0) {
+				return 0;
+			}
+
+			before();
+			int read = super.read(buffer, offset, allowed(length));
 			counted(Math.max(read, 0));
 			return read;
 		}
 
+		/** Reads and discards, rather than passing the skip on: the decompressor would do all the work before it's counted. */
 		@Override
 		public long skip(long n) throws IOException {
-			long skipped = super.skip(n);
-			counted(skipped);
-			return skipped;
+			if (n <= 0) {
+				return 0;
+			}
+
+			if (discard == null) {
+				discard = new byte[CHUNK];
+			}
+
+			before();
+			int read = super.read(discard, 0, allowed(n));
+			counted(Math.max(read, 0));
+			return Math.max(read, 0);
 		}
 
-		private void counted(long bytes) throws TooLargeException {
+		/** A step's size: at most a chunk, and at most one byte past the budget so going over is noticed. */
+		private int allowed(long wanted) {
+			return (int) Math.max(1, Math.min(Math.min(wanted, CHUNK), maxBytes - count + 1));
+		}
+
+		private void before() {
 			if (cancelled.getAsBoolean()) {
 				throw new CancellationException("Reading NBT data was cancelled");
 			}
+		}
 
+		private void counted(long bytes) throws TooLargeException {
 			count += bytes;
 
 			if (count > maxBytes) {
 				throw new TooLargeException("its NBT data decompresses to more than " + mebibytes() + " MiB (the limit)");
 			}
+
+			before();
 		}
 	}
 }

@@ -14,8 +14,10 @@ import net.minecraft.nbt.visitors.FieldSelector;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -23,6 +25,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
 import java.util.stream.Stream;
 
@@ -126,32 +130,192 @@ public final class Schematics {
 		return new Folder(gameDir.resolve("schematics"));
 	}
 
-	/** The schematics folder as resolved once; see {@link #folder()}. */
+	/** Files a walk of the folder found, sorted by path; {@code complete} is false if the walk stopped at a limit. */
+	public record FileList(List<Path> files, boolean complete) {
+	}
+
+	/**
+	 * Entries read from the folder, by path. {@code notRead} files were found but their description wasn't read because
+	 * the reading budget ran out; {@code complete} is false if the walk stopped at a limit before finding every file.
+	 */
+	public record Catalog(List<Entry> entries, int notRead, boolean complete) {
+	}
+
+	/** What {@link Folder#find} chose, and the catalog it chose from. */
+	public record Lookup(Match match, Catalog catalog) {
+	}
+
+	/** Folder entries a walk visits, of any kind; it stops after that many. */
+	static final int MAX_WALKED = 100_000;
+
+	/** Schematic files a walk keeps; it stops at the next one. */
+	static final int MAX_FILES = 10_000;
+
+	/** Descriptions one tool call reads. */
+	static final int MAX_DESCRIBED = 2_000;
+
+	/** Bytes the descriptions one tool call reads may decompress to, all files together. */
+	static final long CATALOG_BYTES = 1L << 30;
+
+	/** Time one tool call may spend reading descriptions. */
+	static final Duration CATALOG_TIME = Duration.ofSeconds(20);
+
+	/** Tool calls reading descriptions at once; others wait. Each may spend {@link #CATALOG_TIME} decompressing. */
+	private static final Semaphore CATALOGS = new Semaphore(2);
+
+	/**
+	 * Heap set aside for one full read: the NBT (at most {@link NbtBudget#FILE_BYTES} by the game's estimate), the
+	 * fixers' copies, and a volume of up to {@link BlockVolume#MAX_POSITIONS}, with room to spare.
+	 */
+	private static final long LOAD_MEMORY = 2L << 30;
+
+	/** Full reads at once, as many as the heap holds {@link #LOAD_MEMORY} for (at least one, at most four); others wait. */
+	private static final Semaphore LOADS = new Semaphore(Math.clamp(Runtime.getRuntime().maxMemory() / LOAD_MEMORY, 1, 4));
+
+	/**
+	 * The schematics folder as resolved once; see {@link #folder()}. It may hold a downloaded collection of any size, so
+	 * one tool call walks at most {@link #MAX_WALKED} entries and keeps at most {@link #MAX_FILES} files, and reads at
+	 * most {@link #MAX_DESCRIBED} descriptions within {@link #CATALOG_BYTES} and {@link #CATALOG_TIME}.
+	 */
 	public record Folder(Path dir) {
-		/** Every schematic file under the folder with its description, by path. Files that can't be read are listed with the reason. */
-		public List<Entry> entries() throws IOException {
+		/** The schematic files under the folder, by path, within the walk's limits. */
+		public FileList files() throws IOException {
 			if (!Files.isDirectory(dir)) {
-				return List.of();
+				return new FileList(List.of(), true);
 			}
 
-			List<Path> files;
+			List<Path> files = new ArrayList<>();
+			boolean complete = true;
 			try (Stream<Path> walk = Files.walk(dir, 8)) {
-				files = walk.filter(Files::isRegularFile).filter(f -> format(f).isPresent()).sorted(Comparator.comparing(Path::toString)).toList();
-			}
+				Iterator<Path> paths = walk.iterator();
+				int walked = 0;
+				while (paths.hasNext()) {
+					if (Thread.currentThread().isInterrupted()) {
+						throw new CancellationException("Listing schematics was cancelled");
+					}
 
-			List<Entry> entries = new ArrayList<>();
-			for (Path file : files) {
-				String path = dir.relativize(file).toString().replace('\\', '/');
-				try {
-					entries.add(new Readable(file, path, info(file)));
-				} catch (CancellationException e) {
-					throw e;
-				} catch (IOException | RuntimeException e) {
-					entries.add(new Unreadable(file, path, String.valueOf(e.getMessage())));
+					Path file = paths.next();
+					if (++walked > MAX_WALKED) {
+						complete = false;
+						break;
+					}
+
+					if (format(file).isPresent() && Files.isRegularFile(file)) {
+						if (files.size() >= MAX_FILES) {
+							complete = false;
+							break;
+						}
+
+						files.add(file);
+					}
 				}
 			}
 
-			return entries;
+			files.sort(Comparator.comparing(Path::toString));
+			return new FileList(files, complete);
+		}
+
+		/** Every schematic file under the folder with its description, by path. Files that can't be read are listed with the reason. */
+		public Catalog entries() throws IOException {
+			FileList list = files();
+			return describe(list.files(), list.complete());
+		}
+
+		/**
+		 * The schematic a query names (see {@link #match}). A file whose path the query names exactly is chosen without
+		 * reading any other file's description; only otherwise are descriptions read, to match schematic names.
+		 */
+		public Lookup find(String query) throws IOException {
+			FileList list = files();
+			String q = normalize(query);
+			List<Path> byPath = list.files().stream().filter(file -> isExactPath(path(file).toLowerCase(Locale.ROOT), q)).toList();
+			Catalog catalog = describe(byPath.isEmpty() ? list.files() : byPath, list.complete());
+			return new Lookup(match(catalog.entries(), query), catalog);
+		}
+
+		private String path(Path file) {
+			return dir.relativize(file).toString().replace('\\', '/');
+		}
+
+		private Catalog describe(List<Path> files, boolean complete) throws IOException {
+			acquire(CATALOGS);
+			try {
+				CatalogBudget budget = new CatalogBudget();
+				List<Entry> entries = new ArrayList<>();
+				int notRead = 0;
+				for (Path file : files) {
+					String path = path(file);
+					try {
+						Optional<Info> info = budget.info(file);
+						if (info.isPresent()) {
+							entries.add(new Readable(file, path, info.get()));
+						} else {
+							notRead++;
+						}
+					} catch (CancellationException e) {
+						throw e;
+					} catch (IOException | RuntimeException e) {
+						entries.add(new Unreadable(file, path, String.valueOf(e.getMessage())));
+					}
+				}
+
+				return new Catalog(entries, notRead, complete);
+			} finally {
+				CATALOGS.release();
+			}
+		}
+	}
+
+	/** One tool call's allowance for reading descriptions, shared by every file it reads. */
+	private static final class CatalogBudget {
+		private final AtomicLong used = new AtomicLong();
+		private final long deadline = System.nanoTime() + CATALOG_TIME.toNanos();
+		private int described;
+		private boolean spent;
+
+		/**
+		 * The file's description, or empty once the allowance is spent. A file that goes over what is left of the
+		 * allowance spends it, rather than counting as unreadable: on its own it might have been within its limit.
+		 */
+		Optional<Info> info(Path file) throws IOException {
+			long left = CATALOG_BYTES - used.get();
+			if (spent || described >= MAX_DESCRIBED || left <= 0 || pastDeadline()) {
+				spent = true;
+				return Optional.empty();
+			}
+
+			described++;
+			NbtBudget nbt = new NbtBudget(Math.min(NbtBudget.FILE_BYTES, left), () -> Thread.currentThread().isInterrupted() || pastDeadline());
+			try {
+				return Optional.of(Schematics.info(file, nbt, used));
+			} catch (CancellationException e) {
+				if (Thread.currentThread().isInterrupted()) {
+					throw e;
+				}
+
+				spent = true;
+				return Optional.empty();
+			} catch (TooLargeException e) {
+				if (nbt.maxBytes() < NbtBudget.FILE_BYTES) {
+					spent = true;
+					return Optional.empty();
+				}
+
+				throw e;
+			}
+		}
+
+		private boolean pastDeadline() {
+			return System.nanoTime() - deadline > 0;
+		}
+	}
+
+	private static void acquire(Semaphore semaphore) {
+		try {
+			semaphore.acquire();
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new CancellationException("Waiting to read schematics was cancelled");
 		}
 	}
 
@@ -170,11 +334,7 @@ public final class Schematics {
 	 */
 	public static Match match(List<Entry> entries, String query) {
 		String q = normalize(query);
-		Predicate<Entry> exact = entry -> {
-			String path = entry.path().toLowerCase(Locale.ROOT);
-			String fileName = path.substring(path.lastIndexOf('/') + 1);
-			return path.equals(q) || stripExtension(path).equals(q) || stripExtension(fileName).equals(q) || name(entry).map(q::equals).orElse(false);
-		};
+		Predicate<Entry> exact = entry -> isExactPath(entry.path().toLowerCase(Locale.ROOT), q) || name(entry).map(q::equals).orElse(false);
 		List<Entry> exactMatches = entries.stream().filter(exact).toList();
 		List<Entry> candidates = exactMatches.isEmpty() ? entries.stream().filter(e -> matches(e, q)).toList() : exactMatches;
 		return switch (candidates.size()) {
@@ -182,6 +342,12 @@ public final class Schematics {
 			case 1 -> new Found(candidates.getFirst());
 			default -> new Ambiguous(candidates);
 		};
+	}
+
+	/** Whether a normalized query names a lower-case path: the whole path, with or without its extension, or the file name without it. */
+	private static boolean isExactPath(String path, String q) {
+		String fileName = path.substring(path.lastIndexOf('/') + 1);
+		return path.equals(q) || stripExtension(path).equals(q) || stripExtension(fileName).equals(q);
 	}
 
 	private static String normalize(String query) {
@@ -198,11 +364,16 @@ public final class Schematics {
 	 * @throws TooLargeException if the file is over {@link NbtBudget#FILE}
 	 */
 	public static Info info(Path file) throws IOException {
+		return info(file, NbtBudget.FILE, new AtomicLong());
+	}
+
+	/** See {@link #info(Path)}; reads within {@code budget}, adding the bytes decompressed to {@code used}. */
+	private static Info info(Path file, NbtBudget budget, AtomicLong used) throws IOException {
 		Format format = format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
 		CollectFields fields = new CollectFields(format.infoFields().toArray(FieldSelector[]::new));
 
 		try {
-			NbtBudget.FILE.parse(file, fields);
+			budget.parse(file, fields, used);
 		} catch (TooLargeException e) {
 			throw tooLarge(file, e);
 		}
@@ -212,7 +383,8 @@ public final class Schematics {
 	}
 
 	/**
-	 * Every block of a schematic.
+	 * Every block of a schematic. Waits while {@link #LOADS} other reads are running, so that several large files read
+	 * at once can't take more memory together than the heap has.
 	 *
 	 * @throws TooLargeException if the file is over {@link NbtBudget#FILE} or over a limit of the volume model (positions,
 	 *     block states) or of {@link StructureNbt} (palettes, block entities, entities)
@@ -220,10 +392,13 @@ public final class Schematics {
 	public static Schematic load(Path file) throws IOException {
 		Format format = format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
 
+		acquire(LOADS);
 		try {
 			return format.read(NbtBudget.FILE.read(file), stem(file));
 		} catch (TooLargeException e) {
 			throw tooLarge(file, e);
+		} finally {
+			LOADS.release();
 		}
 	}
 
