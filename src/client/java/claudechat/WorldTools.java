@@ -221,7 +221,7 @@ public final class WorldTools {
 			"A schematic's material list and contents. \"materials\" is the items needed to place every block, counted "
 				+ "like Litematica's material list (a double slab is 2 slabs, a door is 1 item, redstone wire is redstone dust, "
 				+ "water sources are water buckets). \"crafting\" breaks crafted components (pistons, repeaters, observers, "
-				+ "torches, hoppers...) down into ingredients using the game's recipes, and \"base_materials\" is the total "
+				+ "torches, hoppers...) down into ingredients using the game's recipes (each step's \"recipe\" id works in [[recipe:...]]), and \"base_materials\" is the total "
 				+ "after that, e.g. all the redstone dust including what goes into pistons. Shapes of one material (planks, "
 				+ "slabs, trapdoors, storage blocks) aren't broken down. With compare_with, also checks a container in the "
 				+ "world (a chest's custom name, x y z, or \"inventory\") including shulker boxes in it: what's missing as "
@@ -996,8 +996,8 @@ public final class WorldTools {
 			out.add("regions", regions);
 		}
 
-		Map<String, Integer> noItem = new TreeMap<>();
-		Map<String, Integer> placed = Materials.asPlaced(s.volume(), noItem);
+		Map<Identifier, Integer> noItem = new TreeMap<>();
+		Map<Materials.Material, Integer> placed = Materials.asPlaced(s.volume(), noItem);
 		out.add("materials", countsJson(placed));
 		out.addProperty("total_items", placed.values().stream().mapToInt(Integer::intValue).sum());
 		if (!noItem.isEmpty()) {
@@ -1021,7 +1021,7 @@ public final class WorldTools {
 	}
 
 	/** Checks the containers matching {@code query} against the materials; see inspect_schematic's description. */
-	private JsonObject compare(String query, Map<String, Integer> placed) throws Exception {
+	private JsonObject compare(String query, Map<Materials.Material, Integer> placed) throws Exception {
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.HOLDERS);
 		WorldIndex.PlayerInfo player = snapshot.host();
 		List<String> used = new ArrayList<>();
@@ -1066,7 +1066,7 @@ public final class WorldTools {
 					+ (h.provenance() == Provenance.LIVE ? "" : " (" + h.provenance().label() + ")"));
 			}
 		}
-		Map<String, Integer> stock = new TreeMap<>();
+		Map<Materials.Material, Integer> stock = new TreeMap<>();
 		flatten(items, stock);
 
 		JsonObject out = new JsonObject();
@@ -1088,9 +1088,9 @@ public final class WorldTools {
 	}
 
 	/** Item counts by id, including what's inside shulker boxes and bundles (the box itself counts too). */
-	private static void flatten(List<WorldIndex.Item> items, Map<String, Integer> into) {
+	private static void flatten(List<WorldIndex.Item> items, Map<Materials.Material, Integer> into) {
 		for (WorldIndex.Item item : items) {
-			into.merge(item.id(), item.count(), Integer::sum);
+			into.merge(Materials.Material.item(Identifier.parse(item.id())), item.count(), Integer::sum);
 			flatten(item.contents(), into);
 		}
 	}
@@ -1104,9 +1104,9 @@ public final class WorldTools {
 	}
 
 	/** {"minecraft:redstone": 41, ...}, most first. */
-	private static JsonObject countsJson(Map<String, Integer> counts) {
+	private static JsonObject countsJson(Map<?, Integer> counts) {
 		JsonObject o = new JsonObject();
-		counts.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed()).forEach(e -> o.addProperty(e.getKey(), e.getValue()));
+		counts.entrySet().stream().sorted(Map.Entry.comparingByValue(Comparator.reverseOrder())).forEach(e -> o.addProperty(e.getKey().toString(), e.getValue()));
 		return o;
 	}
 
@@ -1114,16 +1114,16 @@ public final class WorldTools {
 		JsonArray array = new JsonArray();
 		for (Materials.Craft c : crafts) {
 			JsonObject o = new JsonObject();
-			o.addProperty("item", c.item());
+			o.addProperty("item", c.item().toString());
 			o.addProperty("needed", c.used());
 			o.addProperty("craft_times", c.crafts());
 			if (c.made() > c.used()) {
 				o.addProperty("left_over", c.made() - c.used());
 			}
 			JsonObject per = new JsonObject();
-			c.recipe().ingredients().forEach(per::addProperty);
+			c.recipe().ingredients().forEach((ingredient, count) -> per.addProperty(ingredient.toString(), count));
 			o.add("ingredients_per_craft", per);
-			o.addProperty("recipe", c.recipe().file());
+			o.addProperty("recipe", c.recipe().id().toString());
 			array.add(o);
 		}
 		return array;

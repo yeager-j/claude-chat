@@ -284,6 +284,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 		ServerLifecycleEvents.SERVER_STOPPING.register(worldIndex::saveVisits);
 		ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
 			knowledge.clearWorldPacks();
+			knowledge.recipes().clearServer();
 			worldTools.clearTemplates();
 			worldIndex.stop();
 		});
@@ -292,6 +293,7 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static void updateWorldPacks(MinecraftServer server) {
 		knowledge.setWorldPacks(server.getWorldData().getLevelName(), server.getWorldPath(LevelResource.DATAPACK_DIR),
 			List.copyOf(server.getPackRepository().getSelectedIds()));
+		knowledge.recipes().useServer(server.getRecipeManager());
 	}
 
 	private static void ask(String question) {

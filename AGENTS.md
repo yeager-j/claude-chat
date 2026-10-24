@@ -22,7 +22,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | --- | --- |
 | `CLAUDECHAT_LIVE_TEST=1` | Real `@claude` questions (uses the user's Claude subscription) |
 | `CLAUDECHAT_MOD_QUESTION="..."` | Ask about a mod (on-demand decompile) |
-| `CLAUDECHAT_PACK_TEST=1` | Writes a folder and a zip data pack, runs `/reload`, asks about them |
+| `CLAUDECHAT_PACK_TEST=1` | Writes a folder and a zip data pack (overriding a loot table and the piston recipe), runs `/reload`, checks recipe grids, material breakdown and data-root order follow it, then disables the zip; with `CLAUDECHAT_LIVE_TEST=1` also asks Claude about them |
 | `CLAUDECHAT_TEMPLATE_TEST=1` | Calls the structure template tools with checks, including a structure block save showing up in search; `CLAUDECHAT_TEMPLATE_QUESTION="..."` also asks Claude |
 | `CLAUDECHAT_SCHEMATIC_TEST="<folder>"` | Copies the schematics there into the test, checks material lists and a chest comparison; `CLAUDECHAT_SCHEMATIC_QUESTION="..."` also asks Claude. For a folder of test files (every format, old versions, a broken file), first run `gradlew test --rerun --tests claudechat.ExportSchematicFixtures` with `CLAUDECHAT_EXPORT_SCHEMATICS="<folder>"` |
 | `CLAUDECHAT_WAYPOINT_TEST=1` | Needs Xaero's Minimap via `-PextraMods`. Runs `[[waypoint:…]]` button commands, confirms Xaero's screen, checks `waypoints.txt` per dimension; `CLAUDECHAT_WAYPOINT_QUESTION="..."` also asks Claude |
@@ -42,9 +42,10 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `ClaudeCli` | Runs `claude -p`: system prompt, flags, MCP config, timeout (kills `claude` and its child processes) |
 | `ClaudeStream`, `ClaudeResult` | Reads the stream-json output: progress notes, and the final `result` event parsed once (retry only on a missing session) |
 | `ClaudeConfig` | `config/claudechat.properties`; `configVersion` drives migrations |
-| `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand); extracts data and lang files; world data packs; each source's `Status`; the prompt's file map |
+| `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand); extracts data and lang files; world data packs; data roots in the server's pack order; each source's `Status`; the prompt's file map |
 | `BuiltFolder`, `Decompiler`, `ModMentions`, `KnowledgeFiles` | One built folder (layout, marker holding the input key, progress, publish by rename, removing superseded folders); Vineflower in a separate JVM; which mods a question names; contained-path and copy helpers |
-| `ChatMarkup`, `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset parsed into lines (pure, unit-tested) → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON, with tags from the game's merged tag registry |
+| `ChatMarkup`, `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset parsed into lines (pure, unit-tested) → chat components; `[[item]]` icons; `[[recipe:id]]` grids from `GameRecipes` |
+| `GameRecipes`, `GameRecipe` | The one recipe model, for grids and material lists: the integrated server's `RecipeManager` while a single-player world is open, else the knowledge base's recipe files read with the game's codec; lookup by id and each item's main recipe; recipes read through the game's recipe-book displays into immutable records |
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while a known-good version of Xaero's Minimap is loaded: `KNOWN_GOOD_VERSIONS`) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
 | `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players (the host by UUID), per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes. Per-world state is an object made on world start and dropped on stop. A `Snapshot` (`Detail.VISITS` or `HOLDERS`) also reads saved chunks |
@@ -134,4 +135,5 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 **Mods and data packs**
 - **Nested jars:** many mods keep their real code in nested jar-in-jar (Vein Miner's outer jar has 5 classes). Use the loader's `getContainedMods()` / `getRootPaths()`, and skip nested jars with Mod Menu's `library` badge.
 - **Polymer:** Universal Graves depends on modules *inside* `polymer-bundled`, not on `polymer-bundled` itself.
-- **Override order:** world data packs, then mods, then vanilla. `KnowledgeBase.dataRoots()` returns them in that order, and anything looking up data files must respect it.
+- **Override order:** `KnowledgeBase.dataRoots()` is highest priority first. With a world open it follows the server's selected packs (`vanilla`, mod packs named by mod id, `file/…` world packs; disabled ones left out); without one it's mods, then Minecraft. Recipes and loot tables override by file; tags don't (the game merges every pack's tag file), so read tags from the game's tag registry, never from the first file found.
+- **Recipes:** clients don't receive recipes in 26.x (`Registries.RECIPE` is a reloadable registry, not a synced one), so `GameRecipes` reads files only without a server. Its ingredients parse with `Recipe.DIRECT_CODEC`: `"id"`, `"#tag"` or a list of ids; the old `{"item": …}` object doesn't load in 26.x.
