@@ -6,6 +6,7 @@ import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
@@ -16,6 +17,7 @@ import java.nio.file.Path;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -32,6 +34,7 @@ public final class Approvals {
 	public static final String TOOL = "approve";
 	private static final int SHOWN_CHARS = 300;
 	private static final int HOVER_CHARS = 1500;
+	private static final int NOTE_CHARS = 300;
 
 	private static final Set<CompletableFuture<Boolean>> pending = ConcurrentHashMap.newKeySet();
 	private static final AtomicLong waitedMillis = new AtomicLong();
@@ -44,11 +47,18 @@ public final class Approvals {
 	}
 
 	/**
-	 * Posts "[Claude] wants to {action}" with {@code detail} and Allow/Deny buttons, then waits for the player. Not on
-	 * the client thread. {@code warning}, if not null, is shown in red (e.g. "This can't be undone").
+	 * Posts "[Claude] wants to {action}" with {@code detail} and Allow/Deny buttons, then waits for the player.
+	 * {@code warning}, if not null, is shown in red (e.g. "This can't be undone"). An interrupt counts as Deny and
+	 * stays set on the calling thread.
+	 *
+	 * @throws IllegalStateException on the client thread, which would have to post the request and handle the click
+	 *                               while blocked waiting for it
 	 */
 	public static boolean ask(String action, Component detail, String warning) {
 		Minecraft mc = Minecraft.getInstance();
+		if (mc.isSameThread()) {
+			throw new IllegalStateException("Approvals.ask can't wait for the player on the client thread");
+		}
 		if (mc.player == null) {
 			return false;
 		}
@@ -61,7 +71,11 @@ public final class Approvals {
 			allowed = answer.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
 		} catch (TimeoutException e) {
 			mc.execute(() -> info("No answer within " + TIMEOUT_SECONDS / 60 + " minutes, so Claude was told no."));
-		} catch (Exception ignored) {
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		} catch (ExecutionException e) {
+			// Answers are only ever completed with true or false, so this is a bug; deny.
+			ClaudeChatClient.LOGGER.warn("Approval request failed", e);
 		} finally {
 			pending.remove(answer);
 			waitedMillis.addAndGet(System.currentTimeMillis() - start);
@@ -130,13 +144,14 @@ public final class Approvals {
 			case "Bash", "PowerShell" -> ask("run a " + (tool.equals("Bash") ? "shell" : "PowerShell") + " command",
 				code(string(input, "command"), string(input, "description")), null);
 			case "Edit" -> ask("edit " + displayPath(string(input, "file_path")),
-				diff(string(input, "old_string"), string(input, "new_string")), null);
+				diff(string(input, "old_string"), string(input, "new_string"), bool(input, "replace_all")), null);
 			case "Write" -> {
 				String path = string(input, "file_path");
 				String content = string(input, "content");
 				boolean exists = !path.isEmpty() && Files.exists(Path.of(path));
+				String size = lines(content.lines().count()) + ", " + content.length() + " characters";
 				yield ask((exists ? "overwrite " : "create ") + displayPath(path),
-					hoverable(Component.literal(lines(content.lines().count())).withStyle(ChatFormatting.GRAY), content), null);
+					copyable(Component.literal(size).withStyle(ChatFormatting.GRAY), withCopyHint(content), content), null);
 			}
 			default -> ask("use " + tool, code(input.toString(), null), null);
 		};
@@ -152,21 +167,42 @@ public final class Approvals {
 		return out;
 	}
 
-	/** Shell commands and game commands: white, cut short in chat, in full on hover. */
+	/**
+	 * A shell or game command in white. Chat shows its start and the hover more of it, each cut marked as such; the
+	 * hover puts Claude's {@code note} (may be null) after the command, so a long note can't push the command out of
+	 * view. A click copies the whole command.
+	 */
 	public static Component code(String text, String note) {
-		String hover = note == null || note.isBlank() ? text : note + "\n\n" + text;
-		return hoverable(Component.literal(shorten(text, SHOWN_CHARS)).withStyle(ChatFormatting.WHITE), hover);
+		String hover = withCopyHint(text);
+		if (note != null && !note.isBlank()) {
+			hover += "\n\nClaude's description: " + clip(note, NOTE_CHARS);
+		}
+		return copyable(Component.literal(clip(text, SHOWN_CHARS)).withStyle(ChatFormatting.WHITE), hover, text);
 	}
 
-	private static Component diff(String oldText, String newText) {
+	/** "-3 +4 lines", with both texts on hover. A replace-all edit says so in chat, since it can touch many places. */
+	private static Component diff(String oldText, String newText, boolean everywhere) {
 		MutableComponent line = Component.empty()
 			.append(Component.literal("-" + oldText.lines().count() + " ").withStyle(ChatFormatting.RED))
 			.append(Component.literal("+" + lines(newText.lines().count())).withStyle(ChatFormatting.GREEN));
-		return hoverable(line, "Replace:\n" + shorten(oldText, HOVER_CHARS / 2) + "\n\nWith:\n" + shorten(newText, HOVER_CHARS / 2));
+		if (everywhere) {
+			line.append(Component.literal(", everywhere it occurs").withStyle(ChatFormatting.YELLOW));
+		}
+		String hover = "Replace:\n" + clip(oldText, HOVER_CHARS / 2) + "\n\nWith:\n" + clip(newText, HOVER_CHARS / 2)
+			+ "\n\nClick to copy the new text.";
+		return copyable(line, hover, newText);
 	}
 
-	private static Component hoverable(MutableComponent text, String hover) {
-		return text.withStyle(style -> style.withHoverEvent(new HoverEvent.ShowText(Component.literal(shorten(hover, HOVER_CHARS)))));
+	/** {@code text} with {@code hover} shown on hover, copying {@code full} when clicked. */
+	private static Component copyable(MutableComponent text, String hover, String full) {
+		return text.withStyle(style -> style
+			.withHoverEvent(new HoverEvent.ShowText(Component.literal(hover)))
+			.withClickEvent(new ClickEvent.CopyToClipboard(full)));
+	}
+
+	/** As much of {@code text} as a hover holds, then where the rest is. */
+	private static String withCopyHint(String text) {
+		return clip(text, HOVER_CHARS) + "\n\nClick to copy " + (text.length() > HOVER_CHARS ? "all of it." : "it.");
 	}
 
 	/** Paths inside the game folder relative to it: "config/foo.json" rather than a long absolute path. */
@@ -183,12 +219,17 @@ public final class Approvals {
 		return count + (count == 1 ? " line" : " lines");
 	}
 
-	private static String shorten(String text, int max) {
-		return text.length() <= max ? text : text.substring(0, max) + "…";
+	/** {@code text} cut at {@code max} characters, saying how much was cut so a cut never passes for the whole. */
+	private static String clip(String text, int max) {
+		return text.length() <= max ? text : text.substring(0, max) + "… (" + (text.length() - max) + " more characters)";
 	}
 
 	private static String string(JsonObject obj, String key) {
 		return obj.has(key) && obj.get(key).isJsonPrimitive() ? obj.get(key).getAsString() : "";
+	}
+
+	private static boolean bool(JsonObject obj, String key) {
+		return obj.has(key) && obj.get(key).isJsonPrimitive() && obj.get(key).getAsBoolean();
 	}
 
 	private static void info(String message) {
