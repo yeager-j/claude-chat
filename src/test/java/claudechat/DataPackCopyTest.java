@@ -137,10 +137,11 @@ class DataPackCopyTest {
 	@Test
 	void copiesSharingAParentShareItsLimits() throws IOException {
 		// Each copy is within its own limits; together they're over the parent's, as a world's packs or a mod's jars are.
+		// Every file is within the parent's per-file limit too, so only the shared total is over.
 		DataPackCopy.Budget world = new DataPackCopy.Budget(SMALL, "the world's data packs together");
-		Path first = zip(Map.of("data/a.json", "0".repeat(1000)));
+		Path first = zip(Map.of("data/a.json", "0".repeat(1000), "data/c.json", "0".repeat(1000)));
 		DataPackCopy.fromZip(first, "data", temp.resolve("one"), new DataPackCopy.Budget(DataPackCopy.Limits.DEFAULT, "the pack", world));
-		Path second = zip(Map.of("data/b.json", "0".repeat(1100)));
+		Path second = zip(Map.of("data/b.json", "0".repeat(100)));
 
 		TooLargeException e = assertThrows(TooLargeException.class, () -> DataPackCopy.fromZip(second, "data", temp.resolve("two"),
 			new DataPackCopy.Budget(DataPackCopy.Limits.DEFAULT, "the pack", world)));
