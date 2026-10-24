@@ -10,37 +10,47 @@ import net.minecraft.tags.TagKey;
 
 import java.util.List;
 import java.util.Locale;
+import java.util.Optional;
 
-/** Resolves what Claude asks for (an id, a tag, or a plain word) to registry entries, for blocks and biomes. */
+/** Resolves what Claude asks for (an id, a tag, or a plain word) to registry entries: blocks, biomes and structures. */
 public final class RegistryQuery {
 	private RegistryQuery() {
 	}
 
+	/** Whether a name that is both an entry and a tag means the entry or the whole tag. */
+	public enum Precedence {
+		/** "bed" is the bed block if there is one, else #beds. */
+		ID_FIRST,
+		/**
+		 * "ruined_portal" is #ruined_portal (every variant), not just the standard one: a structure tag groups variants
+		 * that a player calls by one name.
+		 */
+		TAG_FIRST
+	}
+
 	/**
-	 * An id ("minecraft:warped_forest"), a tag ("#minecraft:is_nether"), or a word tried as an id, then a tag (also
-	 * plural: "bed" → #minecraft:beds), then a substring of ids ("warped" → warped_forest).
+	 * An id ("minecraft:warped_forest"), a tag ("#minecraft:is_nether"), or a name tried as an id and as a tag (also
+	 * plural: "bed" → #minecraft:beds) in the order {@code precedence} gives; a word without a namespace then falls
+	 * back to a substring of ids ("warped" → warped_forest).
 	 */
-	public static <T> List<Holder<T>> resolve(RegistryAccess access, ResourceKey<? extends Registry<T>> registryKey, String query) {
+	public static <T> List<Holder<T>> resolve(RegistryAccess access, ResourceKey<? extends Registry<T>> registryKey, String query,
+		Precedence precedence) {
 		HolderLookup.RegistryLookup<T> registry = access.lookupOrThrow(registryKey);
 		String q = query.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
 		if (q.startsWith("#")) {
 			Identifier id = Identifier.tryParse(q.substring(1));
-			return id == null ? List.of() : registry.get(TagKey.create(registryKey, id))
-				.map(set -> set.stream().toList()).orElse(List.of());
+			return id == null ? List.of() : tag(registry, registryKey, id).orElse(List.of());
 		}
+
 		Identifier asId = q.contains(":") ? Identifier.tryParse(q) : Identifier.tryParse("minecraft:" + q);
 		if (asId == null) {
 			return List.of();
 		}
-		var exact = registry.get(ResourceKey.create(registryKey, asId));
-		if (exact.isPresent()) {
-			return List.of(exact.get());
-		}
-		for (Identifier tagId : List.of(asId, asId.withSuffix("s"))) {
-			var tag = registry.get(TagKey.create(registryKey, tagId));
-			if (tag.isPresent() && tag.get().size() > 0) {
-				return tag.get().stream().toList();
-			}
+		Optional<List<Holder<T>>> exact = registry.get(ResourceKey.create(registryKey, asId)).map(holder -> List.<Holder<T>>of(holder));
+		Optional<List<Holder<T>>> tag = tag(registry, registryKey, asId).or(() -> tag(registry, registryKey, asId.withSuffix("s")));
+		Optional<List<Holder<T>>> named = precedence == Precedence.ID_FIRST ? exact.or(() -> tag) : tag.or(() -> exact);
+		if (named.isPresent()) {
+			return named.get();
 		}
 		if (q.contains(":")) {
 			return List.of();
@@ -51,5 +61,11 @@ public final class RegistryQuery {
 	/** "minecraft:warped_forest" for a registered holder. */
 	public static String id(Holder<?> holder) {
 		return holder.unwrapKey().map(key -> key.identifier().toString()).orElse("?");
+	}
+
+	/** A non-empty tag's entries. */
+	private static <T> Optional<List<Holder<T>>> tag(HolderLookup.RegistryLookup<T> registry, ResourceKey<? extends Registry<T>> registryKey,
+		Identifier id) {
+		return registry.get(TagKey.create(registryKey, id)).filter(set -> set.size() > 0).map(set -> set.stream().toList());
 	}
 }

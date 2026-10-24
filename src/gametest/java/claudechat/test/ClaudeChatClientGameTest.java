@@ -326,6 +326,10 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					server.runCommand("execute at @p run setblock ~5 ~ ~5 minecraft:spawner{SpawnData:{entity:{id:\"minecraft:zombie\"}}}");
 					server.runCommand("execute at @p run setblock ~-5 ~ ~5 minecraft:respawn_anchor[charges=1]");
 					server.runCommand("forceload remove 2000 2000");
+					server.runCommand("execute in minecraft:the_nether run forceload add 0 0");
+					context.waitTicks(20);
+					server.runCommand("execute in minecraft:the_nether run setblock 3 70 3 minecraft:chest{CustomName:\"Nether Stash\",Items:[{Slot:0b,id:\"minecraft:blaze_rod\",count:7}]}");
+					server.runCommand("execute in minecraft:the_nether run forceload remove 0 0");
 					// save-all is a dedicated-server command; this is what autosave does.
 					server.runOnServer(s -> s.saveEverything(true, true, true));
 					context.waitTicks(40);
@@ -336,6 +340,15 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					logTool(context, "search_containers", "{\"query\": \"emerald\"}");
 					logTool(context, "search_entities", "{\"query\": \"rex\"}");
 					logTool(context, "get_player", "{}");
+					// A chest in another dimension: found with no distance limit, and when its dimension is asked for by
+					// either name; a distance limit keeps the search in the player's dimension.
+					for (String args : List.of("{\"query\": \"blaze_rod\"}", "{\"query\": \"blaze_rod\", \"dimension\": \"the_nether\"}",
+						"{\"query\": \"blaze_rod\", \"dimension\": \"minecraft:the_nether\"}")) {
+						JsonObject nether = logTool(context, "search_containers", args);
+						check(nether.getAsJsonArray("results").toString().contains("\"dimension\":\"the_nether\""), "Nether chest not found by " + args);
+					}
+					JsonObject nearby = logTool(context, "search_containers", "{\"query\": \"blaze_rod\", \"max_distance\": 100}");
+					check(nearby.getAsJsonArray("results").isEmpty(), "max_distance searched another dimension: " + nearby);
 					// Blocks: the zombie spawner and charge-1 anchor are live nearby, the skeleton spawner and full anchor only saved.
 					logTool(context, "find_blocks", "{\"block\": \"spawner\"}");
 					logTool(context, "find_blocks", "{\"block\": \"spawner\", \"data\": \"skeleton\"}");
@@ -433,18 +446,21 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					check(!unvisited.getAsJsonArray("results").toString().contains(villageAt), "visited village listed as unvisited");
 					Path visits = singleplayer.getServer().computeOnServer(s -> s.getWorldPath(LevelResource.ROOT)).resolve("claudechat-visits.txt");
 					List<String> lines = readLines(visits);
-					List<String> farChunk = lines.stream().filter(l -> l.startsWith("overworld 187 187 ")).toList();
+					List<String> farChunk = lines.stream().filter(l -> l.startsWith("minecraft:overworld 187 187 ")).toList();
 					LOGGER.info("visits file: {} lines, far chunk {}", lines.size(), farChunk);
 					// 5 seconds there is 100 ticks; leave margin for the teleports.
 					check(!farChunk.isEmpty() && Long.parseLong(farChunk.getFirst().split(" ")[3]) >= 60, "time in the far chunk wasn't recorded");
 
-					chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and find me a nether fortress in a warped forest");
-					context.waitTicks(5);
-					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
-					context.waitTicks(10);
-					openChat(context);
-					context.takeScreenshot("claudechat-world-answer");
-					context.getInput().pressKey(KEY_ESCAPE);
+					// Asking Claude uses the signed-in account, so only in live runs.
+					if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
+						chat(context, "@claude where's the nearest village I haven't explored yet? where did I put my netherite? and find me a nether fortress in a warped forest");
+						context.waitTicks(5);
+						context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+						context.waitTicks(10);
+						openChat(context);
+						context.takeScreenshot("claudechat-world-answer");
+						context.getInput().pressKey(KEY_ESCAPE);
+					}
 				}
 
 				// 6. Optionally, a question about a data-only mod, which gets decompiled on demand first.

@@ -1,15 +1,10 @@
 package claudechat;
 
 import net.minecraft.SharedConstants;
-import net.minecraft.core.component.DataComponents;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.nbt.ListTag;
-import net.minecraft.nbt.NbtIo;
 import net.minecraft.nbt.NbtOps;
 import net.minecraft.nbt.NbtUtils;
 import net.minecraft.nbt.Tag;
-import net.minecraft.network.chat.Component;
-import net.minecraft.network.chat.ComponentSerialization;
 import net.minecraft.resources.RegistryOps;
 import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
@@ -20,30 +15,18 @@ import net.minecraft.util.datafix.DataFixTypes;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.player.Player;
-import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.item.ItemStackTemplate;
-import net.minecraft.world.item.component.BundleContents;
-import net.minecraft.world.item.component.ItemContainerContents;
-import net.minecraft.world.item.enchantment.Enchantment;
-import net.minecraft.world.item.enchantment.ItemEnchantments;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
-import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.storage.LevelResource;
 import net.minecraft.world.level.storage.TagValueOutput;
 
-import java.io.ByteArrayInputStream;
-import java.io.DataInputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -53,89 +36,167 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Stream;
+import java.util.function.Consumer;
 
 /**
- * What's stored where in the current single-player world, for the world tools: every container with its contents
+ * What's stored where in the open single-player world, for the world tools: every container with its contents
  * (including items inside shulker boxes and bundles), unopened loot chests, entities that hold items or are named or
  * tamed (chest minecarts, item frames, armor stands, dropped items, pets), each player's inventory and ender chest,
  * and how long players have spent near each chunk (its InhabitedTime, used to tell visited structures apart).
  * <p>
  * Saved chunks are read straight from the region files (read-only; only chunks whose save timestamp changed are
- * re-read). Chunks that are loaded right now are captured live from the server instead, since the save on disk can be
- * up to an autosave (5 minutes) behind.
+ * re-read). {@link LiveChunks} are captured from the running game instead, since the save on disk can be up to an
+ * autosave (5 minutes) behind.
  * <p>
  * InhabitedTime needs more: the game writes a chunk only when something in it changes, and its time going up doesn't
  * count, so a chunk the player only walked through keeps the time from its last save, often 0. The index records
  * each chunk's time as it unloads (and every few seconds near players) and keeps the ones newer than the save in
- * {@value #VISITS_FILE} in the world folder, so they survive restarts.
+ * {@value VisitsFile#NAME} in the world folder, so they survive restarts. Those records count only for chunks the save
+ * shows fully generated, and are dropped once the chunk is gone from the save.
+ * <p>
+ * Everything known about one world lives in an object created when it opens and dropped when it closes, so a scan
+ * still running for one world can't write into the next.
  */
 public class WorldIndex {
-	private static final Pattern REGION_NAME = Pattern.compile("r\\.(-?\\d+)\\.(-?\\d+)\\.mca");
-	private static final int MAX_NESTING = 2;
-	private static final String VISITS_FILE = "claudechat-visits.txt";
+	private static final Duration LIVE_CAPTURE_TIMEOUT = Duration.ofSeconds(20);
 
-	/** One chunk of one dimension; block entities and entities are stored in separate region folders. */
-	public record ChunkKey(String dimension, int x, int z, boolean entities) {
+	/** One chunk of one dimension. */
+	public record ChunkKey(ResourceKey<Level> dimension, int x, int z) {
 	}
 
 	/** An item stack, with what's inside it if it's a shulker box or bundle. */
 	public record Item(String id, String name, int count, List<String> enchantments, List<Item> contents) {
 	}
 
-	/** Something that holds items or is worth finding: a container block, an entity, or a player. */
-	public record Holder(String kind, String dimension, int x, int y, int z, String type, String name,
-		String lootTable, boolean tamed, List<Item> items, boolean live) {
-	}
+	/**
+	 * Something that holds items or is worth finding. {@code type} is the block or entity id without the "minecraft:"
+	 * namespace, or for a player's inventory or ender chest, the player's name.
+	 */
+	public record Holder(Kind kind, ResourceKey<Level> dimension, int x, int y, int z, String type, String name,
+		String lootTable, boolean tamed, List<Item> items, Provenance provenance) {
+		public enum Kind {
+			BLOCK, ENTITY, INVENTORY, ENDER_CHEST;
 
-	public record PlayerInfo(String name, String dimension, double x, double y, double z, List<Item> inventory, List<Item> enderChest) {
-	}
-
-	/** Everything at one moment: saved data merged with the live loaded chunks. */
-	public record Snapshot(List<Holder> holders, List<PlayerInfo> players, Map<ChunkKey, Long> inhabitedTicks) {
-		/** How long players have spent within mob-spawning range (128 blocks) of a chunk, or -1 if it was never generated. */
-		public long inhabited(String dimension, int chunkX, int chunkZ) {
-			return inhabitedTicks.getOrDefault(new ChunkKey(dimension, chunkX, chunkZ, false), -1L);
+			/** A player's inventory or ender chest, whose {@code type} is the player's name. */
+			public boolean ofPlayer() {
+				return this == INVENTORY || this == ENDER_CHEST;
+			}
 		}
 	}
 
-	private volatile MinecraftServer server;
-	/** Last-seen save timestamp per chunk, so rescans only parse what changed. */
-	private final Map<ChunkKey, Integer> timestamps = new ConcurrentHashMap<>();
-	private final Map<ChunkKey, List<Holder>> savedHolders = new ConcurrentHashMap<>();
-	private final Map<ChunkKey, Long> savedInhabited = new ConcurrentHashMap<>();
-	/** InhabitedTime recorded from loaded chunks, which the save may lack (see the class comment). */
-	private final Map<ChunkKey, Long> trackedInhabited = new ConcurrentHashMap<>();
-	/**
-	 * Which blocks each saved chunk may contain (the union of its sections' palettes, as sorted ids from
-	 * {@link #blockIds}), so block searches only re-read chunks that can hold a match. Ints rather than strings keep
-	 * this small in big worlds.
-	 */
-	private final Map<ChunkKey, int[]> savedBlocks = new ConcurrentHashMap<>();
-	private final Map<String, Integer> blockIds = new ConcurrentHashMap<>();
-	private final Map<String, Path> dimensionDirs = new ConcurrentHashMap<>();
-	private int failuresLogged;
+	/** A player in the world right now. */
+	public record PlayerInfo(UUID id, String name, ResourceKey<Level> dimension, double x, double y, double z,
+		List<Item> inventory, List<Item> enderChest) {
+		public Origin origin() {
+			return Origin.at(dimension, x, y, z);
+		}
+
+		/** The inventory and ender chest as holders, so item searches find what the player carries. */
+		public List<Holder> holders() {
+			int bx = (int) Math.floor(x);
+			int by = (int) Math.floor(y);
+			int bz = (int) Math.floor(z);
+			return List.of(
+				new Holder(Holder.Kind.INVENTORY, dimension, bx, by, bz, name, null, null, false, inventory, Provenance.LIVE),
+				new Holder(Holder.Kind.ENDER_CHEST, dimension, bx, by, bz, name, null, null, false, enderChest, Provenance.LIVE));
+		}
+	}
+
+	/** How much a snapshot captures. */
+	public enum Detail {
+		/** Players, how long they've spent near each chunk, and reads of saved chunks. Cheap. */
+		VISITS,
+		/** Also every container and entity, which means saving every loaded block entity and entity to NBT. */
+		HOLDERS
+	}
+
+	/** The world at one moment: saved data merged with the live chunks, plus reads of the saved chunks. */
+	public static final class Snapshot {
+		private final World world;
+		private final List<Holder> holders;
+		private final List<PlayerInfo> players;
+		private final UUID hostId;
+		private final Map<ChunkKey, Long> inhabitedTicks;
+
+		private Snapshot(World world, List<Holder> holders, List<PlayerInfo> players, UUID hostId, Map<ChunkKey, Long> inhabitedTicks) {
+			this.world = world;
+			this.holders = holders;
+			this.players = players;
+			this.hostId = hostId;
+			this.inhabitedTicks = inhabitedTicks;
+		}
+
+		public MinecraftServer server() {
+			return world.server;
+		}
+
+		/** Every container and entity worth finding. Only in a {@link Detail#HOLDERS} snapshot. */
+		public List<Holder> holders() {
+			if (holders == null) {
+				throw new IllegalStateException("This snapshot was taken without holders");
+			}
+			return holders;
+		}
+
+		public List<PlayerInfo> players() {
+			return players;
+		}
+
+		/** The player whose game this is (on a LAN world, not a guest). Distances and directions are from them. */
+		public PlayerInfo host() {
+			return players.stream().filter(player -> player.id().equals(hostId)).findFirst()
+				.orElseThrow(() -> new IllegalStateException("The player isn't in the world."));
+		}
+
+		/** How long players have spent within 128 blocks of a chunk; not generated if it isn't fully generated. */
+		public Visit visit(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
+			Long ticks = inhabitedTicks.get(new ChunkKey(dimension, chunkX, chunkZ));
+			return ticks == null ? Visit.NOT_GENERATED : Visit.of(ticks);
+		}
+
+		public Visit.ByChunk visits(ResourceKey<Level> dimension) {
+			return (chunkX, chunkZ) -> visit(dimension, chunkX, chunkZ);
+		}
+
+		/**
+		 * Saved, fully generated chunks of a dimension whose palettes include any of these block ids. Includes live
+		 * chunks; callers prefer the live copy of those.
+		 */
+		public List<ChunkKey> savedChunksContaining(ResourceKey<Level> dimension, Set<String> blockIds) {
+			return world.savedChunksContaining(dimension, blockIds);
+		}
+
+		/**
+		 * Re-reads one saved chunk, upgraded to the current version; empty if it isn't on disk. Any thread, but it's
+		 * file IO: on the server thread, only for a few chunks.
+		 */
+		public Optional<SavedChunk> readSavedChunk(ChunkKey key) throws IOException {
+			return world.readSavedChunk(key);
+		}
+	}
+
+	private volatile World world;
 
 	/** A single-player world opened. Scans it in the background so the first question is quick. */
 	public void start(MinecraftServer server) {
-		this.server = server;
-		timestamps.clear();
-		savedHolders.clear();
-		savedInhabited.clear();
-		trackedInhabited.clear();
-		savedBlocks.clear();
-		dimensionDirs.clear();
+		World opened = new World(server);
+		World previous = world;
+		if (previous != null) {
+			previous.close();
+		}
+		world = opened;
 		// Before anything can save it again, or the next save would drop what earlier sessions recorded.
-		loadVisits(server);
+		opened.loadVisits();
 		Thread thread = new Thread(() -> {
 			try {
-				snapshot();
+				opened.snapshot(Detail.VISITS);
 			} catch (Exception e) {
-				ClaudeChatClient.LOGGER.warn("Could not index the world", e);
+				if (!opened.closed) {
+					ClaudeChatClient.LOGGER.warn("Could not index the world", e);
+				}
 			}
 		}, "Claude Chat world index");
 		thread.setDaemon(true);
@@ -144,514 +205,461 @@ public class WorldIndex {
 	}
 
 	public void stop() {
-		server = null;
+		World closing = world;
+		world = null;
+		if (closing != null) {
+			closing.close();
+		}
 	}
 
+	/** The open world's server, or null. */
 	public MinecraftServer server() {
-		return server;
+		World open = world;
+		return open == null ? null : open.server;
 	}
 
 	/**
-	 * Rescan chunks saved since last time, capture the loaded ones live, and merge. Usually well under a second.
-	 * Call from a background thread (not the server or render thread).
+	 * Rescans chunks saved since last time and captures the live ones. Usually well under a second. Not on the server
+	 * thread: it waits for it.
 	 */
-	public synchronized Snapshot snapshot() throws Exception {
-		MinecraftServer server = this.server;
-		if (server == null) {
+	public Snapshot snapshot(Detail detail) throws Exception {
+		World open = world;
+		if (open == null) {
 			throw new IllegalStateException("No single-player world is open.");
 		}
-		long start = System.nanoTime();
-		RegistryOps<Tag> ops = server.registryAccess().createSerializationContext(NbtOps.INSTANCE);
-		Path worldRoot = server.getWorldPath(LevelResource.ROOT);
-		int changed = 0;
-		for (ServerLevel level : server.getAllLevels()) {
-			Path dimensionDir = DimensionType.getStorageFolder(level.dimension(), worldRoot);
-			dimensionDirs.put(dimensionName(level.dimension()), dimensionDir);
-			changed += scanRegions(server, ops, dimensionName(level.dimension()), dimensionDir.resolve("region"), false);
-			changed += scanRegions(server, ops, dimensionName(level.dimension()), dimensionDir.resolve("entities"), true);
-		}
+		return open.snapshot(detail);
+	}
 
-		Live live = server.submit(() -> captureLive(server, ops)).get(20, TimeUnit.SECONDS);
-		List<Holder> holders = new ArrayList<>();
-		savedHolders.forEach((key, chunkHolders) -> {
-			if (!live.loaded().contains(key)) {
-				holders.addAll(chunkHolders);
-			}
-		});
-		holders.addAll(live.holders());
-		Map<ChunkKey, Long> inhabited = new HashMap<>(savedInhabited);
-		trackedInhabited.forEach((key, ticks) -> inhabited.merge(key, ticks, Math::max));
-		live.inhabited().forEach((key, ticks) -> inhabited.merge(key, ticks, Math::max));
-
-		ClaudeChatClient.LOGGER.debug("World snapshot: {} saved chunks re-read, {} holders, {} ms",
-			changed, holders.size(), TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
-		return new Snapshot(holders, live.players(), inhabited);
+	/** Server thread. The player whose game this is, if they're in the world. */
+	public static Optional<ServerPlayer> host(MinecraftServer server) {
+		ServerTasks.requireServerThread(server);
+		var profile = server.getSingleplayerProfile();
+		return profile == null ? Optional.empty() : Optional.ofNullable(server.getPlayerList().getPlayer(profile.id()));
 	}
 
 	// --- time spent near chunks ----------------------------------------------------------------------------------
 
 	/** Server thread: a chunk is unloading. Remember its time, which the game may not write. */
 	public void chunkUnloaded(ServerLevel level, LevelChunk chunk) {
-		if (server != null && chunk.getInhabitedTime() > 0) {
-			ChunkKey key = new ChunkKey(dimensionName(level.dimension()), chunk.getPos().x(), chunk.getPos().z(), false);
-			trackedInhabited.merge(key, chunk.getInhabitedTime(), Math::max);
+		World open = openFor(level.getServer());
+		if (open != null) {
+			open.record(level, chunk);
 		}
 	}
 
-	/** Server thread: records the time of the chunks around players, which don't unload while the world is closing. */
+	/** Server thread: records the time of the live chunks, which don't unload while the world is closing. */
 	public void recordLoadedChunks(MinecraftServer server) {
-		if (this.server != server) {
+		World open = openFor(server);
+		if (open == null) {
 			return;
 		}
 		for (ServerLevel level : server.getAllLevels()) {
-			for (LevelChunk chunk : loadedChunks(server, level)) {
-				chunkUnloaded(level, chunk);
-			}
+			LiveChunks.in(level).forEach(chunk -> open.record(level, chunk));
 		}
 	}
 
 	/** Server thread, after a save: writes the recorded times the saved chunks lack. Small: one line per chunk. */
 	public void saveVisits(MinecraftServer server) {
-		if (this.server != server) {
+		World open = openFor(server);
+		if (open == null) {
 			return;
 		}
 		recordLoadedChunks(server);
-		StringBuilder out = new StringBuilder("# Claude Chat: time players spent near chunks, which Minecraft doesn't always save.\n"
-			+ "# dimension chunkX chunkZ ticks\n");
-		trackedInhabited.forEach((key, ticks) -> {
-			if (ticks > savedInhabited.getOrDefault(key, -1L)) {
-				out.append(key.dimension()).append(' ').append(key.x()).append(' ').append(key.z()).append(' ').append(ticks).append('\n');
+		open.saveVisits();
+	}
+
+	private World openFor(MinecraftServer server) {
+		ServerTasks.requireServerThread(server);
+		World open = world;
+		return open != null && open.server == server ? open : null;
+	}
+
+	/**
+	 * InhabitedTime per chunk: the save's, raised by recorded and live times. A recorded time counts only while the
+	 * save shows its chunk fully generated or the chunk is live: a chunk trimmed from the save (with a world editor,
+	 * say) generates afresh, unvisited.
+	 */
+	static Map<ChunkKey, Long> inhabitedTimes(Map<ChunkKey, Long> saved, Map<ChunkKey, Long> recorded, Map<ChunkKey, Long> live) {
+		Map<ChunkKey, Long> times = new HashMap<>(saved);
+		recorded.forEach((key, ticks) -> {
+			if (stillExists(key, saved, live)) {
+				times.merge(key, ticks, Math::max);
 			}
 		});
-		Path file = server.getWorldPath(LevelResource.ROOT).resolve(VISITS_FILE);
-		Path temp = file.resolveSibling(VISITS_FILE + ".tmp");
-		try {
-			Files.writeString(temp, out);
-			Files.move(temp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
-		} catch (IOException e) {
-			ClaudeChatClient.LOGGER.warn("Could not save {}", file, e);
+		live.forEach((key, ticks) -> times.merge(key, ticks, Math::max));
+		return times;
+	}
+
+	private static boolean stillExists(ChunkKey key, Map<ChunkKey, Long> saved, Map<ChunkKey, Long> live) {
+		return saved.containsKey(key) || live.containsKey(key);
+	}
+
+	// --- one open world ---------------------------------------------------------------------------------------------
+
+	/** What the game has right now; {@code holders} is null unless asked for. */
+	private record Live(Set<ChunkKey> chunks, Map<ChunkKey, Long> inhabited, List<Holder> holders, List<PlayerInfo> players, UUID hostId) {
+	}
+
+	/** One pass over the saves: how many chunks were re-read, and whether every file could be read. */
+	private record Scan(int changed, boolean complete) {
+	}
+
+	/** What's known from one region folder of every dimension: "region" (blocks) or "entities". */
+	private static final class Folder {
+		final String name;
+		/** Last-seen save timestamp per chunk, so rescans only parse what changed. */
+		final Map<ChunkKey, Integer> timestamps = new ConcurrentHashMap<>();
+		final Map<ChunkKey, List<Holder>> holders = new ConcurrentHashMap<>();
+
+		Folder(String name) {
+			this.name = name;
 		}
 	}
 
-	private void loadVisits(MinecraftServer server) {
-		Path file = server.getWorldPath(LevelResource.ROOT).resolve(VISITS_FILE);
-		if (!Files.isRegularFile(file)) {
-			return;
+	@FunctionalInterface
+	private interface ChunkHandler {
+		void read(ChunkKey key, CompoundTag chunk);
+	}
+
+	/** Everything known about one open world. Dropped (and closed) when the world closes. */
+	private static final class World {
+		final MinecraftServer server;
+		final Path root;
+		final Map<ResourceKey<Level>, Path> dimensionDirs = new HashMap<>();
+		final Folder blockChunks = new Folder("region");
+		final Folder entityChunks = new Folder("entities");
+		/** InhabitedTime of saved chunks that are fully generated. */
+		final Map<ChunkKey, Long> savedInhabited = new ConcurrentHashMap<>();
+		/** InhabitedTime recorded from live chunks, which the save may lack (see the class comment). */
+		final Map<ChunkKey, Long> recordedInhabited = new ConcurrentHashMap<>();
+		/**
+		 * Which blocks each fully generated saved chunk may contain (the union of its sections' palettes, as sorted ids
+		 * from {@link #blockIds}), so block searches only re-read chunks that can hold a match. Ints rather than strings
+		 * keep this small in big worlds.
+		 */
+		final Map<ChunkKey, int[]> savedBlocks = new ConcurrentHashMap<>();
+		final Map<String, Integer> blockIds = new ConcurrentHashMap<>();
+		/** Read failures so far; guarded by the scan's lock. */
+		int failures;
+		volatile boolean closed;
+
+		World(MinecraftServer server) {
+			this.server = server;
+			this.root = server.getWorldPath(LevelResource.ROOT);
+			for (ResourceKey<Level> dimension : server.levelKeys()) {
+				dimensionDirs.put(dimension, DimensionType.getStorageFolder(dimension, root));
+			}
 		}
-		try (Stream<String> lines = Files.lines(file)) {
-			lines.filter(line -> !line.startsWith("#")).forEach(line -> {
-				String[] parts = line.trim().split(" ");
-				if (parts.length == 4) {
-					try {
-						ChunkKey key = new ChunkKey(parts[0], Integer.parseInt(parts[1]), Integer.parseInt(parts[2]), false);
-						trackedInhabited.merge(key, Long.parseLong(parts[3]), Math::max);
-					} catch (NumberFormatException e) {
-						// a hand-edited line; skip it
+
+		void close() {
+			closed = true;
+		}
+
+		Snapshot snapshot(Detail detail) throws Exception {
+			ServerTasks.requireOffServerThread(server);
+			requireOpen();
+			long start = System.nanoTime();
+			Scan scan = scanSaves();
+			Live live = ServerTasks.call(server, () -> captureLive(detail), LIVE_CAPTURE_TIMEOUT, "Reading the loaded chunks");
+
+			// A chunk that couldn't be read this time (mid-write, say) isn't gone; prune only after a clean scan.
+			if (scan.complete()) {
+				recordedInhabited.keySet().removeIf(key -> !stillExists(key, savedInhabited, live.inhabited()));
+			}
+			Map<ChunkKey, Long> inhabited = inhabitedTimes(savedInhabited, recordedInhabited, live.inhabited());
+			List<Holder> holders = live.holders() == null ? null : mergeHolders(live);
+			ClaudeChatClient.LOGGER.debug("World snapshot: {} saved chunks re-read, {} ms", scan.changed(),
+				TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start));
+			return new Snapshot(this, holders, live.players(), live.hostId(), inhabited);
+		}
+
+		/** Saved holders except in live chunks, whose live copy replaces them. */
+		private List<Holder> mergeHolders(Live live) {
+			List<Holder> holders = new ArrayList<>();
+			for (Folder folder : List.of(blockChunks, entityChunks)) {
+				folder.holders.forEach((key, chunkHolders) -> {
+					if (!live.chunks().contains(key)) {
+						holders.addAll(chunkHolders);
 					}
+				});
+			}
+			holders.addAll(live.holders());
+			return holders;
+		}
+
+		private void requireOpen() {
+			if (closed) {
+				throw new IllegalStateException("The world was closed.");
+			}
+		}
+
+		// --- saved chunks -----------------------------------------------------------------------------------------
+
+		/** Re-reads every chunk saved since the last scan, in every dimension. */
+		synchronized Scan scanSaves() {
+			RegistryOps<Tag> ops = server.registryAccess().createSerializationContext(NbtOps.INSTANCE);
+			int failuresBefore = failures;
+			int changed = 0;
+			for (ResourceKey<Level> dimension : dimensionDirs.keySet()) {
+				changed += scanFolder(dimension, blockChunks, (key, tag) -> readBlockChunk(ops, key, tag), this::forgetBlockChunk);
+				changed += scanFolder(dimension, entityChunks, (key, tag) -> readEntityChunk(ops, key, tag), key -> {
+				});
+			}
+			return new Scan(changed, failures == failuresBefore);
+		}
+
+		private void readBlockChunk(RegistryOps<Tag> ops, ChunkKey key, CompoundTag tag) {
+			SavedChunk chunk = new SavedChunk(upgrade(tag, DataFixTypes.CHUNK));
+			List<Holder> holders = new ArrayList<>();
+			for (CompoundTag blockEntity : chunk.blockEntities().values()) {
+				HolderReader.blockEntity(ops, key.dimension(), blockEntity, Provenance.SAVED).ifPresent(holders::add);
+			}
+			blockChunks.holders.put(key, holders);
+			if (chunk.fullyGenerated()) {
+				savedInhabited.put(key, chunk.inhabitedTicks());
+				savedBlocks.put(key, paletteIds(chunk));
+			} else {
+				savedInhabited.remove(key);
+				savedBlocks.remove(key);
+			}
+		}
+
+		private void readEntityChunk(RegistryOps<Tag> ops, ChunkKey key, CompoundTag tag) {
+			List<Holder> holders = new ArrayList<>();
+			for (CompoundTag entity : SavedChunk.entityTags(upgrade(tag, DataFixTypes.ENTITY_CHUNK))) {
+				HolderReader.entity(ops, key.dimension(), entity.getStringOr("id", "?"), entity, Provenance.SAVED).ifPresent(holders::add);
+			}
+			entityChunks.holders.put(key, holders);
+		}
+
+		/** Deleted (trimmed with a world editor, say): it will generate afresh, unvisited. */
+		private void forgetBlockChunk(ChunkKey key) {
+			savedInhabited.remove(key);
+			savedBlocks.remove(key);
+		}
+
+		/**
+		 * Re-reads the chunks of one folder saved since last time, and forgets chunks no longer in it. A region that
+		 * can't be read right now keeps what was known about it. Returns how many chunks were re-read.
+		 */
+		private int scanFolder(ResourceKey<Level> dimension, Folder folder, ChunkHandler handler, Consumer<ChunkKey> forget) {
+			Path dir = dimensionDirs.get(dimension).resolve(folder.name);
+			List<RegionFiles.Region> regions;
+			try {
+				regions = RegionFiles.list(dir);
+			} catch (IOException e) {
+				logFailure("Could not list " + dir, e);
+				return 0;
+			}
+
+			Set<ChunkKey> present = new HashSet<>();
+			int changed = 0;
+			for (RegionFiles.Region region : regions) {
+				try (FileChannel channel = FileChannel.open(region.file(), StandardOpenOption.READ)) {
+					Optional<RegionFiles.Header> header = RegionFiles.readHeader(channel);
+					if (header.isEmpty()) {
+						keepKnown(folder, dimension, region, present);
+						continue;
+					}
+					changed += scanRegion(channel, dimension, region, header.get(), folder, handler, present);
+				} catch (IOException e) {
+					logFailure("Could not read region " + region.file(), e);
+					keepKnown(folder, dimension, region, present);
 				}
-			});
-		} catch (IOException e) {
-			ClaudeChatClient.LOGGER.warn("Could not read {}", file, e);
-		}
-	}
+			}
 
-	// --- saved chunks ---------------------------------------------------------------------------------------------
+			for (ChunkKey key : List.copyOf(folder.timestamps.keySet())) {
+				if (key.dimension().equals(dimension) && !present.contains(key)) {
+					folder.timestamps.remove(key);
+					folder.holders.remove(key);
+					forget.accept(key);
+				}
+			}
+			return changed;
+		}
 
-	private int scanRegions(MinecraftServer server, RegistryOps<Tag> ops, String dimension, Path dir, boolean entities) {
-		if (!Files.isDirectory(dir)) {
-			return 0;
-		}
-		int changed = 0;
-		List<Path> regions;
-		try (Stream<Path> files = Files.list(dir)) {
-			regions = files.filter(f -> REGION_NAME.matcher(f.getFileName().toString()).matches()).toList();
-		} catch (IOException e) {
-			return 0;
-		}
-		for (Path region : regions) {
-			Matcher m = REGION_NAME.matcher(region.getFileName().toString());
-			m.matches();
-			int regionX = Integer.parseInt(m.group(1));
-			int regionZ = Integer.parseInt(m.group(2));
-			try (FileChannel channel = FileChannel.open(region, StandardOpenOption.READ)) {
-				if (channel.size() < 8192) {
+		private int scanRegion(FileChannel channel, ResourceKey<Level> dimension, RegionFiles.Region region, RegionFiles.Header header,
+			Folder folder, ChunkHandler handler, Set<ChunkKey> present) throws IOException {
+			int changed = 0;
+			for (int i = 0; i < header.locations().length; i++) {
+				int location = header.locations()[i];
+				if (location == 0) {
 					continue;
 				}
-				ByteBuffer header = ByteBuffer.allocate(8192);
-				readFully(channel, header, 0);
-				for (int i = 0; i < 1024; i++) {
-					int location = header.getInt(i * 4);
-					ChunkKey key = new ChunkKey(dimension, regionX * 32 + (i & 31), regionZ * 32 + (i >> 5), entities);
-					if (location == 0) {
-						if (timestamps.remove(key) != null) {
-							// Deleted (trimmed with a world editor, say): it will generate afresh, unvisited.
-							savedHolders.remove(key);
-							savedInhabited.remove(key);
-							trackedInhabited.remove(key);
-							savedBlocks.remove(key);
-						}
-						continue;
-					}
-					int timestamp = header.getInt(4096 + i * 4);
-					if (Integer.valueOf(timestamp).equals(timestamps.get(key))) {
-						continue;
-					}
-					// The game may be writing this region right now; a torn read just fails and is retried next time.
-					try {
-						CompoundTag chunk = readChunk(channel, region, location, key);
-						if (chunk != null) {
-							chunk = upgrade(server, chunk, entities ? DataFixTypes.ENTITY_CHUNK : DataFixTypes.CHUNK);
-							savedHolders.put(key, describeChunk(ops, dimension, chunk, entities));
-							if (!entities) {
-								// Only fully generated chunks count: structure searches (ours and /locate's) can leave
-								// partly generated "structure starts" chunks on disk that nobody has ever been near.
-								String status = chunk.getStringOr("Status", "");
-								if (status.equals("minecraft:full") || status.equals("full")) {
-									savedInhabited.put(key, chunk.getLongOr("InhabitedTime", 0L));
-									savedBlocks.put(key, paletteIds(chunk));
-								} else {
-									savedInhabited.remove(key);
-									savedBlocks.remove(key);
-								}
-							}
-							timestamps.put(key, timestamp);
-							changed++;
-						}
-					} catch (IOException | RuntimeException e) {
-						logFailure("Skipping chunk " + key + " for now", e);
-					}
-				}
-			} catch (IOException e) {
-				logFailure("Could not read region " + region, e);
-			}
-		}
-		return changed;
-	}
 
-	/** Every block id in the chunk's section palettes. Palettes can list blocks that are no longer there, never the reverse. */
-	private int[] paletteIds(CompoundTag chunk) {
-		Set<Integer> ids = new HashSet<>();
-		for (CompoundTag section : compounds(chunk.getListOrEmpty("sections"))) {
-			section.getCompound("block_states").ifPresent(states -> {
-				for (Tag entry : states.getListOrEmpty("palette")) {
-					ids.add(blockIds.computeIfAbsent(paletteName(entry), name -> blockIds.size()));
+				ChunkKey key = new ChunkKey(dimension, region.chunkX(i), region.chunkZ(i));
+				present.add(key);
+				int timestamp = header.timestamps()[i];
+				if (Integer.valueOf(timestamp).equals(folder.timestamps.get(key))) {
+					continue;
+				}
+				// The game may be writing this region right now; a torn read just fails and is retried next time.
+				try {
+					Optional<CompoundTag> chunk = RegionFiles.readChunk(channel, region, location, key.x(), key.z());
+					if (chunk.isPresent()) {
+						handler.read(key, chunk.get());
+						folder.timestamps.put(key, timestamp);
+						changed++;
+					}
+				} catch (IOException | RuntimeException e) {
+					logFailure("Skipping chunk " + key + " for now", e);
+				}
+			}
+			return changed;
+		}
+
+		private static void keepKnown(Folder folder, ResourceKey<Level> dimension, RegionFiles.Region region, Set<ChunkKey> present) {
+			folder.timestamps.keySet().stream()
+				.filter(key -> key.dimension().equals(dimension) && region.contains(key.x(), key.z()))
+				.forEach(present::add);
+		}
+
+		private int[] paletteIds(SavedChunk chunk) {
+			return chunk.paletteBlockIds().stream().mapToInt(name -> blockIds.computeIfAbsent(name, n -> blockIds.size())).sorted().toArray();
+		}
+
+		List<ChunkKey> savedChunksContaining(ResourceKey<Level> dimension, Set<String> ids) {
+			int[] wanted = ids.stream().map(blockIds::get).filter(Objects::nonNull).mapToInt(Integer::intValue).toArray();
+			List<ChunkKey> chunks = new ArrayList<>();
+			if (wanted.length == 0) {
+				return chunks;
+			}
+			savedBlocks.forEach((key, palette) -> {
+				if (key.dimension().equals(dimension) && Arrays.stream(wanted).anyMatch(id -> Arrays.binarySearch(palette, id) >= 0)) {
+					chunks.add(key);
 				}
 			});
-		}
-		return ids.stream().mapToInt(Integer::intValue).sorted().toArray();
-	}
-
-	/**
-	 * The block id of a section palette entry. In 26.x a block in its default state is saved as just its id
-	 * ("minecraft:spawner"); other states are {id, properties} compounds (before 26.x, {Name, Properties}).
-	 */
-	public static String paletteName(Tag entry) {
-		if (entry instanceof CompoundTag compound) {
-			return compound.getString("id").or(() -> compound.getString("Name")).orElse("");
-		}
-		return entry.asString().orElse("");
-	}
-
-	/**
-	 * Saved, fully generated block chunks of a dimension whose palettes include any of these block ids, as of the last
-	 * {@link #snapshot()}. Includes chunks that are loaded right now; callers prefer the live copy of those.
-	 */
-	public List<ChunkKey> savedChunksContaining(String dimension, Set<String> ids) {
-		int[] wanted = ids.stream().map(blockIds::get).filter(Objects::nonNull).mapToInt(Integer::intValue).toArray();
-		List<ChunkKey> chunks = new ArrayList<>();
-		if (wanted.length == 0) {
 			return chunks;
 		}
-		savedBlocks.forEach((key, palette) -> {
-			if (key.dimension().equals(dimension) && Arrays.stream(wanted).anyMatch(id -> Arrays.binarySearch(palette, id) >= 0)) {
-				chunks.add(key);
+
+		Optional<SavedChunk> readSavedChunk(ChunkKey key) throws IOException {
+			requireOpen();
+			Path dimensionDir = dimensionDirs.get(key.dimension());
+			if (dimensionDir == null) {
+				throw new IllegalArgumentException("No dimension " + key.dimension().identifier() + " in this world");
 			}
-		});
-		return chunks;
-	}
+			return RegionFiles.readChunk(dimensionDir.resolve(blockChunks.name), key.x(), key.z())
+				.map(tag -> new SavedChunk(upgrade(tag, DataFixTypes.CHUNK)));
+		}
 
-	/** Re-read one saved chunk, upgraded to the current version, or null if it isn't on disk. Any thread. */
-	public CompoundTag readSavedChunk(ChunkKey key) throws IOException {
-		MinecraftServer server = this.server;
-		Path dimensionDir = dimensionDirs.get(key.dimension());
-		if (server == null || dimensionDir == null) {
-			return null;
-		}
-		Path region = dimensionDir.resolve(key.entities() ? "entities" : "region")
-			.resolve("r." + (key.x() >> 5) + "." + (key.z() >> 5) + ".mca");
-		if (!Files.isRegularFile(region)) {
-			return null;
-		}
-		try (FileChannel channel = FileChannel.open(region, StandardOpenOption.READ)) {
-			ByteBuffer entry = ByteBuffer.allocate(4);
-			readFully(channel, entry, ((key.x() & 31) + (key.z() & 31) * 32) * 4L);
-			int location = entry.getInt(0);
-			if (location == 0) {
-				return null;
+		/** Chunks saved by older versions are upgraded with the game's own data fixers; if that fails, use them as they are. */
+		private CompoundTag upgrade(CompoundTag chunk, DataFixTypes type) {
+			int current = SharedConstants.getCurrentVersion().dataVersion().version();
+			int version = NbtUtils.getDataVersion(chunk, current);
+			if (version >= current) {
+				return chunk;
 			}
-			CompoundTag chunk = readChunk(channel, region, location, key);
-			return chunk == null ? null : upgrade(server, chunk, key.entities() ? DataFixTypes.ENTITY_CHUNK : DataFixTypes.CHUNK);
-		}
-	}
-
-	/** Warn about the first few failures (a torn read now and then is normal; a failure on every chunk is a bug). */
-	private void logFailure(String message, Exception e) {
-		if (failuresLogged++ < 3) {
-			ClaudeChatClient.LOGGER.warn(message, e);
-		} else {
-			ClaudeChatClient.LOGGER.debug(message, e);
-		}
-	}
-
-	private static CompoundTag readChunk(FileChannel channel, Path region, int location, ChunkKey key) throws IOException {
-		long offset = (long) (location >>> 8) * 4096;
-		// While the game runs, the region file isn't padded to whole sectors yet (that happens when it's closed),
-		// so read the chunk's own length rather than assuming its last sector is complete.
-		ByteBuffer prefix = ByteBuffer.allocate(5);
-		readFully(channel, prefix, offset);
-		int length = prefix.getInt(0);
-		byte type = prefix.get(4);
-		if (length <= 1 || length > (location & 0xFF) * 4096) {
-			return null;
-		}
-		ByteBuffer data = ByteBuffer.allocate(4 + length);
-		readFully(channel, data, offset);
-		InputStream raw;
-		if ((type & 0x80) != 0) {
-			// Oversized chunk stored next to the region file as c.<x>.<z>.mcc
-			raw = Files.newInputStream(region.resolveSibling("c." + key.x() + "." + key.z() + ".mcc"));
-		} else {
-			raw = new ByteArrayInputStream(data.array(), 5, length - 1);
-		}
-		RegionFileVersion version = RegionFileVersion.fromId(type & 0x7F);
-		if (version == null) {
-			raw.close();
-			return null;
-		}
-		try (DataInputStream in = new DataInputStream(version.wrap(raw))) {
-			return NbtIo.read(in);
-		}
-	}
-
-	private static void readFully(FileChannel channel, ByteBuffer buffer, long position) throws IOException {
-		while (buffer.hasRemaining()) {
-			if (channel.read(buffer, position + buffer.position()) < 0) {
-				throw new IOException("unexpected end of region file at " + (position + buffer.position()) + " of " + channel.size());
+			try {
+				return type.updateToCurrentVersion(server.getFixerUpper(), chunk, version);
+			} catch (RuntimeException e) {
+				return chunk;
 			}
 		}
-	}
 
-	private static List<Holder> describeChunk(RegistryOps<Tag> ops, String dimension, CompoundTag chunk, boolean entities) {
-		List<Holder> holders = new ArrayList<>();
-		if (entities) {
-			for (CompoundTag entity : compounds(chunk.getListOrEmpty("Entities"))) {
-				addIfPresent(holders, describeEntity(ops, dimension, entity.getStringOr("id", "?"), entity, false));
-			}
-		} else {
-			for (CompoundTag blockEntity : compounds(chunk.getListOrEmpty("block_entities"))) {
-				addIfPresent(holders, describeBlockEntity(ops, dimension, blockEntity, false));
+		/** Warn about the first few failures (a torn read now and then is normal; a failure on every chunk is a bug). */
+		private void logFailure(String message, Exception e) {
+			if (failures++ < 3) {
+				ClaudeChatClient.LOGGER.warn(message, e);
+			} else {
+				ClaudeChatClient.LOGGER.debug(message, e);
 			}
 		}
-		return holders;
-	}
 
-	/** Chunks saved by older versions are upgraded with the game's own data fixers; if that fails, use them as they are. */
-	private static CompoundTag upgrade(MinecraftServer server, CompoundTag chunk, DataFixTypes type) {
-		int current = SharedConstants.getCurrentVersion().dataVersion().version();
-		int version = NbtUtils.getDataVersion(chunk, current);
-		if (version >= current) {
-			return chunk;
+		// --- time spent near chunks ---------------------------------------------------------------------------------
+
+		void record(ServerLevel level, LevelChunk chunk) {
+			if (chunk.getInhabitedTime() > 0) {
+				ChunkKey key = new ChunkKey(level.dimension(), chunk.getPos().x(), chunk.getPos().z());
+				recordedInhabited.merge(key, chunk.getInhabitedTime(), Math::max);
+			}
 		}
-		try {
-			return type.updateToCurrentVersion(server.getFixerUpper(), chunk, version);
-		} catch (RuntimeException e) {
-			return chunk;
+
+		void loadVisits() {
+			try {
+				VisitsFile.read(root).forEach((key, ticks) -> recordedInhabited.merge(key, ticks, Math::max));
+			} catch (IOException e) {
+				ClaudeChatClient.LOGGER.warn("Could not read {}", root.resolve(VisitsFile.NAME), e);
+			}
 		}
-	}
 
-	// --- live state -----------------------------------------------------------------------------------------------
+		void saveVisits() {
+			Map<ChunkKey, Long> newerThanSave = new HashMap<>();
+			recordedInhabited.forEach((key, ticks) -> {
+				if (ticks > savedInhabited.getOrDefault(key, -1L)) {
+					newerThanSave.put(key, ticks);
+				}
+			});
+			try {
+				VisitsFile.write(root, newerThanSave);
+			} catch (IOException e) {
+				ClaudeChatClient.LOGGER.warn("Could not save {}", root.resolve(VisitsFile.NAME), e);
+			}
+		}
 
-	private record Live(Set<ChunkKey> loaded, List<Holder> holders, List<PlayerInfo> players, Map<ChunkKey, Long> inhabited) {
-	}
+		// --- live state -------------------------------------------------------------------------------------------
 
-	/** Server thread: what's in the chunks around players right now, plus the players themselves. */
-	private static Live captureLive(MinecraftServer server, RegistryOps<Tag> ops) {
-		Set<ChunkKey> loaded = new HashSet<>();
-		List<Holder> holders = new ArrayList<>();
-		List<PlayerInfo> players = new ArrayList<>();
-		Map<ChunkKey, Long> inhabited = new HashMap<>();
-		for (ServerLevel level : server.getAllLevels()) {
-			String dimension = dimensionName(level.dimension());
-			for (LevelChunk chunk : loadedChunks(server, level)) {
-				ChunkKey blocks = new ChunkKey(dimension, chunk.getPos().x(), chunk.getPos().z(), false);
-				loaded.add(blocks);
-				loaded.add(new ChunkKey(dimension, blocks.x(), blocks.z(), true));
-				inhabited.put(blocks, chunk.getInhabitedTime());
-				for (BlockEntity blockEntity : chunk.getBlockEntities().values()) {
-					try {
-						addIfPresent(holders, describeBlockEntity(ops, dimension, blockEntity.saveWithFullMetadata(server.registryAccess()), true));
-					} catch (RuntimeException e) {
-						ClaudeChatClient.LOGGER.debug("Skipping block entity at {}", blockEntity.getBlockPos(), e);
+		/** Server thread: what the live chunks hold right now, plus the players. */
+		private Live captureLive(Detail detail) {
+			ServerTasks.requireServerThread(server);
+			RegistryOps<Tag> ops = server.registryAccess().createSerializationContext(NbtOps.INSTANCE);
+			Set<ChunkKey> chunks = new HashSet<>();
+			Map<ChunkKey, Long> inhabited = new HashMap<>();
+			List<Holder> holders = detail == Detail.HOLDERS ? new ArrayList<>() : null;
+			for (ServerLevel level : server.getAllLevels()) {
+				ResourceKey<Level> dimension = level.dimension();
+				for (LevelChunk chunk : LiveChunks.in(level)) {
+					ChunkKey key = new ChunkKey(dimension, chunk.getPos().x(), chunk.getPos().z());
+					chunks.add(key);
+					inhabited.put(key, chunk.getInhabitedTime());
+					if (holders != null) {
+						addBlockEntities(ops, dimension, chunk, holders);
 					}
 				}
+				if (holders != null) {
+					addEntities(ops, level, chunks, holders);
+				}
 			}
+
+			List<PlayerInfo> players = new ArrayList<>();
+			for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+				CompoundTag tag = save(player);
+				players.add(new PlayerInfo(player.getUUID(), player.getName().getString(), player.level().dimension(),
+					player.getX(), player.getY(), player.getZ(), HolderReader.playerInventory(ops, tag), HolderReader.playerEnderChest(ops, tag)));
+			}
+			UUID hostId = host(server).map(Entity::getUUID).orElse(null);
+			return new Live(chunks, inhabited, holders, players, hostId);
+		}
+
+		private void addBlockEntities(RegistryOps<Tag> ops, ResourceKey<Level> dimension, LevelChunk chunk, List<Holder> holders) {
+			for (BlockEntity blockEntity : chunk.getBlockEntities().values()) {
+				try {
+					CompoundTag tag = blockEntity.saveWithFullMetadata(server.registryAccess());
+					HolderReader.blockEntity(ops, dimension, tag, Provenance.LIVE).ifPresent(holders::add);
+				} catch (RuntimeException e) {
+					ClaudeChatClient.LOGGER.debug("Skipping block entity at {}", blockEntity.getBlockPos(), e);
+				}
+			}
+		}
+
+		private void addEntities(RegistryOps<Tag> ops, ServerLevel level, Set<ChunkKey> liveChunks, List<Holder> holders) {
 			for (Entity entity : level.getAllEntities()) {
-				if (entity instanceof Player || !loaded.contains(new ChunkKey(dimension, entity.chunkPosition().x(), entity.chunkPosition().z(), true))) {
+				ChunkKey key = new ChunkKey(level.dimension(), entity.chunkPosition().x(), entity.chunkPosition().z());
+				if (entity instanceof Player || !liveChunks.contains(key)) {
 					continue;
 				}
 				try {
-					addIfPresent(holders, describeEntity(ops, dimension, EntityType.getKey(entity.getType()).toString(), save(server, entity), true));
+					String type = EntityType.getKey(entity.getType()).toString();
+					HolderReader.entity(ops, level.dimension(), type, save(entity), Provenance.LIVE).ifPresent(holders::add);
 				} catch (RuntimeException e) {
 					ClaudeChatClient.LOGGER.debug("Skipping entity {}", entity, e);
 				}
 			}
 		}
 
-		for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-			CompoundTag tag = save(server, player);
-			players.add(new PlayerInfo(player.getName().getString(), dimensionName(player.level().dimension()),
-				player.getX(), player.getY(), player.getZ(),
-				items(ops, tag.getListOrEmpty("Inventory")), items(ops, tag.getListOrEmpty("EnderItems"))));
-		}
-		return new Live(loaded, holders, players, inhabited);
-	}
-
-	/** Server thread: the chunks within view distance of the level's players that are loaded right now. */
-	public static List<LevelChunk> loadedChunks(MinecraftServer server, ServerLevel level) {
-		int radius = server.getPlayerList().getViewDistance() + 1;
-		List<LevelChunk> chunks = new ArrayList<>();
-		Set<Long> seen = new HashSet<>();
-		for (ServerPlayer player : level.players()) {
-			int px = player.chunkPosition().x();
-			int pz = player.chunkPosition().z();
-			for (int cx = px - radius; cx <= px + radius; cx++) {
-				for (int cz = pz - radius; cz <= pz + radius; cz++) {
-					if (seen.add(((long) cx << 32) ^ (cz & 0xFFFFFFFFL))) {
-						addIfPresent(chunks, level.getChunkSource().getChunkNow(cx, cz));
-					}
-				}
-			}
-		}
-		return chunks;
-	}
-
-	private static CompoundTag save(MinecraftServer server, Entity entity) {
-		TagValueOutput output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
-		entity.saveWithoutId(output);
-		return output.buildResult();
-	}
-
-	// --- reading block entities, entities and items ---------------------------------------------------------------
-
-	/** A container block (or any block entity holding items or a name); null if there's nothing worth listing. */
-	private static Holder describeBlockEntity(RegistryOps<Tag> ops, String dimension, CompoundTag tag, boolean live) {
-		String name = customName(ops, tag);
-		String loot = tag.getStringOr("LootTable", "");
-		List<Item> items = items(ops, tag.getListOrEmpty("Items"));
-		for (String single : List.of("item", "Book", "RecordItem")) {
-			tag.getCompound(single).flatMap(item -> item(ops, item, 0)).ifPresent(items::add);
-		}
-		if (items.isEmpty() && loot.isEmpty() && name == null) {
-			return null;
-		}
-		return new Holder("block", dimension, tag.getIntOr("x", 0), tag.getIntOr("y", 0), tag.getIntOr("z", 0),
-			shortId(tag.getStringOr("id", "?")), name, loot.isEmpty() ? null : loot, false, items, live);
-	}
-
-	/** Entities worth finding: ones holding items (minecarts, item frames, armor stands, dropped items) or named or tamed. */
-	private static Holder describeEntity(RegistryOps<Tag> ops, String dimension, String typeId, CompoundTag tag, boolean live) {
-		String type = shortId(typeId);
-		String name = customName(ops, tag);
-		boolean tamed = tag.contains("Owner");
-		List<Item> items = items(ops, tag.getListOrEmpty("Items"));
-		tag.getCompound("Item").flatMap(item -> item(ops, item, 0)).ifPresent(items::add);
-		if (type.equals("armor_stand")) {
-			tag.getCompound("equipment").ifPresent(equipment -> {
-				for (String slot : equipment.keySet()) {
-					equipment.getCompound(slot).flatMap(item -> item(ops, item, 0)).ifPresent(items::add);
-				}
-			});
-		}
-		String loot = tag.getStringOr("LootTable", "");
-		if (items.isEmpty() && name == null && !tamed && loot.isEmpty()) {
-			return null;
-		}
-		ListTag pos = tag.getListOrEmpty("Pos");
-		int x = pos.size() == 3 ? (int) Math.floor(pos.getDoubleOr(0, 0)) : 0;
-		int y = pos.size() == 3 ? (int) Math.floor(pos.getDoubleOr(1, 0)) : 0;
-		int z = pos.size() == 3 ? (int) Math.floor(pos.getDoubleOr(2, 0)) : 0;
-		return new Holder("entity", dimension, x, y, z, type, name, loot.isEmpty() ? null : loot, tamed, items, live);
-	}
-
-	private static List<Item> items(RegistryOps<Tag> ops, ListTag list) {
-		List<Item> items = new ArrayList<>();
-		for (CompoundTag tag : compounds(list)) {
-			item(ops, tag, 0).ifPresent(items::add);
-		}
-		return items;
-	}
-
-	private static Optional<Item> item(RegistryOps<Tag> ops, CompoundTag tag, int depth) {
-		Optional<ItemStack> parsed = ItemStack.CODEC.parse(ops, tag).result();
-		if (parsed.isPresent()) {
-			return Optional.ofNullable(item(parsed.get(), depth));
-		}
-		String id = tag.getStringOr("id", "");
-		return id.isEmpty() ? Optional.empty() : Optional.of(new Item(id, id, tag.getIntOr("count", 1), List.of(), List.of()));
-	}
-
-	/** Name, count, enchantments, and (two levels deep) what's inside shulker boxes and bundles. */
-	private static Item item(ItemStack stack, int depth) {
-		if (stack.isEmpty()) {
-			return null;
-		}
-		List<String> enchantments = new ArrayList<>();
-		for (ItemEnchantments enchants : new ItemEnchantments[] {stack.get(DataComponents.ENCHANTMENTS), stack.get(DataComponents.STORED_ENCHANTMENTS)}) {
-			if (enchants != null) {
-				for (var entry : enchants.entrySet()) {
-					enchantments.add(Enchantment.getFullname(entry.getKey(), entry.getIntValue()).getString());
-				}
-			}
-		}
-		List<Item> contents = new ArrayList<>();
-		if (depth < MAX_NESTING) {
-			ItemContainerContents container = stack.get(DataComponents.CONTAINER);
-			if (container != null) {
-				container.nonEmptyItemCopyStream().forEach(inner -> addIfPresent(contents, item(inner, depth + 1)));
-			}
-			BundleContents bundle = stack.get(DataComponents.BUNDLE_CONTENTS);
-			if (bundle != null) {
-				for (ItemStackTemplate inner : bundle.items()) {
-					addIfPresent(contents, item(inner.create(), depth + 1));
-				}
-			}
-		}
-		return new Item(stack.typeHolder().getRegisteredName(), stack.getHoverName().getString(), stack.getCount(), enchantments, contents);
-	}
-
-	private static String customName(RegistryOps<Tag> ops, CompoundTag tag) {
-		Tag name = tag.get("CustomName");
-		if (name == null) {
-			return null;
-		}
-		return ComponentSerialization.CODEC.parse(ops, name).result().map(Component::getString).filter(s -> !s.isBlank()).orElse(null);
-	}
-
-	private static List<CompoundTag> compounds(ListTag list) {
-		return list.compoundStream().toList();
-	}
-
-	public static String dimensionName(ResourceKey<Level> dimension) {
-		return dimension.identifier().getNamespace().equals("minecraft") ? dimension.identifier().getPath() : dimension.identifier().toString();
-	}
-
-	private static String shortId(String id) {
-		return id.startsWith("minecraft:") ? id.substring("minecraft:".length()) : id;
-	}
-
-	private static <T> void addIfPresent(List<T> list, T value) {
-		if (value != null) {
-			list.add(value);
+		private CompoundTag save(Entity entity) {
+			TagValueOutput output = TagValueOutput.createWithContext(ProblemReporter.DISCARDING, server.registryAccess());
+			entity.saveWithoutId(output);
+			return output.buildResult();
 		}
 	}
 }

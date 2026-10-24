@@ -4,68 +4,79 @@ import claudechat.mixin.FeaturePoolElementAccessor;
 import claudechat.mixin.TemplateStructurePieceAccessor;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
-import net.minecraft.core.HolderLookup;
 import net.minecraft.core.QuartPos;
-import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.SectionPos;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.resources.Identifier;
-import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.tags.TagKey;
 import net.minecraft.world.level.ChunkPos;
 import net.minecraft.world.level.StructureManager;
 import net.minecraft.world.level.biome.BiomeResolver;
-import net.minecraft.world.level.chunk.ChunkAccess;
 import net.minecraft.world.level.chunk.ChunkGenerator;
 import net.minecraft.world.level.chunk.ChunkGeneratorStructureState;
-import net.minecraft.world.level.chunk.status.ChunkStatus;
+import net.minecraft.world.level.levelgen.LegacyRandomSource;
 import net.minecraft.world.level.levelgen.RandomState;
+import net.minecraft.world.level.levelgen.WorldgenRandom;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
+import net.minecraft.world.level.levelgen.structure.PoolElementStructurePiece;
 import net.minecraft.world.level.levelgen.structure.Structure;
 import net.minecraft.world.level.levelgen.structure.StructureCheckResult;
 import net.minecraft.world.level.levelgen.structure.StructurePiece;
+import net.minecraft.world.level.levelgen.structure.StructureSet;
 import net.minecraft.world.level.levelgen.structure.StructureStart;
-import net.minecraft.world.level.levelgen.structure.PoolElementStructurePiece;
 import net.minecraft.world.level.levelgen.structure.TemplateStructurePiece;
+import net.minecraft.world.level.levelgen.structure.pieces.StructurePieceSerializationContext;
+import net.minecraft.world.level.levelgen.structure.placement.ConcentricRingsStructurePlacement;
+import net.minecraft.world.level.levelgen.structure.placement.RandomSpreadStructurePlacement;
+import net.minecraft.world.level.levelgen.structure.placement.StructurePlacement;
 import net.minecraft.world.level.levelgen.structure.pools.FeaturePoolElement;
 import net.minecraft.world.level.levelgen.structure.pools.ListPoolElement;
 import net.minecraft.world.level.levelgen.structure.pools.SinglePoolElement;
 import net.minecraft.world.level.levelgen.structure.pools.StructurePoolElement;
-import net.minecraft.world.level.levelgen.structure.placement.ConcentricRingsStructurePlacement;
-import net.minecraft.world.level.levelgen.structure.placement.RandomSpreadStructurePlacement;
-import net.minecraft.world.level.levelgen.structure.placement.StructurePlacement;
 
+import java.io.IOException;
 import java.lang.reflect.Modifier;
+import java.time.Duration;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
-import java.util.Comparator;
+import java.util.Collections;
+import java.util.Deque;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.LinkedHashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeMap;
-import java.util.function.Predicate;
 
 /**
  * Finds many structures, not just the nearest one like /locate. Uses the same search as /locate: walk the structure's
- * placement grid outward in rings and ask the game (from the seed and biomes, without generating anything) whether the
- * structure starts in each candidate chunk. Each hit gets its distance and how long players have spent nearby, so
- * callers can skip structures the player has already visited.
+ * placement grid outward in rings and ask the game, from the seed and biomes and the structure starts already saved,
+ * whether the structure starts in each candidate chunk. Unlike /locate it never generates a chunk to find out: where
+ * nothing is saved yet, it builds the structure in memory exactly as generation would. Each hit gets its pieces (from
+ * the saved start where there is one), the biomes they sit in, and how long players have spent nearby, so callers can
+ * skip structures the player has already visited.
+ * <p>
+ * The search runs on the server thread, which owns the game's structure caches, in short slices so the game keeps
+ * ticking; a search that runs too long is stopped.
  */
 public final class StructureFinder {
-	/**
-	 * A structure start. {@code inhabitedTicks} is the most of any chunk it covers, or -1 if none has been generated.
-	 * {@code start} is its pieces if the search already built them (it does near generated land), else null.
-	 */
-	public record Found(String structure, int x, int z, double distance, long inhabitedTicks, Holder<Structure> holder, ChunkPos chunk,
-		StructureStart start) {
-		public boolean generated() {
-			return inhabitedTicks >= 0;
-		}
+	/** Spacing of the biome samples inside each piece, plus its corners. Biomes are stored per 4 blocks. */
+	private static final int SAMPLE_STEP = 8;
+	private static final int MAX_SAMPLES = 20_000;
+	private static final int MAX_CHECKS = 60_000;
+	private static final int MAX_RINGS = 200;
+	/** How far (in chunks) a structure's pieces can reach from its start chunk: jigsaw structures are capped at 128 blocks. */
+	private static final int PIECE_REACH = 8;
+	/** How long the search may hold the server thread at a time, and how long it may take in all. */
+	private static final Duration SLICE = Duration.ofMillis(15);
+	private static final Duration SLICE_TIMEOUT = Duration.ofSeconds(20);
+	private static final Duration TIMEOUT = Duration.ofSeconds(110);
+
+	private StructureFinder() {
 	}
 
 	/**
@@ -74,66 +85,71 @@ public final class StructureFinder {
 	 * structures like fortresses leave most of their box empty.
 	 */
 	public record Footprint(BoundingBox bounds, Map<String, Integer> biomeSamples, int totalSamples) {
-	}
-
-	/** Spacing of the biome samples inside each piece, plus its corners. Biomes are stored per 4 blocks. */
-	private static final int SAMPLE_STEP = 8;
-	private static final int MAX_SAMPLES = 20_000;
-
-	/**
-	 * Server thread. The structure's pieces, built in memory from the seed exactly as world generation would (it's
-	 * the same {@link Structure#generate} call), without generating or saving any chunk. Null if the structure turns
-	 * out not to fit there after all.
-	 */
-	public static StructureStart start(ServerLevel level, Found found) {
-		return found.start() != null ? found.start() : generateStart(level, found.holder(), found.chunk());
+		/** Percent of the sampled cells in any of these biomes. */
+		public double share(Set<String> biomes) {
+			if (totalSamples == 0) {
+				return 0;
+			}
+			int matching = biomeSamples.entrySet().stream().filter(e -> biomes.contains(e.getKey())).mapToInt(Map.Entry::getValue).sum();
+			return 100.0 * matching / totalSamples;
+		}
 	}
 
 	/**
-	 * Server thread. Where the pieces are and which biomes they sit in. Biomes come from the seed, which matches what
-	 * generation stores (worlds generated by older versions can differ). Null for a null start.
+	 * A structure found: its /locate position, its start with every piece (as saved, or as generation would build it),
+	 * the most time players have spent near any of its chunks, and its footprint.
 	 */
-	public static Footprint footprint(ServerLevel level, StructureStart start) {
-		if (start == null) {
-			return null;
+	public record Found(String structure, int x, int z, double distance, Visit visit, StructureStart start, Footprint footprint) {
+		/** The pieces by name with their counts; see {@link StructureFinder#pieces}. */
+		public Map<String, Integer> pieces() {
+			return StructureFinder.pieces(start);
+		}
+	}
+
+	/**
+	 * What to look for. {@code pieceTerms} must each be part of some piece's name ("ship" matches "end_city/ship");
+	 * with {@code biomes}, some piece must be in one of them and at least {@code minBiomeShare} percent of the
+	 * structure in them combined.
+	 */
+	public record Request(List<Holder<Structure>> structures, int minDistance, int maxDistance, int limit, Visit.Filter visited,
+		List<String> pieceTerms, Set<String> biomes, int minBiomeShare) {
+		boolean hasPieces(Set<String> pieceNames) {
+			return pieceTerms.stream().allMatch(term -> pieceNames.stream().anyMatch(name -> name.contains(term)));
 		}
 
-		ChunkGenerator generator = level.getChunkSource().getGenerator();
-		BiomeResolver biomes = generator.getBiomeSource().createCachingResolver(level.getChunkSource().getGeneratorState().randomState());
-		Map<String, Integer> counts = new HashMap<>();
-		Set<Long> sampled = new HashSet<>();
-		for (StructurePiece piece : start.getPieces()) {
-			BoundingBox box = piece.getBoundingBox();
-			for (int x : steps(box.minX(), box.maxX())) {
-				for (int y : steps(box.minY(), box.maxY())) {
-					for (int z : steps(box.minZ(), box.maxZ())) {
-						int qx = QuartPos.fromBlock(x);
-						int qy = QuartPos.fromBlock(y);
-						int qz = QuartPos.fromBlock(z);
-						if (sampled.size() < MAX_SAMPLES && sampled.add(BlockPos.asLong(qx, qy, qz))) {
-							counts.merge(RegistryQuery.id(biomes.getNoiseBiome(qx, qy, qz)), 1, Integer::sum);
-						}
-					}
-				}
+		boolean inBiomes(Footprint footprint) {
+			double share = footprint.share(biomes);
+			return share > 0 && share >= minBiomeShare;
+		}
+	}
+
+	/**
+	 * The structures nearest {@code origin} (in {@code level}) that pass the request, nearest first. Not on the server
+	 * thread: it hands the server short slices of work and waits. {@code snapshot} gives how long players spent near
+	 * each chunk, and the saved structure starts.
+	 */
+	public static List<Found> find(ServerLevel level, Origin origin, Request request, WorldIndex.Snapshot snapshot) throws Exception {
+		MinecraftServer server = level.getServer();
+		ServerTasks.requireOffServerThread(server);
+		if (!origin.dimension().equals(level.dimension())) {
+			throw new IllegalArgumentException("The origin is in " + origin.dimension().identifier() + ", not " + level.dimension().identifier());
+		}
+
+		Search search = ServerTasks.call(server, () -> new Search(level, origin, request, snapshot), SLICE_TIMEOUT, "Starting the structure search");
+		long deadline = System.nanoTime() + TIMEOUT.toNanos();
+		while (!ServerTasks.call(server, search::advance, SLICE_TIMEOUT, "The structure search")) {
+			if (System.nanoTime() > deadline) {
+				throw new IllegalStateException("The structure search took longer than " + TIMEOUT.toSeconds()
+					+ " s and was stopped. Try a smaller max_distance, or fewer structure types.");
+			}
+			if (Thread.interrupted()) {
+				throw new InterruptedException("The structure search was cancelled.");
 			}
 		}
-		return new Footprint(start.getBoundingBox(), counts, sampled.size());
+		return search.results();
 	}
 
-	/** Server thread. The structure's start and pieces as generation builds them, in memory; null if it doesn't fit. */
-	private static StructureStart generateStart(ServerLevel level, Holder<Structure> holder, ChunkPos chunk) {
-		ChunkGeneratorStructureState generatorState = level.getChunkSource().getGeneratorState();
-		ChunkGenerator generator = level.getChunkSource().getGenerator();
-		RandomState randomState = generatorState.randomState();
-		Structure structure = holder.value();
-		StructureStart start = structure.generate(holder, level.dimension(), level.registryAccess(), generator,
-			generator.getBiomeSource(), randomState.createClimateSampler(SamplerContext.builder().enableCaches().build()), randomState,
-			level.getServer().getStructureTemplateManager(), generatorState.getLevelSeed(), chunk, 0, level,
-			structure.biomes()::contains);
-		return start.isValid() ? start : null;
-	}
-
-	/** The pieces by name with their counts, sorted by name, e.g. {"end_city/ship": 1, "end_city/fat_tower_top": 2}. */
+	/** The pieces by name with their counts, sorted by name, e.g. {"end_city/ship": 1, "end_city/fat_tower_top": 2}. Empty for null. */
 	public static Map<String, Integer> pieces(StructureStart start) {
 		Map<String, Integer> pieces = new TreeMap<>();
 		if (start != null) {
@@ -217,202 +233,332 @@ public final class StructureFinder {
 		return steps;
 	}
 
-	/** How long players must have been within 128 blocks of a structure's pieces for it to count as visited. */
-	public static final long VISITED_TICKS = 20;
-	/**
-	 * How far (in chunks) a structure's pieces can reach from its start chunk: jigsaw structures are capped at 128
-	 * blocks from the start. Beyond that, nothing generated around a start means nobody has been there.
-	 */
-	private static final int PIECE_REACH = 8;
-	private static final int MAX_CHECKS = 60_000;
+	// --- the search -------------------------------------------------------------------------------------------------
 
-	private StructureFinder() {
+	/** One structure that may start in one chunk, with what's been worked out about it so far. */
+	private static final class Candidate {
+		final Holder<Structure> structure;
+		final String id;
+		final StructurePlacement placement;
+		final StructureSet set;
+		final ChunkPos chunk;
+		final BlockPos locatePos;
+		final double distance;
+		StructureStart start;
+		Visit visit;
+		Footprint footprint;
+
+		Candidate(Holder<Structure> structure, StructurePlacement placement, StructureSet set, ChunkPos chunk, Origin origin) {
+			this.structure = structure;
+			this.id = RegistryQuery.id(structure);
+			this.placement = placement;
+			this.set = set;
+			this.chunk = chunk;
+			this.locatePos = placement.getLocatePos(chunk);
+			this.distance = origin.horizontalDistanceTo(locatePos.getX(), locatePos.getZ());
+		}
 	}
 
-	/**
-	 * Structures matching a query: an id ("minecraft:village_plains"), a tag ("#minecraft:village"), or a plain word
-	 * matched against tags and then ids ("village" → the village tag; "ruined" → every ruined_portal variant).
-	 */
-	public static List<Holder<Structure>> resolve(RegistryAccess access, String query) {
-		HolderLookup.RegistryLookup<Structure> registry = access.lookupOrThrow(Registries.STRUCTURE);
-		String q = query.trim().toLowerCase(Locale.ROOT).replace(' ', '_');
-		if (q.startsWith("#")) {
-			Identifier id = Identifier.tryParse(q.substring(1));
-			return id == null ? List.of() : registry.get(TagKey.create(Registries.STRUCTURE, id))
-				.map(set -> set.stream().toList()).orElse(List.of());
-		}
-		if (q.contains(":")) {
-			Identifier id = Identifier.tryParse(q);
-			if (id != null) {
-				var exact = registry.get(ResourceKey.create(Registries.STRUCTURE, id));
-				if (exact.isPresent()) {
-					return List.of(exact.get());
-				}
-				var tag = registry.get(TagKey.create(Registries.STRUCTURE, id));
-				if (tag.isPresent()) {
-					return tag.get().stream().toList();
-				}
-			}
-			return List.of();
-		}
-		var tag = registry.get(TagKey.create(Registries.STRUCTURE, Identifier.withDefaultNamespace(q)));
-		if (tag.isPresent() && tag.get().size() > 0) {
-			return tag.get().stream().toList();
-		}
-		var exact = registry.get(ResourceKey.create(Registries.STRUCTURE, Identifier.withDefaultNamespace(q)));
-		if (exact.isPresent()) {
-			return List.of(exact.get());
-		}
-		List<Holder<Structure>> matches = new ArrayList<>();
-		registry.listElements().filter(h -> h.key().identifier().getPath().contains(q)).forEach(matches::add);
-		return matches;
+	/** The structures of one structure set that the request asks for; they share its placement. */
+	private record Group(StructureSet set, List<Holder<Structure>> structures) {
 	}
 
-	/**
-	 * Server thread. Searches outward from {@code origin} until {@code limit} structures pass {@code filter} (nearest
-	 * first) or {@code maxDistance} blocks is covered. {@code inhabited} gives a chunk's InhabitedTime, or -1.
-	 */
-	public static List<Found> find(ServerLevel level, List<Holder<Structure>> structures, BlockPos origin, int maxDistance,
-		int limit, Predicate<Found> filter, ChunkInhabitedTime inhabited) {
-		ChunkGeneratorStructureState generatorState = level.getChunkSource().getGeneratorState();
-		StructureManager structureManager = level.structureManager();
-		Map<StructurePlacement, List<Holder<Structure>>> byPlacement = new LinkedHashMap<>();
-		for (Holder<Structure> structure : structures) {
-			for (StructurePlacement placement : generatorState.getPlacementsForStructure(structure)) {
-				byPlacement.computeIfAbsent(placement, p -> new ArrayList<>()).add(structure);
-			}
-		}
+	/** A search in progress. Server thread only: {@link #advance} does a slice of it. */
+	private static final class Search {
+		private final ServerLevel level;
+		private final Origin origin;
+		private final Request request;
+		private final WorldIndex.Snapshot snapshot;
+		private final Visit.ByChunk visits;
+		private final ChunkGeneratorStructureState generatorState;
+		private final StructureManager structureManager;
+		private final BiomeResolver biomes;
+		private final List<Group> spread = new ArrayList<>();
+		private final int minSpacing;
+		private final int maxRing;
 
-		List<Found> results = new ArrayList<>();
-		Set<String> seen = new HashSet<>();
-		int[] checks = {0};
+		private final Deque<Candidate> pending = new ArrayDeque<>();
+		private final Set<String> seen = new HashSet<>();
+		private final NearestFirst.TopK<Candidate> nearest;
+		/** What generation would place for a structure set in a chunk: one per set and chunk, shared by its structures. */
+		private final Map<StructureSet, Map<Long, Optional<StructureStart>>> generated = new IdentityHashMap<>();
+		private int ring = -1;
+		private int checks;
+		private List<Candidate> results;
+		private int footprintsDone;
 
-		for (var entry : byPlacement.entrySet()) {
-			if (entry.getKey() instanceof ConcentricRingsStructurePlacement rings) {
-				List<ChunkPos> positions = generatorState.getRingPositionsFor(rings);
-				if (positions != null) {
-					for (ChunkPos chunk : positions) {
-						check(level, structureManager, rings, entry.getValue(), chunk, origin, maxDistance, inhabited, filter, results, seen, checks);
+		Search(ServerLevel level, Origin origin, Request request, WorldIndex.Snapshot snapshot) {
+			ServerTasks.requireServerThread(level.getServer());
+			this.level = level;
+			this.origin = origin;
+			this.request = request;
+			this.snapshot = snapshot;
+			this.visits = snapshot.visits(level.dimension());
+			this.generatorState = level.getChunkSource().getGeneratorState();
+			this.structureManager = level.structureManager();
+			this.biomes = level.getChunkSource().getGenerator().getBiomeSource().createCachingResolver(generatorState.randomState());
+			this.nearest = new NearestFirst.TopK<>(request.limit(), request.maxDistance());
+
+			for (Group group : groups()) {
+				if (group.set().placement() instanceof ConcentricRingsStructurePlacement rings) {
+					List<ChunkPos> positions = generatorState.getRingPositionsFor(rings);
+					if (positions != null) {
+						positions.forEach(chunk -> addCandidates(group, chunk));
 					}
+				} else if (group.set().placement() instanceof RandomSpreadStructurePlacement) {
+					spread.add(group);
 				}
 			}
+			this.minSpacing = spread.stream().mapToInt(group -> spacing(group)).min().orElse(1);
+			this.maxRing = Math.min(MAX_RINGS, request.maxDistance() / (minSpacing * 16) + 2);
 		}
 
-		List<Map.Entry<StructurePlacement, List<Holder<Structure>>>> spread = byPlacement.entrySet().stream()
-			.filter(e -> e.getKey() instanceof RandomSpreadStructurePlacement).toList();
-		if (!spread.isEmpty()) {
-			int originX = SectionPos.blockToSectionCoord(origin.getX());
-			int originZ = SectionPos.blockToSectionCoord(origin.getZ());
-			int minSpacing = spread.stream().mapToInt(e -> ((RandomSpreadStructurePlacement) e.getKey()).spacing()).min().orElse(1);
-			int maxRadius = Math.min(200, maxDistance / (minSpacing * 16) + 2);
+		/** The structure sets this level generates that include a requested structure. */
+		private List<Group> groups() {
+			Set<Structure> requested = Collections.newSetFromMap(new IdentityHashMap<>());
+			request.structures().forEach(structure -> requested.add(structure.value()));
+			List<Group> groups = new ArrayList<>();
+			for (Holder<StructureSet> set : generatorState.possibleStructureSets()) {
+				List<Holder<Structure>> wanted = set.value().structures().stream().map(StructureSet.StructureSelectionEntry::structure)
+					.filter(structure -> requested.contains(structure.value())).toList();
+				if (!wanted.isEmpty()) {
+					groups.add(new Group(set.value(), wanted));
+				}
+			}
+			return groups;
+		}
+
+		private static int spacing(Group group) {
+			return ((RandomSpreadStructurePlacement) group.set().placement()).spacing();
+		}
+
+		/** Works until the slice is used up; true once the search is complete. */
+		boolean advance() {
+			ServerTasks.requireServerThread(level.getServer());
+			long sliceEnd = System.nanoTime() + SLICE.toNanos();
+			while (System.nanoTime() < sliceEnd) {
+				if (results != null) {
+					if (footprintsDone == results.size()) {
+						return true;
+					}
+					Candidate result = results.get(footprintsDone++);
+					footprint(result);
+				} else if (!pending.isEmpty()) {
+					check(pending.poll());
+				} else if (!nextRing()) {
+					results = nearest.sorted();
+				}
+			}
+			return false;
+		}
+
+		List<Found> results() {
+			return results.stream().map(c -> new Found(c.id, c.locatePos.getX(), c.locatePos.getZ(), c.distance, c.visit, c.start, c.footprint)).toList();
+		}
+
+		/** Queues the next ring of placement cells; false when the search is over. */
+		private boolean nextRing() {
+			// Ring r + 1's cells are at least r cells from the origin's: nothing there can beat a full list closer than that.
+			if (ring >= 0 && nearest.settled((double) ring * minSpacing * 16)) {
+				return false;
+			}
+			ring++;
+			if (ring > maxRing || checks >= MAX_CHECKS || spread.isEmpty()) {
+				return false;
+			}
+
+			int originX = SectionPos.blockToSectionCoord(origin.blockPos().getX());
+			int originZ = SectionPos.blockToSectionCoord(origin.blockPos().getZ());
 			long seed = generatorState.getLevelSeed();
+			for (Group group : spread) {
+				RandomSpreadStructurePlacement placement = (RandomSpreadStructurePlacement) group.set().placement();
+				int spacing = placement.spacing();
+				if ((long) (ring - 1) * spacing * 16 > request.maxDistance()) {
+					continue;
+				}
+				NearestFirst.forEachInRing(ring, (dx, dz) ->
+					addCandidates(group, placement.getPotentialStructureChunk(seed, originX + spacing * dx, originZ + spacing * dz)));
+			}
+			return true;
+		}
 
-			for (int radius = 0; radius <= maxRadius && checks[0] < MAX_CHECKS; radius++) {
-				for (var entry : spread) {
-					RandomSpreadStructurePlacement placement = (RandomSpreadStructurePlacement) entry.getKey();
-					int spacing = placement.spacing();
-					if ((long) (radius - 1) * spacing * 16 > maxDistance) {
-						continue;
+		private void addCandidates(Group group, ChunkPos chunk) {
+			for (Holder<Structure> structure : group.structures()) {
+				Candidate candidate = new Candidate(structure, group.set().placement(), group.set(), chunk, origin);
+				if (seen.add(candidate.id + "@" + chunk.x() + "," + chunk.z())) {
+					pending.add(candidate);
+				}
+			}
+		}
+
+		/** Cheapest checks first: pieces and footprints are built only for candidates that could make the list. */
+		private void check(Candidate c) {
+			if (checks++ >= MAX_CHECKS || c.distance < request.minDistance() || !nearest.couldAccept(c.distance)) {
+				return;
+			}
+			if (request.visited() == Visit.Filter.VISITED && !nearGeneratedLand(c.chunk)) {
+				return;
+			}
+			// Same check /locate uses: decided from the saved structure starts, else from the seed and biomes.
+			StructureCheckResult presence = structureManager.checkStructurePresence(c.chunk, c.structure.value(), c.placement, false);
+			if (presence == StructureCheckResult.START_NOT_PRESENT) {
+				return;
+			}
+			Optional<StructureStart> start = presence == StructureCheckResult.START_PRESENT
+				? storedStart(c).or(() -> generatedStart(c))
+				: generatedStart(c);
+			if (start.isEmpty()) {
+				return;
+			}
+
+			c.start = start.get();
+			c.visit = timeNearby(c);
+			if (!request.visited().accepts(c.visit) || !request.hasPieces(pieces(c.start).keySet())) {
+				return;
+			}
+			if (!request.biomes().isEmpty() && !request.inBiomes(footprint(c))) {
+				return;
+			}
+			nearest.offer(c, c.distance);
+		}
+
+		/**
+		 * Whether any chunk the structure's pieces could reach is generated. If none is, nobody has been there, so a
+		 * search for visited structures can skip it without building its pieces.
+		 */
+		private boolean nearGeneratedLand(ChunkPos chunk) {
+			for (int dx = -PIECE_REACH; dx <= PIECE_REACH; dx++) {
+				for (int dz = -PIECE_REACH; dz <= PIECE_REACH; dz++) {
+					if (visits.at(chunk.x() + dx, chunk.z() + dz).generated()) {
+						return true;
 					}
-					for (int dx = -radius; dx <= radius; dx++) {
-						for (int dz = -radius; dz <= radius; dz++) {
-							if (Math.abs(dx) != radius && Math.abs(dz) != radius) {
-								continue;
-							}
-							ChunkPos chunk = placement.getPotentialStructureChunk(seed, originX + spacing * dx, originZ + spacing * dz);
-							check(level, structureManager, placement, entry.getValue(), chunk, origin, maxDistance, inhabited, filter, results, seen, checks);
+				}
+			}
+			return false;
+		}
+
+		/** The start as the game has it: in the live chunk, else in the save; empty if neither has it. */
+		private Optional<StructureStart> storedStart(Candidate c) {
+			var live = LiveChunks.at(level, c.chunk.x(), c.chunk.z());
+			if (live.isPresent()) {
+				return Optional.ofNullable(live.get().getStartForStructure(c.structure.value())).filter(StructureStart::isValid);
+			}
+			try {
+				WorldIndex.ChunkKey key = new WorldIndex.ChunkKey(level.dimension(), c.chunk.x(), c.chunk.z());
+				Identifier id = c.structure.unwrapKey().orElseThrow().identifier();
+				return snapshot.readSavedChunk(key).flatMap(chunk -> chunk.structureStart(id))
+					.map(tag -> StructureStart.loadStaticStart(StructurePieceSerializationContext.fromLevel(level), tag, generatorState.getLevelSeed()))
+					.filter(StructureStart::isValid);
+			} catch (IOException | RuntimeException e) {
+				ClaudeChatClient.LOGGER.debug("Could not read the saved start of {} at {}", c.id, c.chunk, e);
+				return Optional.empty();
+			}
+		}
+
+		/**
+		 * The start generation would make here, built in memory without generating or saving anything; empty if it
+		 * would place nothing, or another structure of the same set (a bastion instead of a fortress).
+		 */
+		private Optional<StructureStart> generatedStart(Candidate c) {
+			Optional<StructureStart> start = generated.computeIfAbsent(c.set, set -> new HashMap<>())
+				.computeIfAbsent(c.chunk.pack(), chunk -> generateForSet(c.set, c.chunk));
+			return start.filter(s -> s.getStructure() == c.structure.value());
+		}
+
+		/** What ChunkGenerator.createStructures places for one structure set: the first valid one in its weighted draw. */
+		private Optional<StructureStart> generateForSet(StructureSet set, ChunkPos chunk) {
+			if (!set.placement().isStructureChunk(generatorState, chunk.x(), chunk.z())) {
+				return Optional.empty();
+			}
+			List<StructureSet.StructureSelectionEntry> options = new ArrayList<>(set.structures());
+			if (options.size() == 1) {
+				return generate(options.getFirst().structure(), chunk);
+			}
+
+			WorldgenRandom random = new WorldgenRandom(new LegacyRandomSource(0L));
+			random.setLargeFeatureSeed(generatorState.getLevelSeed(), chunk.x(), chunk.z());
+			int total = options.stream().mapToInt(StructureSet.StructureSelectionEntry::weight).sum();
+			while (!options.isEmpty()) {
+				int choice = random.nextInt(total);
+				int index = 0;
+				for (StructureSet.StructureSelectionEntry option : options) {
+					choice -= option.weight();
+					if (choice < 0) {
+						break;
+					}
+					index++;
+				}
+				StructureSet.StructureSelectionEntry selected = options.get(index);
+				Optional<StructureStart> start = generate(selected.structure(), chunk);
+				if (start.isPresent()) {
+					return start;
+				}
+				options.remove(index);
+				total -= selected.weight();
+			}
+			return Optional.empty();
+		}
+
+		/** One structure's start and pieces as generation builds them (the same {@link Structure#generate} call), in memory. */
+		private Optional<StructureStart> generate(Holder<Structure> holder, ChunkPos chunk) {
+			ChunkGenerator generator = level.getChunkSource().getGenerator();
+			RandomState randomState = generatorState.randomState();
+			Structure structure = holder.value();
+			StructureStart start = structure.generate(holder, level.dimension(), level.registryAccess(), generator,
+				generator.getBiomeSource(), randomState.createClimateSampler(SamplerContext.builder().enableCaches().build()), randomState,
+				level.getServer().getStructureTemplateManager(), generatorState.getLevelSeed(), chunk, 0, level,
+				structure.biomes()::contains);
+			return start.isValid() ? Optional.of(start) : Optional.empty();
+		}
+
+		/**
+		 * How long players have spent near the structure: the most of any chunk its pieces cover. The start chunk
+		 * alone isn't enough: a chunk only gains time while a player is within 128 blocks of it, and an end city's
+		 * ship or a fortress's far bridges can be farther than that from its start.
+		 */
+		private Visit timeNearby(Candidate c) {
+			Visit most = visits.at(c.chunk.x(), c.chunk.z());
+			Set<Long> counted = new HashSet<>();
+			for (StructurePiece piece : c.start.getPieces()) {
+				BoundingBox box = piece.getBoundingBox();
+				for (int cx = SectionPos.blockToSectionCoord(box.minX()); cx <= SectionPos.blockToSectionCoord(box.maxX()); cx++) {
+					for (int cz = SectionPos.blockToSectionCoord(box.minZ()); cz <= SectionPos.blockToSectionCoord(box.maxZ()); cz++) {
+						if (counted.add(ChunkPos.pack(cx, cz))) {
+							most = most.max(visits.at(cx, cz));
 						}
 					}
 				}
-				// Rings are ordered by distance, so once enough results are closer than anything the next ring
-				// could hold, stop.
-				if (results.size() >= limit) {
-					results.sort(Comparator.comparingDouble(Found::distance));
-					double nextRingMin = (double) radius * minSpacing * 16;
-					if (results.get(limit - 1).distance() < nextRingMin) {
-						break;
+			}
+			return most;
+		}
+
+		/**
+		 * Where the pieces are and which biomes they sit in. Biomes come from the seed, which matches what generation
+		 * stores (worlds generated by older versions can differ).
+		 */
+		private Footprint footprint(Candidate c) {
+			if (c.footprint != null) {
+				return c.footprint;
+			}
+			Map<String, Integer> counts = new HashMap<>();
+			Set<Long> sampled = new HashSet<>();
+			for (StructurePiece piece : c.start.getPieces()) {
+				BoundingBox box = piece.getBoundingBox();
+				for (int x : steps(box.minX(), box.maxX())) {
+					for (int y : steps(box.minY(), box.maxY())) {
+						for (int z : steps(box.minZ(), box.maxZ())) {
+							int qx = QuartPos.fromBlock(x);
+							int qy = QuartPos.fromBlock(y);
+							int qz = QuartPos.fromBlock(z);
+							if (sampled.size() < MAX_SAMPLES && sampled.add(BlockPos.asLong(qx, qy, qz))) {
+								counts.merge(RegistryQuery.id(biomes.getNoiseBiome(qx, qy, qz)), 1, Integer::sum);
+							}
+						}
 					}
 				}
 			}
+			c.footprint = new Footprint(c.start.getBoundingBox(), counts, sampled.size());
+			return c.footprint;
 		}
-
-		results.sort(Comparator.comparingDouble(Found::distance));
-		return results.size() > limit ? List.copyOf(results.subList(0, limit)) : results;
-	}
-
-	@FunctionalInterface
-	public interface ChunkInhabitedTime {
-		long ticks(int chunkX, int chunkZ);
-	}
-
-	private static void check(ServerLevel level, StructureManager structureManager, StructurePlacement placement,
-		List<Holder<Structure>> structures, ChunkPos chunk, BlockPos origin, int maxDistance, ChunkInhabitedTime inhabited,
-		Predicate<Found> filter, List<Found> results, Set<String> seen, int[] checks) {
-		for (Holder<Structure> structure : structures) {
-			String id = structure.unwrapKey().map(k -> k.identifier().toString()).orElse("?");
-			if (!seen.add(id + "@" + chunk.x() + "," + chunk.z()) || checks[0]++ >= MAX_CHECKS) {
-				continue;
-			}
-			BlockPos pos = placement.getLocatePos(chunk);
-			double distance = Math.sqrt(Math.pow(pos.getX() - origin.getX(), 2) + Math.pow(pos.getZ() - origin.getZ(), 2));
-			if (distance > maxDistance) {
-				continue;
-			}
-			// Same check /locate uses: decided from the seed and biomes without generating the chunk; only when the
-			// game can't tell does it load the chunk's structure starts (also what /locate does).
-			StructureCheckResult result = structureManager.checkStructurePresence(chunk, structure.value(), placement, false);
-			if (result == StructureCheckResult.START_NOT_PRESENT) {
-				continue;
-			}
-			if (result == StructureCheckResult.CHUNK_LOAD_NEEDED) {
-				ChunkAccess access = level.getChunk(chunk.x(), chunk.z(), ChunkStatus.STRUCTURE_STARTS);
-				StructureStart start = structureManager.getStartForStructure(structure.value(), access);
-				if (start == null || !start.isValid()) {
-					continue;
-				}
-			}
-			// Most candidates lie outside explored land; only build the pieces (for the time spent near them) if
-			// something around the start is generated. Filters that need them build them later.
-			StructureStart start = explored(chunk, inhabited) ? generateStart(level, structure, chunk) : null;
-			Found found = new Found(id, pos.getX(), pos.getZ(), distance, timeNearby(start, chunk, inhabited), structure, chunk, start);
-			if (filter.test(found)) {
-				results.add(found);
-			}
-		}
-	}
-
-	private static boolean explored(ChunkPos chunk, ChunkInhabitedTime inhabited) {
-		for (int dx = -PIECE_REACH; dx <= PIECE_REACH; dx++) {
-			for (int dz = -PIECE_REACH; dz <= PIECE_REACH; dz++) {
-				if (inhabited.ticks(chunk.x() + dx, chunk.z() + dz) >= 0) {
-					return true;
-				}
-			}
-		}
-		return false;
-	}
-
-	/**
-	 * How long players have spent near the structure: the most InhabitedTime of any chunk its pieces cover, or -1 if
-	 * none is generated. The start chunk alone isn't enough: a chunk only gains time while a player is within 128
-	 * blocks of it, and an end city's ship or a fortress's far bridges can be farther than that from its start.
-	 */
-	private static long timeNearby(StructureStart start, ChunkPos chunk, ChunkInhabitedTime inhabited) {
-		long best = inhabited.ticks(chunk.x(), chunk.z());
-		if (start == null) {
-			return best;
-		}
-		Set<Long> counted = new HashSet<>();
-		for (StructurePiece piece : start.getPieces()) {
-			BoundingBox box = piece.getBoundingBox();
-			for (int cx = SectionPos.blockToSectionCoord(box.minX()); cx <= SectionPos.blockToSectionCoord(box.maxX()); cx++) {
-				for (int cz = SectionPos.blockToSectionCoord(box.minZ()); cz <= SectionPos.blockToSectionCoord(box.maxZ()); cz++) {
-					if (counted.add(((long) cx << 32) | (cz & 0xFFFFFFFFL))) {
-						best = Math.max(best, inhabited.ticks(cx, cz));
-					}
-				}
-			}
-		}
-		return best;
 	}
 }
