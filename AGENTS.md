@@ -165,3 +165,13 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 - **Wrapped parse errors:** the parser wraps a stream's `IOException` in `ReportedNbtException` (cause in `getCause()`), and unwinds the accounter's depth before its exception arrives; `NbtBudget.translated` handles both.
 - **Limits are `TooLargeException`:** positions (`BlockVolume.MAX_POSITIONS`), block states, palettes (64), block entries (2^22, and no more than the declared box has positions), block entities (2^18), entities (2^16), and pack and mod entries and bytes (`DataPackCopy.Limits`, per copy and per world). A failed build deletes its partial folder. Check them before the data fixers run; the template index retries a template that's too large for its parallel pass.
 - **Windows junctions aren't symbolic links to Java:** `Files.isSymbolicLink` is false, `isDirectory` true and `isOther` true, and `Files.walk` enters them, deleting through them too. `KnowledgeFiles.isLink` treats an "other" entry whose real path differs as a link (cloud-sync placeholders are "other" too, but real in place). Walk and delete with `KnowledgeFiles`; links inside the knowledge folder aren't followed, so to move it, link the whole folder. Unit tests create junctions with `mklink /J`; symbolic links need Developer Mode, so those tests skip without it.
+
+## Agent skills
+
+### Issue tracker
+
+Issues live in Linear, team **ClaudeChat** (`MAI-<n>`), through the Linear MCP tools. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: one `GLOSSARY.md` and `docs/adr/` at the repo root, created lazily. See `docs/agents/domain.md`.
