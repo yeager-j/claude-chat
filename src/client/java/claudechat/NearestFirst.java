@@ -4,10 +4,14 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.PriorityQueue;
+import java.util.concurrent.CancellationException;
+import java.util.function.BooleanSupplier;
+import java.util.function.Predicate;
 
 /**
  * The shared parts of the nearest-first searches (structures, biomes, blocks): walking square rings of grid cells
- * outward, and keeping the k nearest hits with the rule for when the rest of the search can't beat them.
+ * outward, and keeping the k nearest hits with the rule for when the rest of the search can't beat them. Also picks
+ * the nearest few of a collection before expensive work on each ({@link #closest}).
  */
 final class NearestFirst {
 	private NearestFirst() {
@@ -74,5 +78,36 @@ final class NearestFirst {
 			entries.forEach(entry -> items.add(entry.item()));
 			return items;
 		}
+	}
+
+	/** The {@code limit} first items in {@code order}, and how many more passed the filter. */
+	record Closest<T>(List<T> items, int more) {
+	}
+
+	/**
+	 * The {@code limit} first of the items that pass {@code cheap}, in {@code order}, without keeping or sorting the
+	 * rest: the cap on the expensive work that follows, for a collection someone else decides the size of. Checks
+	 * {@code stopped} as it goes and throws {@link CancellationException} once it's true.
+	 */
+	static <T> Closest<T> closest(Iterable<T> all, Predicate<T> cheap, Comparator<T> order, int limit, BooleanSupplier stopped) {
+		PriorityQueue<T> lastFirst = new PriorityQueue<>(order.reversed());
+		int seen = 0;
+		int passed = 0;
+		for (T item : all) {
+			if ((seen++ & 255) == 0 && stopped.getAsBoolean()) {
+				throw new CancellationException("Stopped.");
+			}
+			if (!cheap.test(item)) {
+				continue;
+			}
+			passed++;
+			lastFirst.add(item);
+			if (lastFirst.size() > limit) {
+				lastFirst.poll();
+			}
+		}
+		List<T> items = new ArrayList<>(lastFirst);
+		items.sort(order);
+		return new Closest<>(items, passed - items.size());
 	}
 }

@@ -25,7 +25,8 @@ import java.util.regex.Pattern;
  * mod's argument building, process start, stream parsing and killing are all real. It plays the scenario named in
  * {@code <folder>/scenario.txt}, prints stream-json as claude does, and leaves files the test reads: {@code calls.log}
  * (one line of arguments per start), {@code started.txt} (its pid and its child's), {@code mcp.json} and
- * {@code prompt.txt} (copies of the MCP config and system prompt it was given). It waits for {@code <folder>/go} where
+ * {@code prompt.txt} (copies of the MCP config and system prompt it was given), {@code workdir.txt} (the working
+ * directory it was started in). It waits for {@code <folder>/go} where
  * a scenario needs the test to act first.
  * <p>
  * Scenarios, as {@code <name> <argument>}:
@@ -109,6 +110,7 @@ public final class FakeClaude {
 		// Copied now: the mod deletes both files when the question ends.
 		copy(Path.of(valueAfter("--mcp-config")), "mcp.json");
 		copy(Path.of(valueAfter("--append-system-prompt-file")), "prompt.txt");
+		Files.writeString(folder.resolve("workdir.txt"), Path.of("").toAbsolutePath().toString());
 
 		switch (scenario[0]) {
 			case "answer" -> {
@@ -341,6 +343,11 @@ public final class FakeClaude {
 	/** For the test: the system prompt the last question was given. */
 	public static String systemPrompt(Path folder) throws IOException {
 		return Files.readString(folder.resolve("prompt.txt"));
+	}
+
+	/** For the test: the working directory the last question started in. */
+	public static Path workingDirectory(Path folder) throws IOException {
+		return Path.of(Files.readString(folder.resolve("workdir.txt")));
 	}
 
 	/** For the test: the lines of calls.log, oldest first. */

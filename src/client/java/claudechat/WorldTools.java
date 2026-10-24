@@ -553,20 +553,25 @@ public final class WorldTools {
 		return r;
 	}
 
+	/** Keys every block entity has, which a result says another way or not at all. */
+	private static final Set<String> ROUTINE_KEYS = Set.of("id", "x", "y", "z", "keepPacked", "components");
+
 	/** The block entity's data as trimmed SNBT, plus "spawns" for spawners. */
 	private static void addBlockEntity(JsonObject r, CompoundTag blockEntity) {
+		addBlockEntity(r, blockEntity, ROUTINE_KEYS);
+	}
+
+	/** See {@link #addBlockEntity(JsonObject, CompoundTag)}; leaves out the top-level keys in {@code omit}. */
+	private static void addBlockEntity(JsonObject r, CompoundTag blockEntity, Set<String> omit) {
 		if (blockEntity != null) {
 			// Spawners and trial spawners keep the mob in SpawnData; say it plainly rather than leave it in the SNBT.
 			blockEntity.getCompound("SpawnData").flatMap(spawn -> spawn.getCompound("entity"))
 				.map(entity -> entity.getStringOr("id", "")).filter(id -> !id.isEmpty())
 				.ifPresent(id -> r.addProperty("spawns", ToolFormat.id(id)));
-			CompoundTag trimmed = blockEntity.copy();
-			for (String key : List.of("id", "x", "y", "z", "keepPacked", "components")) {
-				trimmed.remove(key);
-			}
-			if (!trimmed.isEmpty()) {
-				String snbt = trimmed.toString();
-				r.addProperty("block_entity", snbt.length() > 400 ? snbt.substring(0, 400) + "…" : snbt);
+			// Bounded as it is written: the data may come from a downloaded schematic or world, and be any size.
+			String snbt = NbtPreview.of(blockEntity, omit, NbtPreview.PREVIEW_CHARS);
+			if (!snbt.equals("{}")) {
+				r.addProperty("block_entity", snbt);
 			}
 		}
 	}
@@ -645,7 +650,7 @@ public final class WorldTools {
 		}
 		out.add("results", results);
 		if (result.truncated()) {
-			ToolFormat.noteMore(out, "Stopped early: the search area was too large. Narrow max_distance to search farther in parts.");
+			ToolFormat.noteMore(out, "Stopped early: the search was too large. Narrow max_distance to search farther in parts, or raise min_spacing.");
 		} else if (results.isEmpty()) {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}
@@ -692,6 +697,12 @@ public final class WorldTools {
 	private static final int MAX_LAYER_CELLS = 40_000;
 	private static final int MAX_BLOCK_ENTITIES = 40;
 	private static final int MAX_TEMPLATE_ENTITIES = 30;
+	/** list_schematics results; the rest are counted. */
+	private static final int MAX_LISTED_SCHEMATICS = 200;
+	/** Regions inspect_schematic names; the rest are counted. */
+	private static final int MAX_LISTED_REGIONS = 50;
+	/** Characters of a schematic's own text (name, author, description, path) a result carries. */
+	private static final int MAX_SCHEMATIC_TEXT = 300;
 
 	/**
 	 * Slow first-use work, in the background when the world opens or reloads: the structure template index, and the
@@ -830,6 +841,9 @@ public final class WorldTools {
 	}
 
 	/** "block_entities" (chests with loot tables, spawners, signs...), "entities" and "jigsaw_connectors". */
+	/** A template's block entities show their loot table on its own. */
+	private static final Set<String> WITHOUT_LOOT_TABLE = Set.of("id", "x", "y", "z", "keepPacked", "components", "LootTable");
+
 	private static void addBlockEntities(JsonObject out, BlockVolume volume) {
 		JsonArray blockEntities = new JsonArray();
 		JsonArray jigsaws = new JsonArray();
@@ -864,9 +878,7 @@ public final class WorldTools {
 			ToolFormat.addBlockState(r, b.state());
 			r.addProperty("pos", ToolFormat.position(b.pos()));
 			b.data().getString("LootTable").ifPresent(loot -> r.addProperty("loot_table", ToolFormat.id(loot)));
-			CompoundTag rest = b.data().copy();
-			rest.remove("LootTable");
-			addBlockEntity(r, rest);
+			addBlockEntity(r, b.data(), WITHOUT_LOOT_TABLE);
 			blockEntities.add(r);
 		}
 		if (!blockEntities.isEmpty()) {
@@ -899,60 +911,97 @@ public final class WorldTools {
 		JsonObject out = new JsonObject();
 		out.addProperty("folder", folder.dir().toString());
 		JsonArray results = new JsonArray();
-		for (Schematics.Entry entry : folder.entries()) {
+		Schematics.Catalog catalog = folder.entries();
+		int more = 0;
+		for (Schematics.Entry entry : catalog.entries()) {
 			if (!query.isEmpty() && !Schematics.matches(entry, query)) {
 				continue;
 			}
+			if (results.size() >= MAX_LISTED_SCHEMATICS) {
+				more++;
+				continue;
+			}
 			JsonObject r = new JsonObject();
-			r.addProperty("file", entry.path());
+			r.addProperty("file", clipped(entry.path()));
 			switch (entry) {
 				case Schematics.Readable readable -> {
 					Schematics.Info info = readable.info();
-					r.addProperty("name", info.name());
+					r.addProperty("name", clipped(info.name()));
 					if (!info.author().isEmpty()) {
-						r.addProperty("author", info.author());
+						r.addProperty("author", clipped(info.author()));
 					}
 					r.addProperty("size", ToolFormat.size(info.size()));
 					info.recordedBlocks().ifPresent(blocks -> r.addProperty("blocks", blocks));
 				}
-				case Schematics.Unreadable unreadable -> r.addProperty("error", "unreadable: " + unreadable.error());
+				case Schematics.Unreadable unreadable -> r.addProperty("error", "unreadable: " + clipped(unreadable.error()));
 			}
 			results.add(r);
 		}
 		out.add("schematics", results);
+		if (more > 0) {
+			ToolFormat.noteMore(out, more + " more " + (query.isEmpty() ? "schematics" : "matches") + "; give a query to narrow the list.");
+		}
+		noteUnread(out, catalog);
 		if (results.isEmpty()) {
 			out.addProperty("note", "No schematics" + (query.isEmpty() ? "" : " matching \"" + query + "\"") + " in that folder.");
 		}
 		return Tool.Result.of(out);
 	}
 
+	/** Says which files a catalog left out: the folder may hold a downloaded collection of any size. */
+	private static void noteUnread(JsonObject out, Schematics.Catalog catalog) {
+		if (catalog.notRead() > 0) {
+			ToolFormat.noteMore(out, catalog.notRead() + " more schematic files weren't read: reading the folder stopped at its limit "
+				+ "(" + Schematics.MAX_DESCRIBED + " files, " + (Schematics.CATALOG_BYTES >> 20) + " MiB of data or "
+				+ Schematics.CATALOG_TIME.toSeconds() + " s). Give a file's path to read it.");
+		}
+		if (!catalog.complete()) {
+			ToolFormat.noteMore(out, "The folder wasn't searched to the end: it has more than " + Schematics.MAX_FILES + " schematic files or "
+				+ Schematics.MAX_WALKED + " entries.");
+		}
+	}
+
+	/** Text a schematic file chose (its name, author, description), cut to a length a result can carry. */
+	private static String clipped(String text) {
+		return text.length() > MAX_SCHEMATIC_TEXT ? text.substring(0, MAX_SCHEMATIC_TEXT) + "…" : text;
+	}
+
 	private Tool.Result inspectSchematic(Arguments args, Tool.Context context) throws Exception {
 		String query = args.get(SCHEMATIC);
 		Schematics.Folder folder = Schematics.folder();
-		Schematics.Entry entry = switch (Schematics.match(folder.entries(), query)) {
+		Schematics.Lookup lookup = folder.find(query);
+		Schematics.Entry entry = switch (lookup.match()) {
 			case Schematics.Found found -> found.entry();
 			case Schematics.Ambiguous ambiguous -> throw new IllegalArgumentException("\"" + query + "\" matches several schematics: "
-				+ String.join(", ", ambiguous.candidates().stream().limit(20).map(Schematics.Entry::path).toList()) + ". Give the file name.");
-			case Schematics.NotFound notFound -> throw new IllegalArgumentException(
-				"No schematic matching \"" + query + "\" in " + folder.dir() + ". Use list_schematics.");
+				+ String.join(", ", ambiguous.candidates().stream().limit(20).map(e -> clipped(e.path())).toList()) + ". Give the file name.");
+			case Schematics.NotFound notFound -> {
+				JsonObject unread = new JsonObject();
+				noteUnread(unread, lookup.catalog());
+				throw new IllegalArgumentException("No schematic matching \"" + query + "\" in " + folder.dir() + ". Use list_schematics."
+					+ (unread.has(ToolFormat.MORE_KEY) ? " " + unread.get(ToolFormat.MORE_KEY).getAsString() : ""));
+			}
 		};
 		Schematics.Schematic s = Schematics.load(entry.file());
 		Schematics.Info info = s.info();
 
 		JsonObject out = new JsonObject();
 		out.addProperty("file", entry.path());
-		out.addProperty("name", info.name());
+		out.addProperty("name", clipped(info.name()));
 		if (!info.author().isEmpty()) {
-			out.addProperty("author", info.author());
+			out.addProperty("author", clipped(info.author()));
 		}
 		if (!info.description().isEmpty()) {
-			out.addProperty("description", info.description());
+			out.addProperty("description", clipped(info.description()));
 		}
 		out.addProperty("size", ToolFormat.size(info.size()));
 		if (s.regions().size() > 1) {
 			JsonArray regions = new JsonArray();
-			s.regions().forEach(r -> regions.add(r.name() + ": " + ToolFormat.size(r.size()) + " at " + ToolFormat.position(r.position())));
+			s.regions().stream().limit(MAX_LISTED_REGIONS)
+				.forEach(r -> regions.add(clipped(r.name()) + ": " + ToolFormat.size(r.size()) + " at " + ToolFormat.position(r.position())));
 			out.add("regions", regions);
+			if (s.regions().size() > MAX_LISTED_REGIONS) {
+				ToolFormat.noteMore(out, (s.regions().size() - MAX_LISTED_REGIONS) + " more regions.");
+			}
 		}
 
 		Map<Identifier, Integer> noItem = new TreeMap<>();

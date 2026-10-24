@@ -6,6 +6,8 @@ import net.minecraft.resources.ResourceKey;
 import net.minecraft.world.level.Level;
 import org.junit.jupiter.api.Test;
 
+import java.io.IOException;
+import java.io.StringReader;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -150,16 +152,16 @@ class WorldValuesTest {
 	// --- Visits file and InhabitedTime ---
 
 	@Test
-	void visitsFileReadsOldAndNewDimensionNames() {
-		Map<WorldIndex.ChunkKey, Long> times = VisitsFile.parse(List.of(
+	void visitsFileReadsOldAndNewDimensionNames() throws IOException {
+		Map<WorldIndex.ChunkKey, Long> times = VisitsFile.parse(new StringReader(String.join("\n",
 			"# comment",
 			"overworld 1 2 30",
 			"minecraft:overworld 1 2 50",
 			"minecraft:the_nether -3 4 7",
 			"overworld x 2 30",
-			"short line"));
+			"short line")));
 		assertEquals(Map.of(new WorldIndex.ChunkKey(OVERWORLD, 1, 2), 50L, new WorldIndex.ChunkKey(NETHER, -3, 4), 7L), times);
-		assertEquals(times, VisitsFile.parse(List.of(VisitsFile.format(times).split("\n"))));
+		assertEquals(times, VisitsFile.parse(new StringReader(VisitsFile.format(times))));
 	}
 
 	@Test

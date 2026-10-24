@@ -96,7 +96,8 @@ public class ClaudeCli {
 		int timeoutSeconds = config.timeoutSeconds;
 		ClaudeRun.Request request = run.request();
 
-		// Run inside the knowledge folder: Claude can search it, and won't pick up a CLAUDE.md or other files from the game directory.
+		// Run inside the knowledge folder: Claude can search it, and won't pick up a CLAUDE.md or other files from the game
+		// directory. The tiers' pre-approved reads are relative to it (PermissionTier.PRE_APPROVED_READS).
 		Path workDir = knowledge.root();
 		Files.createDirectories(workDir);
 		// The question's files, in a folder only the player's account can open: the MCP config holds the question's
@@ -133,7 +134,7 @@ public class ClaudeCli {
 
 	private String systemPrompt(ClaudeRun.Request request) {
 		SystemPrompt.Parts parts = new SystemPrompt.Parts(request.gameContext(), mcp.worldOpen(), Waypoints.available(),
-			request.policy().tier(), knowledge.describeForPrompt(), config.extraInstructions);
+			request.policy(), knowledge.describeForPrompt(), config.extraInstructions);
 		return SystemPrompt.build(parts, mcp.toolNames());
 	}
 
@@ -144,7 +145,7 @@ public class ClaudeCli {
 			"--mcp-config", mcpConfig.toString(),
 			"--strict-mcp-config",
 			"--append-system-prompt-file", promptFile.toString()));
-		command.addAll(policy.tier().cliFlags(mcp.isRunning(), FabricLoader.getInstance().getGameDir().toString()));
+		command.addAll(policy.tier().cliFlags(policy.web(), mcp.isRunning(), FabricLoader.getInstance().getGameDir().toString()));
 		config.effort.flag().ifPresent(effort -> command.addAll(List.of("--effort", effort)));
 		resume.ifPresent(session -> command.addAll(List.of("--resume", session)));
 		return command;

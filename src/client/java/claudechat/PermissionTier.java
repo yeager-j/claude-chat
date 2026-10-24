@@ -24,15 +24,11 @@ public enum PermissionTier {
 				""".formatted(McpServer.claudeName(GameCommands.TOOL));
 		}
 
-		/**
-		 * Reads are confined to the knowledge folder (the working directory): text Claude reads in the world, in mods or
-		 * on the web could otherwise talk it into reading any file the player can, and sending it out. With nobody to
-		 * ask, dontAsk denies whatever isn't allowed here.
-		 */
+		/** Nothing answers permission prompts, so a read outside the knowledge folder is denied. */
 		@Override
-		public List<String> cliFlags(boolean toolsServer, String gameDir) {
-			return List.of("--tools", READ_TOOLS, "--allowedTools", allowedTools(toolsServer), "--disallowedTools", APPROVE_TOOL,
-				"--permission-mode", "dontAsk");
+		public List<String> cliFlags(boolean web, boolean toolsServer, String gameDir) {
+			return List.of("--tools", offeredTools(web, READ_TOOLS), "--allowedTools", allowedTools(web, toolsServer),
+				"--disallowedTools", APPROVE_TOOL, "--permission-mode", "default");
 		}
 	},
 
@@ -47,15 +43,16 @@ public enum PermissionTier {
 
 		/**
 		 * Anything not pre-approved goes to the approve tool, which asks in chat; without the tools server nobody could
-		 * answer, so it's denied. Reads outside the knowledge and game folders (the working directories) are asked about too.
+		 * answer, so it's denied. Reads in the game folder ({@code --add-dir}) don't ask; reads elsewhere do.
 		 */
 		@Override
-		public List<String> cliFlags(boolean toolsServer, String gameDir) {
+		public List<String> cliFlags(boolean web, boolean toolsServer, String gameDir) {
 			List<String> askHow = toolsServer
 				? List.of("--disallowedTools", APPROVE_TOOL, "--permission-prompt-tool", APPROVE_TOOL)
 				: List.of("--permission-prompts", "none");
-			return Stream.concat(Stream.of("--tools", READ_TOOLS + "," + WRITE_TOOLS, "--allowedTools", allowedTools(toolsServer),
-				"--add-dir", gameDir), askHow.stream()).toList();
+			return Stream.concat(Stream.of("--tools", offeredTools(web, READ_TOOLS + "," + WRITE_TOOLS),
+				"--allowedTools", allowedTools(web, toolsServer), "--add-dir", gameDir, "--permission-mode", "default"),
+				askHow.stream()).toList();
 		}
 	},
 
@@ -69,9 +66,10 @@ public enum PermissionTier {
 			return actPrompt(worldOpen, "Nothing asks the player first, so be careful.");
 		}
 
+		/** Without the web tools, shell commands can still reach the network. */
 		@Override
-		public List<String> cliFlags(boolean toolsServer, String gameDir) {
-			return List.of("--tools", READ_TOOLS + "," + WRITE_TOOLS, "--permission-mode", "bypassPermissions",
+		public List<String> cliFlags(boolean web, boolean toolsServer, String gameDir) {
+			return List.of("--tools", offeredTools(web, READ_TOOLS + "," + WRITE_TOOLS), "--permission-mode", "bypassPermissions",
 				"--disallowedTools", APPROVE_TOOL, "--add-dir", gameDir);
 		}
 	};
@@ -84,13 +82,17 @@ public enum PermissionTier {
 		REFUSE
 	}
 
-	/** Always offered: Claude can search the knowledge folder and the web. */
-	static final String READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch";
+	/** Always offered: Claude can search the knowledge folder. */
+	static final String READ_TOOLS = "Read,Grep,Glob";
+	/** Offered, and never asked about, only while {@code /claude web} is on. */
+	static final String WEB_TOOLS = "WebSearch,WebFetch";
 	/**
-	 * What's allowed without asking, of {@link #READ_TOOLS}: reads only inside the working directory (Claude Code applies
-	 * Read rules to Grep and Glob too), never a bare {@code Read}, which would allow every file the player can read.
+	 * Never asked about: file reads within the working directory, which {@link ClaudeCli} sets to the knowledge folder.
+	 * A bare {@code Read} rule would pre-approve reading any file the player's account can, so text Claude reads in the
+	 * world could talk it into reading private files. Rule paths starting {@code ./} are relative to the working
+	 * directory.
 	 */
-	static final String READ_RULES = "Read(./**),WebSearch,WebFetch";
+	static final String PRE_APPROVED_READS = "Read(./**),Grep(./**),Glob(./**)";
 	/** Added for Ask for approval and Full access. Shell commands that only read are still allowed without asking. */
 	static final String WRITE_TOOLS = "Bash,Edit,Write"
 		+ (System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows") ? ",PowerShell" : "");
@@ -133,12 +135,15 @@ public enum PermissionTier {
 
 	/**
 	 * Claude Code's tool and permission flags. Our own MCP tools are always pre-approved: run_command decides for
-	 * itself which game commands need the player's OK.
+	 * itself which game commands need the player's OK. Read only and Ask name {@code --permission-mode default}, so a
+	 * {@code defaultMode} in the player's own Claude Code settings (such as {@code bypassPermissions}) can't loosen them.
 	 *
+	 * @param web         whether Claude may search the web and fetch pages ({@code /claude web}); off, the web tools
+	 *                    aren't offered at all, so Ask never asks about them
 	 * @param toolsServer whether the mod's MCP server is running
 	 * @param gameDir     the game folder, which edits and shell commands may reach (config, saves, mods)
 	 */
-	public abstract List<String> cliFlags(boolean toolsServer, String gameDir);
+	public abstract List<String> cliFlags(boolean web, boolean toolsServer, String gameDir);
 
 	/** The warning shown with the confirm button, when turning this tier on needs one (a typo or a link mustn't). */
 	public Optional<String> confirmation() {
@@ -154,8 +159,13 @@ public enum PermissionTier {
 		return Stream.of(values()).map(tier -> tier.id).toList();
 	}
 
-	private static String allowedTools(boolean toolsServer) {
-		return toolsServer ? READ_RULES + "," + McpServer.CLAUDE_PREFIX : READ_RULES;
+	private static String offeredTools(boolean web, String tools) {
+		return web ? tools + "," + WEB_TOOLS : tools;
+	}
+
+	private static String allowedTools(boolean web, boolean toolsServer) {
+		String reads = offeredTools(web, PRE_APPROVED_READS);
+		return toolsServer ? reads + "," + McpServer.CLAUDE_PREFIX : reads;
 	}
 
 	private static String actPrompt(boolean worldOpen, String approval) {
