@@ -65,6 +65,20 @@ record NbtBudget(long maxBytes, BooleanSupplier cancelled) {
 		}
 	}
 
+	/**
+	 * Reads a whole stream that's decompressed already: a saved chunk, through its region file's own compression. See
+	 * {@link #read(Path)}.
+	 */
+	CompoundTag readUncompressed(InputStream uncompressed) throws IOException {
+		Accounter accounter = new Accounter(maxBytes);
+
+		try (DataInputStream in = new DataInputStream(new BufferedInputStream(new Limited(uncompressed)))) {
+			return NbtIo.read(in, accounter);
+		} catch (RuntimeException e) {
+			throw translated(e, accounter);
+		}
+	}
+
 	/** Streams a file through {@code visitor}, which may skip what it doesn't need; see {@link #read(Path)}. */
 	void parse(Path file, StreamTagVisitor visitor) throws IOException {
 		parse(file, visitor, new AtomicLong());

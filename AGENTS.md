@@ -64,7 +64,7 @@ The `*_QUESTION` variables and `CLAUDECHAT_LIVE_TEST` ask the real Claude. With 
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while a known-good version of Xaero's Minimap is loaded: `KNOWN_GOOD_VERSIONS`) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
 | `WorldIndex` | Reads region files (read-only) plus live loaded chunks: containers, entities, players (the host by UUID), per-chunk `InhabitedTime` (with its own record of what the save lacks) and block palettes. Per-world state is an object made on world start and dropped on stop. A `Snapshot` (`Detail.VISITS` or `HOLDERS`) also reads saved chunks |
-| `RegionFiles`, `SavedChunk`, `HolderReader`, `VisitsFile` | Region file layout; the parsed chunk view (the only reader of chunk NBT keys); block entity/entity/player NBT → holders; `claudechat-visits.txt` |
+| `RegionFiles`, `SavedChunk`, `HolderReader`, `VisitsFile` | Region file layout (no links followed, each chunk within an `NbtBudget`); the parsed chunk view (the only reader of chunk NBT keys); block entity/entity/player NBT → holders; `claudechat-visits.txt` (bounded reads, written through a fresh random temp file) |
 | `LiveChunks` | The one rule for which chunks are read live rather than from the save |
 | `Visit`, `Dimensions`, `Origin`, `Provenance` | Values the world tools parse arguments into: visit state and the `visited` filter, dimension names and which dimensions a search covers, the search origin (translated x/8 into the Nether), live/saved/predicted |
 | `NearestFirst`, `ServerTasks` | Ring walk and top-k for the nearest-first searches; server-thread calls with timeouts and asserted thread rules |
