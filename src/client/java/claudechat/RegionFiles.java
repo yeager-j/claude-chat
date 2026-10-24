@@ -6,6 +6,7 @@ import net.minecraft.world.level.chunk.storage.RegionFileVersion;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
@@ -15,6 +16,7 @@ import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.List;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -36,6 +38,9 @@ final class RegionFiles {
 	static final long CHUNK_BYTES = 64L << 20;
 
 	private static final Pattern REGION_NAME = Pattern.compile("r\\.(-?\\d+)\\.(-?\\d+)\\.mca");
+	/** The region coordinates whose chunks ({@link Region#chunkX}, {@link Region#chunkZ}) don't overflow. */
+	static final int MIN_REGION = Integer.MIN_VALUE >> 5;
+	static final int MAX_REGION = Integer.MAX_VALUE >> 5;
 	private static final int SECTOR = 4096;
 	private static final int CHUNKS = 1024;
 
@@ -71,6 +76,9 @@ final class RegionFiles {
 		}
 		try (Stream<Path> files = Files.list(dir)) {
 			return files.map(RegionFiles::region).flatMap(Optional::stream).filter(region -> isPlainFile(region.file())).toList();
+		} catch (UncheckedIOException e) {
+			// The stream reports a failure while iterating the folder unchecked; callers handle it like one opening it.
+			throw e.getCause();
 		}
 	}
 
@@ -110,12 +118,32 @@ final class RegionFiles {
 		}
 	}
 
+	/**
+	 * The region a file's name says it is, or empty for any other name. The name grammar allows any number of digits,
+	 * so a coordinate is also checked against the range whose chunks have {@code int} coordinates: a world can come
+	 * from anywhere, and one name out of range must not stop the folder's other regions being listed.
+	 */
 	private static Optional<Region> region(Path file) {
 		Matcher m = REGION_NAME.matcher(file.getFileName().toString());
 		if (!m.matches()) {
 			return Optional.empty();
 		}
-		return Optional.of(new Region(file, Integer.parseInt(m.group(1)), Integer.parseInt(m.group(2))));
+		OptionalInt x = coordinate(m.group(1));
+		OptionalInt z = coordinate(m.group(2));
+		if (x.isEmpty() || z.isEmpty()) {
+			return Optional.empty();
+		}
+		return Optional.of(new Region(file, x.getAsInt(), z.getAsInt()));
+	}
+
+	/** A region coordinate whose chunks' coordinates fit in an {@code int}, or empty. */
+	private static OptionalInt coordinate(String digits) {
+		try {
+			int value = Integer.parseInt(digits);
+			return value >= MIN_REGION && value <= MAX_REGION ? OptionalInt.of(value) : OptionalInt.empty();
+		} catch (NumberFormatException e) {
+			return OptionalInt.empty();
+		}
 	}
 
 	/** The header, or empty for a file too short to have one (just created). */
