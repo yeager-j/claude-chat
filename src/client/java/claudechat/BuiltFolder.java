@@ -3,7 +3,6 @@ package claudechat;
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.Files;
-import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
@@ -72,6 +71,7 @@ final class BuiltFolder {
 	/** Deep enough for mods/&lt;id&gt;/&lt;version&gt; and datapacks/&lt;world&gt;/&lt;pack&gt;. */
 	private static final int MAX_SWEEP_DEPTH = 3;
 
+	private final Path root;
 	private final Path dir;
 	private final String relativeDir;
 	private final String key;
@@ -83,6 +83,7 @@ final class BuiltFolder {
 
 	/** Reads what's already built in {@code root/relativeDir}; nothing counts unless its marker holds {@code key}. */
 	BuiltFolder(Path root, String relativeDir, String key) {
+		this.root = root;
 		this.dir = root.resolve(relativeDir).normalize();
 		this.relativeDir = relativeDir;
 		this.key = key;
@@ -147,7 +148,9 @@ final class BuiltFolder {
 	/**
 	 * Builds the folder from scratch into a partial folder, then publishes it in place of the current one. Must hold
 	 * {@link #locked}. On failure the published folder is left as it was, progress becomes FAILED, and the exception
-	 * is rethrown.
+	 * is rethrown. Refuses to build when a link leads the folder outside the knowledge root, before deleting or
+	 * creating anything: everything {@code contents} writes is below the partial and work folders beside it, in folders
+	 * this build creates.
 	 */
 	void build(Content target, Contents contents) throws IOException, InterruptedException {
 		requireLock();
@@ -163,6 +166,9 @@ final class BuiltFolder {
 		Path work = sibling(WORK_SUFFIX);
 
 		try {
+			Files.createDirectories(root);
+			// The partial and work folders are siblings of the published one, so checking its parent covers all three.
+			KnowledgeFiles.requireRealLocationInside(root, dir.getParent());
 			KnowledgeFiles.deleteTree(partial);
 			KnowledgeFiles.deleteTree(work);
 			Files.createDirectories(partial);
@@ -191,6 +197,7 @@ final class BuiltFolder {
 			return;
 		}
 
+		KnowledgeFiles.requireRealLocationInside(root, dir);
 		// Data marker first: an interruption in between leaves both markers, which still reads as the code that's there.
 		Files.writeString(dir.resolve(DATA_MARKER), marker);
 		Files.delete(dir.resolve(CODE_MARKER));
@@ -304,7 +311,8 @@ final class BuiltFolder {
 	 * Deletes built folders under {@code root} that aren't in {@code wanted}: those with a marker, and leftovers of
 	 * builds (a wanted folder's partial and work folders are kept, since its build may be running). Folders without a marker
 	 * aren't ours and are left alone, as is anything deeper than a built folder can be. Folders emptied this way are
-	 * removed too. Never follows links, so nothing outside {@code root} is touched.
+	 * removed too. Links, Windows junctions included, are neither entered nor deleted, so nothing outside {@code root}
+	 * is touched.
 	 */
 	static void removeUnwanted(Path root, Set<Path> wanted) {
 		Path normalizedRoot = root.normalize();
@@ -331,7 +339,7 @@ final class BuiltFolder {
 		List<Path> children;
 
 		try (Stream<Path> list = Files.list(dir)) {
-			children = list.filter(child -> Files.isDirectory(child, LinkOption.NOFOLLOW_LINKS)).toList();
+			children = list.filter(KnowledgeFiles::isPlainDirectory).toList();
 		} catch (IOException e) {
 			ClaudeChatClient.LOGGER.warn("Could not list {}", dir, e);
 			return;

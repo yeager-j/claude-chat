@@ -53,11 +53,14 @@ final class SpongeFormat implements Schematics.Format {
 		CompoundTag schematic = root.getCompound("Schematic").orElse(root);
 		int dataVersion = schematic.getIntOr("DataVersion", StructureNbt.UNKNOWN_VERSION);
 		Vec3i size = size(schematic);
+		// Before the palette and the fixers, so an oversized file costs nothing.
+		BlockVolume.Builder volume = new BlockVolume.Builder(size);
 		CompoundTag blocks = schematic.getCompound("Blocks").orElse(schematic);
 		byte[] data = blocks.getByteArray(blocks.contains("Data") ? "Data" : "BlockData").orElse(new byte[0]);
 		ListTag blockEntityList = blocks.getList("BlockEntities").orElseGet(() -> schematic.getListOrEmpty("TileEntities"));
 
 		CompoundTag paletteTag = blocks.getCompoundOrEmpty("Palette");
+		TooLargeException.requireAtMost(paletteTag.size(), BlockVolume.MAX_STATES, "block states in a palette");
 		ListTag palette = new ListTag();
 		boolean[] assigned = new boolean[paletteTag.size()];
 		for (int i = 0; i < assigned.length; i++) {
@@ -84,7 +87,6 @@ final class SpongeFormat implements Schematics.Format {
 		});
 		StructureNbt.Contents upgraded = StructureNbt.upgradeParts(palette, blockEntities, entities, dataVersion);
 
-		BlockVolume.Builder volume = new BlockVolume.Builder(size);
 		readBlocks(data, size, upgraded.palettes().getFirst(), assigned, volume);
 		for (StructureNbt.Entry be : upgraded.blocks()) {
 			volume.blockEntity(be.pos(), be.nbt());
@@ -119,7 +121,8 @@ final class SpongeFormat implements Schematics.Format {
 				shift += 7;
 			} while ((b & 0x80) != 0);
 
-			if (value >= palette.size() || !assigned[value]) {
+			// A fifth byte can set the sign bit.
+			if (value < 0 || value >= palette.size() || !assigned[value]) {
 				throw new IOException("Block data is corrupt: block " + i + " uses palette entry " + value + ", which isn't in the palette");
 			}
 

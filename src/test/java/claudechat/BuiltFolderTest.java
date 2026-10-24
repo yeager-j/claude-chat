@@ -7,6 +7,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.util.Set;
 
@@ -18,6 +19,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class BuiltFolderTest {
 	@TempDir
 	Path root;
+
+	/** Outside {@link #root}: what a link inside it may lead to. */
+	@TempDir
+	Path elsewhere;
 
 	/** Builds {@code folder} with a data file, plus a source file when {@code target} is CODE. */
 	private static void build(BuiltFolder folder, Content target) {
@@ -158,5 +163,50 @@ class BuiltFolderTest {
 		assertTrue(Files.isDirectory(inProgressWork));
 		assertFalse(Files.exists(leftoverOld));
 		assertTrue(Files.isDirectory(notOurs));
+	}
+
+	@Test
+	void sweepNeitherEntersNorDeletesJunctions() throws Exception {
+		Path outside = Files.createDirectories(elsewhere.resolve("outside"));
+		Path markedFolder = Files.createDirectories(outside.resolve("1.0"));
+		Files.writeString(markedFolder.resolve(".complete"), "not ours to delete");
+		Path oldLooking = Files.createDirectories(outside.resolve("2.0.old"));
+		Files.createDirectories(root.resolve("mods"));
+		Path link = FileLinks.junction(root.resolve("mods/foo"), outside);
+		Path linkedBuilt = FileLinks.junction(root.resolve("mods/bar.old"), outside);
+
+		BuiltFolder.removeUnwanted(root, Set.of());
+
+		assertTrue(Files.isRegularFile(markedFolder.resolve(".complete")));
+		assertTrue(Files.isDirectory(oldLooking));
+		assertTrue(Files.exists(link, LinkOption.NOFOLLOW_LINKS));
+		assertTrue(Files.exists(linkedBuilt, LinkOption.NOFOLLOW_LINKS));
+	}
+
+	@Test
+	void sweepNeitherEntersNorDeletesSymbolicLinks() throws Exception {
+		Path outside = Files.createDirectories(elsewhere.resolve("outside"));
+		Path markedFolder = Files.createDirectories(outside.resolve("1.0"));
+		Files.writeString(markedFolder.resolve(".complete"), "not ours to delete");
+		Files.createDirectories(root.resolve("mods"));
+		Path link = FileLinks.symbolicLink(root.resolve("mods/foo"), outside);
+
+		BuiltFolder.removeUnwanted(root, Set.of());
+
+		assertTrue(Files.isRegularFile(markedFolder.resolve(".complete")));
+		assertTrue(Files.exists(link, LinkOption.NOFOLLOW_LINKS));
+	}
+
+	@Test
+	void aBuildALinkLeadsOutsideTheRootIsRefusedBeforeWriting() throws Exception {
+		Path outside = Files.createDirectories(elsewhere.resolve("outside"));
+		FileLinks.junction(root.resolve("mods"), outside);
+		BuiltFolder folder = new BuiltFolder(root, "mods/foo/1.0", "foo@1.0");
+
+		folder.locked(() -> assertThrows(IOException.class, () -> folder.build(Content.DATA, (out, work) -> Files.writeString(out.resolve("x"), "x"))));
+
+		assertEquals(Progress.FAILED, folder.progress());
+		assertTrue(folder.failure().contains("Refusing"), folder.failure());
+		assertTrue(KnowledgeFiles.isEmptyDirectory(outside));
 	}
 }

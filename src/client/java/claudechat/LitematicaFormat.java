@@ -44,6 +44,7 @@ final class LitematicaFormat implements Schematics.Format {
 	public Schematics.Schematic read(CompoundTag root, String fileStem) throws IOException {
 		int dataVersion = root.getIntOr("MinecraftDataVersion", StructureNbt.UNKNOWN_VERSION);
 		List<Bounds> bounds = bounds(root.getCompoundOrEmpty("Regions"));
+		requireWithinLimits(bounds);
 		BlockPos min = bounds.stream().map(Bounds::min).reduce(BlockPos::min).orElse(BlockPos.ZERO);
 		BlockPos max = bounds.stream().map(Bounds::max).reduce(BlockPos::max).orElse(BlockPos.ZERO);
 		Vec3i size = max.subtract(min);
@@ -78,6 +79,27 @@ final class LitematicaFormat implements Schematics.Format {
 		}
 
 		return bounds;
+	}
+
+	/**
+	 * The limits on the whole file, checked before any region is read: each region visits every one of its positions,
+	 * and regions may overlap, so their positions together must fit in one volume; block entities and entities are
+	 * upgraded region by region, so their limits apply to the sum.
+	 */
+	private static void requireWithinLimits(List<Bounds> bounds) throws IOException {
+		long positions = 0;
+		long blockEntities = 0;
+		long entities = 0;
+
+		for (Bounds region : bounds) {
+			positions += BlockVolume.requireFits(region.size());
+			blockEntities += region.tag().getListOrEmpty("TileEntities").size();
+			entities += region.tag().getListOrEmpty("Entities").size();
+		}
+
+		TooLargeException.requireAtMost(positions, BlockVolume.MAX_POSITIONS, "positions in its regions");
+		TooLargeException.requireAtMost(blockEntities, StructureNbt.MAX_BLOCK_ENTITIES, "block entities");
+		TooLargeException.requireAtMost(entities, StructureNbt.MAX_ENTITIES, "entities");
 	}
 
 	/** Adds one region's blocks, block entities and entities to the volume, at {@code offset}. */

@@ -141,9 +141,61 @@ class SchematicFormatsTest {
 
 		List<Schematics.Entry> entries = new Schematics.Folder(dir).entries();
 
-		assertEquals(List.of("Redstone Test.litematic", "farms/Witch Farm.litematic", "farms/Witch Hut.schem", "old/Broken.litematic",
-			"old/Old Spawner.nbt", "old/Sponge Two.schem"), entries.stream().map(Schematics.Entry::path).toList());
-		assertTrue(entries.get(3) instanceof Schematics.Unreadable);
+		assertEquals(List.of("Redstone Test.litematic", "farms/Witch Farm.litematic", "farms/Witch Hut.schem", "old/Bomb.schem",
+			"old/Broken.litematic", "old/Old Spawner.nbt", "old/Sponge Two.schem"), entries.stream().map(Schematics.Entry::path).toList());
+		assertTrue(entries.get(4) instanceof Schematics.Unreadable);
+		String bomb = ((Schematics.Unreadable) entries.get(3)).error();
+		assertTrue(bomb.contains("Bomb.schem") && bomb.contains("decompresses to more than 256 MiB"), bomb);
+	}
+
+	@Test
+	void decompressionBombIsRefusedBeforeItsArrayIsAllocated() throws IOException {
+		Path bomb = dir.resolve("bomb.schem");
+		SchematicFixtures.writeZeroBomb(bomb, NbtBudget.FILE_BYTES + (1 << 20));
+
+		TooLargeException e = assertThrows(TooLargeException.class, () -> Schematics.load(bomb));
+
+		assertTrue(e.getMessage().contains("bomb.schem") && e.getMessage().contains("256 MiB of memory"), e.getMessage());
+	}
+
+	@Test
+	void oversizedSchematicIsRefusedNamingTheFileAndLimit() {
+		TooLargeException e = assertThrows(TooLargeException.class, () -> load("huge.schem", SchematicFixtures.oversizedSponge()));
+
+		assertTrue(e.getMessage().startsWith("huge.schem is too large to read: it has 1073741824 positions (the limit is 67108864)"), e.getMessage());
+	}
+
+	@Test
+	void tooManyPalettesAreRefused() throws IOException {
+		assertEquals(Blocks.STONE, load("ok.nbt", SchematicFixtures.structureWithPalettes(StructureNbt.MAX_PALETTES)).volume().state(0, 0, 0).getBlock());
+
+		TooLargeException e = assertThrows(TooLargeException.class,
+			() -> load("many.nbt", SchematicFixtures.structureWithPalettes(StructureNbt.MAX_PALETTES + 1)));
+		assertTrue(e.getMessage().contains("65 palettes (the limit is 64)"), e.getMessage());
+	}
+
+	@Test
+	void overlappingRegionsCountEveryPositionTheyVisit() {
+		TooLargeException e = assertThrows(TooLargeException.class, () -> load("overlap.litematic", SchematicFixtures.overlappingLitematic()));
+
+		assertTrue(e.getMessage().contains("positions in its regions"), e.getMessage());
+	}
+
+	@Test
+	void tooManyBlockEntitiesAreRefusedBeforeUpgrading() {
+		TooLargeException e = assertThrows(TooLargeException.class,
+			() -> load("chests.litematic", SchematicFixtures.litematicWithBlockEntities(StructureNbt.MAX_BLOCK_ENTITIES + 1)));
+
+		assertTrue(e.getMessage().contains("block entities"), e.getMessage());
+	}
+
+	@Test
+	void corruptVarintIsAnErrorNotACrash() {
+		byte[] fiveByteVarint = {(byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0x0F, 1, 1, 1};
+
+		IOException e = assertThrows(IOException.class, () -> load("sign.schem", SchematicFixtures.spongeWithData(fiveByteVarint)));
+
+		assertTrue(e.getMessage().contains("isn't in the palette"), e.getMessage());
 	}
 
 	@Test
