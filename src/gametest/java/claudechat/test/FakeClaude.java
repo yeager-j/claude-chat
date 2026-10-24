@@ -183,11 +183,19 @@ public final class FakeClaude {
 
 	/**
 	 * The real claude with the arguments the mod gave, its output passed straight through; returns its exit code. The
-	 * mod kills it along with the fake, as one of the fake's descendants.
+	 * mod kills it along with the fake, as one of the fake's descendants. A step may ask the real Claude after fake
+	 * answers in the same conversation, so a resume of one of the fake's own sessions is dropped: the real claude has
+	 * never heard of it, and rejects an id that isn't a UUID outright rather than as a missing session.
 	 */
 	private int live(Path claude, String question) throws Exception {
 		List<String> command = new ArrayList<>(List.of(claude.toString()));
-		command.addAll(args);
+		for (int i = 0; i < args.size(); i++) {
+			if (args.get(i).equals("--resume") && i + 1 < args.size() && args.get(i + 1).startsWith("fake-session-")) {
+				i++;
+				continue;
+			}
+			command.add(args.get(i));
+		}
 		Process real = new ProcessBuilder(command)
 			.redirectOutput(ProcessBuilder.Redirect.INHERIT)
 			.redirectError(ProcessBuilder.Redirect.INHERIT)
