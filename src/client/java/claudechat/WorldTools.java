@@ -650,7 +650,7 @@ public final class WorldTools {
 		}
 		out.add("results", results);
 		if (result.truncated()) {
-			ToolFormat.noteMore(out, "Stopped early: the search area was too large. Narrow max_distance to search farther in parts.");
+			ToolFormat.noteMore(out, "Stopped early: the search was too large. Narrow max_distance to search farther in parts, or raise min_spacing.");
 		} else if (results.isEmpty()) {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}

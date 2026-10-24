@@ -147,6 +147,7 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 
 **Game commands**
 - **Raising permissions:** `CommandSourceStack.withMaximumPermission` doesn't raise anything in 26.3: `LevelBasedPermissionSet.union` keeps the *lower* level. `GameCommands.atLeastGamemaster` compares levels itself and uses `withPermission`.
+- **`/locate` writes:** `locate structure` (and `locate poi`) load candidate chunks to `structure_starts`, which are saved. Only `locate biome` is on `CommandRules.READ_ONLY`; the world tools find structures without generating anything.
 
 **Xaero waypoints**
 - **No Xaero dependency:** the button's `RunCommand` goes through `sendUnattendedCommand`, which Xaero's mixin cancels at HEAD for `xaero_waypoint_add:` and answers with its Add Waypoint screen. Without Xaero the command would reach the server, so `Waypoints.button` renders nothing then.
