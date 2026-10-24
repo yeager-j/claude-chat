@@ -718,7 +718,7 @@ public final class WorldTools {
 	 * Stops the background work for the world that's closing: the template index build, and a warm-up that hasn't
 	 * started yet. A warm-up already running finishes; it doesn't hold the server.
 	 */
-	public void clearTemplates() {
+	public void stopBackgroundWork() {
 		templates.stop();
 		synchronized (warmUp) {
 			if (warmUpRun != null) {

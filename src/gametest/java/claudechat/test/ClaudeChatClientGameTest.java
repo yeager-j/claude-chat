@@ -1,15 +1,24 @@
 package claudechat.test;
 
 import claudechat.Approvals;
-import claudechat.ChatActions;
 import claudechat.ClaudeChatClient;
 import claudechat.ClaudeConfig;
 import claudechat.GameRecipe;
 import claudechat.GameRecipes;
 import claudechat.KnowledgeBase;
 import claudechat.Materials;
+import claudechat.McpServer;
+import claudechat.PermissionTier;
+import claudechat.Policy;
 import claudechat.RecipeRenderer;
+import claudechat.Tool;
+import claudechat.mixin.ChatComponentAccessor;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.chat.GuiMessage;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.Style;
+import java.util.Objects;
+import java.util.Optional;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 import claudechat.Schematics;
@@ -88,12 +97,16 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	private static final int KEY_ESCAPE = InputConstants.KEY_ESCAPE;
 	/** The pack step's zip pack, as the server names it. */
 	private static final String OVERRIDE_PACK = "file/Better Dungeons.zip";
+	/** The token the test's own tool calls use ({@link #usePolicy}). */
+	private static McpServer.Grant grant;
 
 	@Override
 	public void runTest(ClientGameTestContext context) {
 		// Recipe grids read the decompiled data, so wait for the first knowledge base build.
 		context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 600 * SECONDS);
 		LOGGER.info("optional steps: {}", System.getenv().keySet().stream().filter(k -> k.startsWith("CLAUDECHAT_")).sorted().toList());
+		// The test's own tool calls get a token as a question would, with a policy the test chooses.
+		usePolicy(new Policy(PermissionTier.READ_ONLY, false));
 
 		// 0. The MCP server Claude talks to, over HTTP like claude does. With no world open (as on a server) it offers
 		// only decompile_mod; the test mod itself is a data-only mod it can decompile.
@@ -571,19 +584,31 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				throw t;
 			}
 		}
+
+		// 8. Optionally, questions answered by a scripted stand-in for claude, in worlds of their own.
+		if ("1".equals(System.getenv("CLAUDECHAT_RUN_TEST"))) {
+			try {
+				testRuns(context);
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			} catch (RuntimeException | Error e) {
+				LOGGER.error("run test failed", e);
+				throw e;
+			}
+		}
 	}
 
+	/**
+	 * run_command and approve as a question with each policy would call them: every tier with cheats off and on, the
+	 * note and level cheats give, and the chat approval buttons clicked the way chat does.
+	 */
 	private static void testPermissions(ClientGameTestContext context, TestSingleplayerContext singleplayer) {
-		ClaudeConfig config = ClaudeChatClient.config();
-		ClaudeConfig.Permissions savedPermissions = config.permissions;
-		boolean savedCheats = config.cheats;
 		var server = singleplayer.getServer();
 		try {
 			check(mcpToolNames().contains("run_command") && mcpToolNames().contains("approve"), "run_command or approve not offered");
 
-			// Read only, cheats on: commands that change nothing run, the rest are refused.
-			config.permissions = ClaudeConfig.Permissions.READ_ONLY;
-			config.cheats = true;
+			// Read only, cheats on: commands that change nothing run, the rest are refused; cheats don't change that.
+			usePolicy(new Policy(PermissionTier.READ_ONLY, true));
 			for (String command : List.of("time query time", "/execute if entity @s", "gamerule keep_inventory",
 				"scoreboard objectives list", "execute as @s at @s if block ~ ~-1 ~ minecraft:air")) {
 				JsonObject r = runCommand(context, command);
@@ -602,23 +627,30 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				JsonObject r = runCommand(context, command);
 				check(r.has("error") && r.get("error").getAsString().contains("Read only"), "writing execute not refused: " + command + " -> " + r);
 			}
+			// The cheats note says what's true: /time needs command block level, which the player lacks here; /list doesn't.
+			check(runCommand(context, "time query time").has("note"), "time query ran with cheats but has no note");
+			check(!runCommand(context, "list").has("note"), "list has the cheats note though the player could run it");
+			usePolicy(new Policy(PermissionTier.READ_ONLY, false));
+			JsonObject ownLevel = runCommand(context, "time query time");
+			check(ownLevel.has("error") && ownLevel.get("error").getAsString().contains("/claude cheats on"),
+				"time query ran without cheats in a world without cheats: " + ownLevel);
 
 			// Cheats off: the player's own permissions, which in this world can't run cheat commands at all.
-			config.cheats = false;
-			config.permissions = ClaudeConfig.Permissions.FULL;
+			usePolicy(new Policy(PermissionTier.FULL, false));
 			JsonObject noCheats = runCommand(context, "give @s minecraft:diamond");
 			check(noCheats.has("error") && noCheats.get("error").getAsString().contains("/claude cheats on"), "give ran without cheats: " + noCheats);
 			check(!hasDiamond(server), "diamond given without cheats");
 			// Cheats on: the same command at command block level, still as the player.
-			config.cheats = true;
+			usePolicy(new Policy(PermissionTier.FULL, true));
 			JsonObject cheated = runCommand(context, "give @s minecraft:diamond");
 			check(cheated.has("success") && cheated.get("success").getAsBoolean() && cheated.has("note"), "give with cheats failed: " + cheated);
 			check(hasDiamond(server), "no diamond after give with cheats");
 
 			// Ask for approval: read-only commands don't ask; others wait for a click.
-			config.permissions = ClaudeConfig.Permissions.ASK;
-			Component before = Approvals.lastAllow;
-			check(!runCommand(context, "time query time").has("error") && Approvals.lastAllow == before, "a read-only command asked");
+			usePolicy(new Policy(PermissionTier.ASK, true));
+			String before = context.computeOnClient(mc -> newestButton(mc, "Allow"));
+			check(!runCommand(context, "time query time").has("error")
+				&& Objects.equals(before, context.computeOnClient(mc -> newestButton(mc, "Allow"))), "a read-only command asked");
 			for (String command : writingModifiers) {
 				JsonObject r = withApproval(context, command, false, null);
 				check(r.has("error") && r.get("error").getAsString().contains("denied"), "writing execute didn't ask: " + command + " -> " + r);
@@ -631,17 +663,26 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			check(allowed.has("success") && allowed.get("success").getAsBoolean(), "allowed fill failed: " + allowed);
 			check(server.computeOnServer(s -> s.overworld().getBlockState(below).is(Blocks.GOLD_BLOCK)), "no gold block after Allow");
 			// A used button does nothing: "That button has expired."
-			click(context, Approvals.lastAllow);
+			click(context, context.computeOnClient(mc -> newestButton(mc, "Allow")));
 
-			// Claude Code's own permission prompts, through the MCP tool as claude calls it.
+			// Claude Code's own permission prompts, through the MCP tool as claude calls it. The Allow returns exactly
+			// the input shown, including a field the request lists as "also".
 			CompletableFuture<JsonObject> prompt = CompletableFuture.supplyAsync(() -> mcpCall("tools/call",
-				"{\"name\": \"approve\", \"arguments\": {\"tool_name\": \"Write\", \"input\": {\"file_path\": \"config/x.txt\", \"content\": \"hi\\nthere\"}}}"));
+				"{\"name\": \"approve\", \"arguments\": {\"tool_name\": \"Write\", \"input\": {\"file_path\": \"config/x.txt\","
+					+ " \"content\": \"hi\\nthere\", \"mode\": \"append\"}}}"));
 			answer(context, true, "claudechat-approval-write");
 			context.waitFor(mc -> prompt.isDone(), 10 * SECONDS);
-			JsonObject decision = JsonParser.parseString(prompt.join().getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString()).getAsJsonObject();
+			JsonObject decision = JsonParser.parseString(resultText(prompt.join())).getAsJsonObject();
 			LOGGER.info("approve Write -> {}", decision);
-			check(decision.get("behavior").getAsString().equals("allow") && decision.getAsJsonObject("updatedInput").get("content").getAsString().equals("hi\nthere"),
-				"approve tool didn't allow with the input: " + decision);
+			check(decision.get("behavior").getAsString().equals("allow") && decision.getAsJsonObject("updatedInput").equals(
+				JsonParser.parseString("{\"file_path\": \"config/x.txt\", \"content\": \"hi\\nthere\", \"mode\": \"append\"}")),
+				"approve tool didn't allow with the input shown: " + decision);
+			check(context.computeOnClient(mc -> chatHas(mc, "(also mode=\"append\")")), "the extra input field wasn't shown");
+			// Outside Ask for approval there's nothing to approve.
+			usePolicy(new Policy(PermissionTier.READ_ONLY, true));
+			JsonObject refused = JsonParser.parseString(resultText(mcpCall("tools/call", "{\"name\": \"approve\", \"arguments\":"
+				+ " {\"tool_name\": \"Bash\", \"input\": {\"command\": \"echo hi\"}}}"))).getAsJsonObject();
+			check(refused.get("behavior").getAsString().equals("deny"), "approve allowed outside Ask for approval: " + refused);
 
 			// Live: Claude asks, the test clicks Allow, and the change happens.
 			if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
@@ -651,16 +692,17 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				} catch (IOException e) {
 					throw new UncheckedIOException(e);
 				}
-				Component last = Approvals.lastAllow;
+				chat(context, "/claude permissions ask");
+				String last = context.computeOnClient(mc -> newestButton(mc, "Allow"));
 				chat(context, "@claude create the file config/claude-permission-test.txt in the game folder containing the word hello,"
 					+ " then set the time to midnight with a command");
 				for (int i = 0; i < 4 && !(Files.exists(file) && !ClaudeChatClient.isBusy()); i++) {
-					Component seen = last;
-					context.waitFor(mc -> Approvals.lastAllow != seen || !ClaudeChatClient.isBusy(), 180 * SECONDS);
-					if (Approvals.lastAllow == seen) {
+					String seen = last;
+					context.waitFor(mc -> !Objects.equals(newestButton(mc, "Allow"), seen) || !ClaudeChatClient.isBusy(), 180 * SECONDS);
+					last = context.computeOnClient(mc -> newestButton(mc, "Allow"));
+					if (Objects.equals(last, seen)) {
 						break;
 					}
-					last = Approvals.lastAllow;
 					context.waitTicks(10);
 					openChat(context);
 					context.takeScreenshot("claudechat-live-approval-" + i);
@@ -673,13 +715,168 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				context.takeScreenshot("claudechat-live-permissions-answer");
 				context.getInput().pressKey(KEY_ESCAPE);
 				check(Files.exists(file), "Claude didn't create the file after Allow");
+				chat(context, "/claude permissions read_only");
 			}
 		} finally {
-			config.permissions = savedPermissions;
-			config.cheats = savedCheats;
-			config.save();
+			usePolicy(new Policy(PermissionTier.READ_ONLY, false));
 			// The live crafter question expects the crafter in the first hotbar slot.
 			server.runCommand("clear @a minecraft:diamond");
+		}
+	}
+
+	/**
+	 * Questions answered by {@link FakeClaude}, a scripted stand-in for claude that claudePath points to: an answer
+	 * after progress notes, an error, a lost session, a tool call whose tier changes mid-question, a timeout, and a
+	 * disconnect mid-question whose late answer must never reach the next world.
+	 */
+	private static void testRuns(ClientGameTestContext context) throws IOException {
+		Path folder = FabricLoader.getInstance().getGameDir().resolve("claudechat-fake");
+		ClaudeConfig config = ClaudeChatClient.config();
+		Optional<Path> savedPath = context.computeOnClient(mc -> config.claudePath);
+		int savedTimeout = context.computeOnClient(mc -> config.timeoutSeconds);
+		Path wrapper = FakeClaude.writeWrapper(folder);
+		Files.deleteIfExists(folder.resolve("calls.log"));
+		context.runOnClient(mc -> {
+			config.claudePath = Optional.of(wrapper);
+			config.timeoutSeconds = 30;
+		});
+		try {
+			List<Long> abandoned;
+			try (TestSingleplayerContext world = context.worldBuilder().adjustSettings(s -> s.setAllowCommands(true)).create()) {
+				world.getConnection().waitForChunksRender();
+				var server = world.getServer();
+
+				// An answer after a progress note, which shows in the status line while the fake waits.
+				scenario(folder, "progress Fake answer about crafters");
+				chat(context, "@claude what does the fake know?");
+				context.waitFor(mc -> chatHas(mc, "Checking the fake data"), 30 * SECONDS);
+				go(folder);
+				awaitAnswer(context);
+				check(context.computeOnClient(mc -> chatHas(mc, "Fake answer about crafters")), "the fake's answer isn't in chat");
+				check(!context.computeOnClient(mc -> chatHas(mc, "Checking the fake data")), "the status line stayed after the answer");
+
+				// An error result shows Claude Code's own message.
+				scenario(folder, "error Fake failure: the model is overloaded");
+				chat(context, "@claude fail, please");
+				awaitAnswer(context);
+				check(context.computeOnClient(mc -> chatHas(mc, "Fake failure: the model is overloaded")), "the error message isn't in chat");
+
+				// A follow-up whose session is gone is asked again in a new conversation.
+				scenario(folder, "missing-session Answer in a fresh conversation");
+				chat(context, "@claude and now?");
+				awaitAnswer(context);
+				check(context.computeOnClient(mc -> chatHas(mc, "Answer in a fresh conversation")), "no answer after the lost session");
+				List<String> calls = FakeClaude.calls(folder);
+				check(calls.size() >= 2 && calls.get(calls.size() - 2).contains("--resume fake-session-error")
+					&& !calls.getLast().contains("--resume"), "the lost session wasn't retried fresh: " + calls);
+
+				// The tier a question starts with is the one its run_command calls get, whatever changes meanwhile; its
+				// token dies with it.
+				chat(context, "/claude permissions read_only");
+				scenario(folder, "run_command setblock 3 -55 3 minecraft:gold_block");
+				chat(context, "@claude put a gold block down");
+				awaitStarted(context, folder);
+				chat(context, "/claude permissions full");
+				click(context, context.computeOnClient(mc -> newestButton(mc, "Turn on Full access")));
+				check(context.computeOnClient(mc -> config.permissions) == PermissionTier.FULL, "Full access wasn't turned on");
+				go(folder);
+				awaitAnswer(context);
+				check(context.computeOnClient(mc -> chatHas(mc, "run_command said: Error: The player's permissions are Read only")),
+					"run_command didn't use the tier the question started with");
+				check(!server.computeOnServer(s -> s.overworld().getBlockState(new BlockPos(3, -55, 3)).is(Blocks.GOLD_BLOCK)),
+					"the block was placed with the tier set mid-question");
+				check(!FakeClaude.calls(folder).getLast().contains("bypassPermissions"), "the question was started with Full access flags");
+				List<String> mcp = readLines(folder.resolve("mcp.txt"));
+				check(httpStatus(mcp.get(0), mcp.get(1)) == 401, "the finished question's token still works");
+				try (var left = Files.list(ClaudeConfig.dir().resolve("runs"))) {
+					List<Path> files = left.toList();
+					check(files.isEmpty(), "question files left behind: " + files);
+				}
+				chat(context, "/claude permissions read_only");
+
+				// A question that never ends is stopped at the timeout, with the process it started.
+				context.runOnClient(mc -> config.timeoutSeconds = 3);
+				scenario(folder, "hang");
+				chat(context, "@claude never answer");
+				List<Long> hung = awaitStarted(context, folder);
+				check(hung.size() == 2, "the fake didn't start its child: " + hung);
+				awaitAnswer(context);
+				check(context.computeOnClient(mc -> chatHas(mc, "Claude took longer than 3s and was stopped.")), "no timeout message");
+				awaitDead(context, hung);
+				context.runOnClient(mc -> config.timeoutSeconds = 30);
+
+				// Leaving the world mid-question cancels it.
+				scenario(folder, "late-answer Late answer from the old world");
+				chat(context, "@claude answer later");
+				abandoned = awaitStarted(context, folder);
+			}
+
+			awaitDead(context, abandoned);
+			check(!ClaudeChatClient.isBusy(), "still busy after leaving the world");
+			go(folder);
+			try (TestSingleplayerContext world = context.worldBuilder().create()) {
+				world.getConnection().waitForChunksRender();
+				scenario(folder, "answer Fresh answer in the new world");
+				chat(context, "@claude anything new?");
+				awaitAnswer(context);
+				check(context.computeOnClient(mc -> chatHas(mc, "Fresh answer in the new world")), "no answer in the new world");
+				check(!context.computeOnClient(mc -> chatHas(mc, "Late answer from the old world")), "the old world's answer arrived");
+				check(!FakeClaude.calls(folder).getLast().contains("--resume"), "the new world continued the old conversation");
+				context.waitTicks(10);
+				openChat(context);
+				context.takeScreenshot("claudechat-runs");
+				context.getInput().pressKey(KEY_ESCAPE);
+			}
+		} finally {
+			context.runOnClient(mc -> {
+				config.claudePath = savedPath;
+				config.timeoutSeconds = savedTimeout;
+				config.permissions = PermissionTier.READ_ONLY;
+				config.save();
+			});
+		}
+	}
+
+	/** The fake's next script; clears what the last one left for the test. */
+	private static void scenario(Path folder, String scenario) throws IOException {
+		Files.deleteIfExists(folder.resolve("go"));
+		Files.deleteIfExists(folder.resolve("started.txt"));
+		Files.writeString(folder.resolve("scenario.txt"), scenario);
+	}
+
+	private static void go(Path folder) throws IOException {
+		Files.writeString(folder.resolve("go"), "");
+	}
+
+	/** Waits for the fake to start; returns its pid and its child's. */
+	private static List<Long> awaitStarted(ClientGameTestContext context, Path folder) {
+		context.waitFor(mc -> !FakeClaude.startedPids(folder).isEmpty(), 30 * SECONDS);
+		return FakeClaude.startedPids(folder);
+	}
+
+	private static void awaitAnswer(ClientGameTestContext context) {
+		context.waitFor(mc -> !ClaudeChatClient.isBusy(), 30 * SECONDS);
+		context.waitTicks(2);
+	}
+
+	private static void awaitDead(ClientGameTestContext context, List<Long> pids) {
+		context.waitFor(mc -> pids.stream().noneMatch(pid -> ProcessHandle.of(pid).map(ProcessHandle::isAlive).orElse(false)),
+			10 * SECONDS);
+	}
+
+	/** The status of an MCP ping with this Authorization header. */
+	private static int httpStatus(String url, String authorization) {
+		try {
+			return HttpClient.newHttpClient().send(HttpRequest.newBuilder(URI.create(url))
+				.header("Authorization", authorization)
+				.header("Content-Type", "application/json")
+				.POST(HttpRequest.BodyPublishers.ofString("{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"ping\"}"))
+				.build(), HttpResponse.BodyHandlers.ofString()).statusCode();
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+			throw new IllegalStateException(e);
 		}
 	}
 
@@ -693,23 +890,54 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		return r;
 	}
 
-	/** Waits for a new approval request, screenshots it (unless {@code screenshot} is null) and clicks. */
+	/** Waits for a new approval request in chat, screenshots it (unless {@code screenshot} is null) and clicks. */
 	private static void answer(ClientGameTestContext context, boolean allow, String screenshot) {
-		Component before = Approvals.lastAllow;
-		context.waitFor(mc -> Approvals.lastAllow != before, 10 * SECONDS);
+		String before = context.computeOnClient(mc -> newestButton(mc, "Allow"));
+		context.waitFor(mc -> !Objects.equals(newestButton(mc, "Allow"), before), 10 * SECONDS);
 		context.waitTicks(5);
 		if (screenshot != null) {
 			openChat(context);
 			context.takeScreenshot(screenshot);
 			context.getInput().pressKey(KEY_ESCAPE);
 		}
-		click(context, allow ? Approvals.lastAllow : Approvals.lastDeny);
+		click(context, context.computeOnClient(mc -> newestButton(mc, allow ? "Allow" : "Deny")));
 	}
 
-	/** Clicks a ChatActions button as chat does. Without Fabric's client command hook this would go to the server. */
-	private static void click(ClientGameTestContext context, Component button) {
-		String id = ChatActions.idOf(button);
-		context.runOnClient(mc -> mc.player.connection.sendUnattendedCommand("claude action " + id, null));
+	/** The command behind the newest "[label]" button in chat, or null if there's none. Client thread. */
+	private static String newestButton(Minecraft mc, String label) {
+		for (GuiMessage message : chatMessages(mc)) {
+			Optional<String> command = message.content().visit((style, text) ->
+				text.equals("[" + label + "]") && style.getClickEvent() instanceof ClickEvent.RunCommand(String run)
+					? Optional.of(run) : Optional.empty(), Style.EMPTY);
+			if (command.isPresent()) {
+				return command.get();
+			}
+		}
+		return null;
+	}
+
+	/** Does any chat line contain {@code text}? Client thread. */
+	private static boolean chatHas(Minecraft mc, String text) {
+		return chatMessages(mc).stream().anyMatch(message -> message.content().getString().contains(text));
+	}
+
+	/** Every chat line, newest first. */
+	private static List<GuiMessage> chatMessages(Minecraft mc) {
+		return ((ChatComponentAccessor) mc.gui.hud.getChat()).claudechat$allMessages();
+	}
+
+	/** Clicks a chat button's command as chat does. Without Fabric's client command hook this would go to the server. */
+	private static void click(ClientGameTestContext context, String command) {
+		check(command != null, "no button to click");
+		context.runOnClient(mc -> mc.player.connection.sendUnattendedCommand(Commands.trimOptionalPrefix(command), null));
+	}
+
+	/** The MCP access the test's direct tool calls use, as a question with {@code policy} would have it. */
+	private static void usePolicy(Policy policy) {
+		if (grant != null) {
+			grant.close();
+		}
+		grant = ClaudeChatClient.mcp().grant(new Tool.Context(policy, new Approvals(note -> { })));
 	}
 
 	private static JsonObject runCommand(ClientGameTestContext context, String command) {
@@ -1149,7 +1377,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 
 	/** One JSON-RPC request to the mod's MCP server; returns the whole response, result or error. */
 	private static JsonObject mcpResponse(String method, String params) {
-		JsonObject server = JsonParser.parseString(ClaudeChatClient.mcp().claudeConfig()).getAsJsonObject()
+		JsonObject server = JsonParser.parseString(grant.claudeConfig()).getAsJsonObject()
 			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
 		String body = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
 		try {

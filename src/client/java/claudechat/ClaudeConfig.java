@@ -18,6 +18,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -32,29 +33,6 @@ import java.util.stream.Stream;
  */
 public class ClaudeConfig {
 	public static final List<String> MODEL_SUGGESTIONS = List.of("haiku", "sonnet", "opus", "fable");
-
-	/** What Claude may do beyond reading. Each tier's claude flags are in {@link ClaudeCli}. */
-	public enum Permissions {
-		/** Read and search only; game commands only if they change nothing. */
-		READ_ONLY("read_only", "Read only"),
-		/** Also edits files, runs shell and game commands, each after the player clicks Allow in chat. */
-		ASK("ask", "Ask for approval"),
-		/** Everything, without asking. */
-		FULL("full", "Full access");
-
-		public final String id;
-		public final String label;
-
-		Permissions(String id, String label) {
-			this.id = id;
-			this.label = label;
-		}
-
-		/** The tier with this id, ignoring case and surrounding spaces. */
-		public static Optional<Permissions> parse(String id) {
-			return Stream.of(values()).filter(p -> p.id.equalsIgnoreCase(id.trim())).findFirst();
-		}
-	}
 
 	/** Claude Code's {@code --effort} level. */
 	public enum Effort {
@@ -98,19 +76,27 @@ public class ClaudeConfig {
 	public Effort effort = Effort.DEFAULT;
 	/** Chat messages starting with this are sent to Claude instead of the server. */
 	public String chatPrefix = "@claude";
+	/** How long Claude may work on a question, not counting time spent waiting for the player to Allow or Deny. */
 	public int timeoutSeconds = 300;
 	/** Decompile Minecraft and installed mods in the background so Claude can search the real code. */
 	public boolean buildKnowledge = true;
-	/** Mod ids to always decompile, or never decompile, overriding the automatic choice. Set with /claude knowledge. */
-	public final Set<String> knowledgeInclude = new TreeSet<>();
-	public final Set<String> knowledgeExclude = new TreeSet<>();
+	/**
+	 * Mod ids to always decompile, or never decompile, overriding the automatic choice. Set with /claude knowledge on
+	 * the client thread and read by background builds, so they're concurrent sets (sorted, for the file).
+	 */
+	public final Set<String> knowledgeInclude = new ConcurrentSkipListSet<>();
+	public final Set<String> knowledgeExclude = new ConcurrentSkipListSet<>();
 	/** Extra instructions appended to the system prompt, e.g. "Answer like a pirate." */
 	public String extraInstructions = "";
-	/** Set with /claude permissions; turning on Full access needs a click on a confirm button. */
-	public Permissions permissions = Permissions.READ_ONLY;
+	/**
+	 * Set with /claude permissions; a tier that needs it is set only after a click on a confirm button. A question
+	 * captures it when asked ({@link Policy}).
+	 */
+	public PermissionTier permissions = PermissionTier.READ_ONLY;
 	/**
 	 * Off: Claude's game commands run with the player's own permission level, so in a world without cheats it can't
-	 * run cheat commands. On: they run at command-block level (still as the player), whatever the world allows.
+	 * run cheat commands. On: they run at command block level at least (still as the player), whatever the world
+	 * allows. A question captures it when asked.
 	 */
 	public boolean cheats = false;
 
@@ -146,7 +132,7 @@ public class ClaudeConfig {
 		new Setting<>("knowledgeExclude", ClaudeConfig::list, ClaudeConfig::formatList, c -> c.knowledgeExclude,
 			(c, v) -> replaceAll(c.knowledgeExclude, v)),
 		// A missing or unknown tier is read only, so nobody gets more access by accident.
-		new Setting<>("permissions", Permissions::parse, p -> p.id, c -> c.permissions, (c, v) -> c.permissions = v),
+		new Setting<>("permissions", PermissionTier::parse, p -> p.id, c -> c.permissions, (c, v) -> c.permissions = v),
 		new Setting<>("cheats", ClaudeConfig::bool, String::valueOf, c -> c.cheats, (c, v) -> c.cheats = v));
 
 	/** The file as loaded and migrated, including keys this version doesn't know. */
@@ -282,7 +268,7 @@ public class ClaudeConfig {
 
 	private static String fileComment() {
 		String efforts = Stream.of(Effort.values()).filter(e -> e != Effort.DEFAULT).map(e -> e.id).collect(Collectors.joining(", "));
-		String tiers = Stream.of(Permissions.values()).map(p -> p.id).collect(Collectors.joining(", "));
+		String tiers = String.join(", ", PermissionTier.ids());
 		return "Claude Chat settings. claudePath empty = auto-detect. model: " + String.join(", ", MODEL_SUGGESTIONS)
 			+ ", or a full model ID. effort: " + efforts + ", or empty for the default. permissions: " + tiers + "."
 			+ " cheats: true lets Claude run cheat commands even where you can't.";

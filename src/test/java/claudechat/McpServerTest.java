@@ -3,6 +3,7 @@ package claudechat;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -10,12 +11,16 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.UncheckedIOException;
 import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -26,8 +31,12 @@ class McpServerTest {
 	private static final Param<String> QUERY = Param.requiredText("query", "What to echo.");
 	private static final Param<Integer> LIMIT = Param.integer("limit", "Max results.", 5, 1, 20);
 
+	/** Counted down when the block tool starts waiting. */
+	private static final CountDownLatch blocking = new CountDownLatch(1);
+
 	private static McpServer server;
 	private static int port;
+	/** The Authorization header of a Read only grant that stays open. */
 	private static String authorization;
 
 	@BeforeAll
@@ -45,17 +54,77 @@ class McpServerTest {
 		});
 		Tool picture = Tool.of("picture", "Returns an image.", Tool.Requirement.NOTHING, List.of(),
 			(arguments, context) -> new Tool.Result(new JsonObject(), new byte[] {1, 2, 3}));
-		server = new McpServer(List.of(echo, closed, silent, picture), () -> false);
+		Tool tier = new Tool("tier", context -> "Says the tier: " + context.policy().tier().id, List.of(), Tool.Requirement.NOTHING,
+			(arguments, context) -> Tool.Result.of(new JsonPrimitive(context.policy().tier().id)));
+		Tool block = Tool.of("block", "Waits until interrupted.", Tool.Requirement.NOTHING, List.of(), (arguments, context) -> {
+			blocking.countDown();
+			Thread.sleep(60_000);
+			return Tool.Result.of(new JsonObject());
+		});
+		server = new McpServer(List.of(echo, closed, silent, picture, tier, block), () -> false);
 		server.start();
-		JsonObject minecraft = JsonParser.parseString(server.claudeConfig()).getAsJsonObject()
-			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
-		port = URI.create(minecraft.get("url").getAsString()).getPort();
-		authorization = minecraft.getAsJsonObject("headers").get("Authorization").getAsString();
+		authorization = authorization(server.grant(context(PermissionTier.READ_ONLY)));
 	}
 
 	@AfterAll
 	static void stop() {
 		server.stop();
+	}
+
+	@Test
+	void eachGrantsCallsGetItsOwnContext() throws IOException {
+		try (McpServer.Grant full = server.grant(context(PermissionTier.FULL))) {
+			assertEquals("\"full\"", callAs(authorization(full), "tier"));
+			assertEquals("\"read_only\"", callAs(authorization, "tier"));
+			String listed = body(exchange(post(authorization(full), rpcRequest("tools/list", "{}")))).toString();
+			assertTrue(listed.contains("Says the tier: full"), listed);
+		}
+	}
+
+	@Test
+	void aClosedGrantsTokenIsRefused() throws IOException {
+		McpServer.Grant grant = server.grant(context(PermissionTier.ASK));
+		String token = authorization(grant);
+		assertTrue(exchange(post(token, rpcRequest("ping", "{}"))).startsWith("HTTP/1.1 200"));
+
+		grant.close();
+
+		assertTrue(exchange(post(token, rpcRequest("ping", "{}"))).startsWith("HTTP/1.1 401"));
+	}
+
+	@Test
+	void closingAGrantInterruptsItsCalls() throws Exception {
+		McpServer.Grant grant = server.grant(context(PermissionTier.READ_ONLY));
+		String token = authorization(grant);
+		CompletableFuture<String> call = CompletableFuture.supplyAsync(() -> {
+			try {
+				return exchange(post(token, rpcRequest("tools/call", "{\"name\": \"block\"}")));
+			} catch (IOException e) {
+				throw new UncheckedIOException(e);
+			}
+		});
+		assertTrue(blocking.await(10, TimeUnit.SECONDS));
+
+		grant.close();
+
+		JsonObject result = body(call.get(10, TimeUnit.SECONDS)).getAsJsonObject("result");
+		assertTrue(result.get("isError").getAsBoolean(), result.toString());
+		// The worker that was interrupted serves the next request normally.
+		for (int i = 0; i < 20; i++) {
+			assertEquals("\"read_only\"", callAs(authorization, "tier"));
+		}
+	}
+
+	private static Tool.Context context(PermissionTier tier) {
+		return new Tool.Context(new Policy(tier, false), new Approvals(note -> { }));
+	}
+
+	/** The Authorization header claude gets from the grant's --mcp-config; also sets {@link #port}. */
+	private static String authorization(McpServer.Grant grant) {
+		JsonObject minecraft = JsonParser.parseString(grant.claudeConfig()).getAsJsonObject()
+			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
+		port = URI.create(minecraft.get("url").getAsString()).getPort();
+		return minecraft.getAsJsonObject("headers").get("Authorization").getAsString();
 	}
 
 	@Test
@@ -103,7 +172,7 @@ class McpServerTest {
 		rpc("tools/list", "{}").getAsJsonObject("result").getAsJsonArray("tools")
 			.forEach(tool -> names.add(tool.getAsJsonObject().get("name").getAsString()));
 
-		assertEquals(List.of("echo", "silent", "picture"), names);
+		assertEquals(List.of("echo", "silent", "picture", "tier", "block"), names);
 	}
 
 	@Test
@@ -188,8 +257,19 @@ class McpServerTest {
 	}
 
 	private static JsonObject rpc(String method, String params) throws IOException {
-		String request = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
-		return body(exchange(post(authorization, request)));
+		return body(exchange(post(authorization, rpcRequest(method, params))));
+	}
+
+	private static String rpcRequest(String method, String params) {
+		return "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
+	}
+
+	/** A tool's text result, called with {@code authorization}. */
+	private static String callAs(String authorization, String tool) throws IOException {
+		JsonObject result = body(exchange(post(authorization, rpcRequest("tools/call", "{\"name\": \"" + tool + "\"}"))))
+			.getAsJsonObject("result");
+		assertFalse(result.has("isError"), result.toString());
+		return result.getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString();
 	}
 
 	private static String post(String authorization, String json) {

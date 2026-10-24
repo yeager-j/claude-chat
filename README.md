@@ -102,24 +102,26 @@ All of these tab-complete.
 
 | `/claude permissions` | Files and shell | Game commands (single-player) |
 | --- | --- | --- |
-| `read_only` (default) | Read and search only | Only ones that change nothing: `time query`, `data get`, `gamerule <name>`, `execute if …` |
+| `read_only` (default) | Read and search only | Only ones that change nothing, like `time query`, `data get` or `gamerule <name>`. Every other one is refused, cheats or not |
 | `ask` | Edits, new files and shell commands each wait for you to click **[Allow]** or **[Deny]** in chat. Commands that only read run straight away | The same: read-only ones run, every other one asks. Destructive ones (`clear`, `kill`, `fill`…) are marked in red, with the block count for `fill` and `clone` |
 | `full` | Anything, without asking | Anything, without asking |
 
 - The mod decides which game commands need your OK; Claude Code's own judgment isn't used for them. Commands added by mods always ask.
 - No answer within 2 minutes counts as Deny. A sound plays and the status line says so, since chat fades while closed.
+- What runs after **[Allow]** is exactly what the request showed: the same parsed game command, or Claude Code's request with every field it carries. A request whose question has ended (left the world, `/claude reset`) is denied, and its buttons stop working.
 - Every game command Claude runs is shown in chat, with the game's response on hover.
-- `/claude cheats` decides *what* is possible. Off: Claude's commands run with your own permissions, so in a world without cheats it can't `/give` or `/gamemode` either. On: they run at command block level, as you. The world list still shows cheats off.
+- `/claude cheats` decides *what* is possible, not whether Claude may change things. Off: Claude's commands run with your own permissions, so in a world without cheats it can't `/give` or `/gamemode` either. On: they run at command block level (or yours, if higher), always as you. The world list still shows cheats off.
 - Turning on `full` or cheats needs a click on a confirm button.
+- A question keeps the permissions and cheats setting it was asked with; changes apply from your next question. Leaving the world or `/claude reset` stops a running question, along with anything it started.
 
 ## Privacy and safety
 
 - **Read-only by default.** Claude can read the reference files, search the web, and use the world tools. Unless you change `/claude permissions`, it can't edit files, run shell commands, or change your world. Waypoint buttons only open Xaero's own screen; nothing is added until you confirm it. The mod itself writes one file in your world folder, `claudechat-visits.txt` (where you've been), and never touches the world's own files.
-- **Local only.**
+- **Local storage and transport.**
   - The decompiled code and extracted data stay on your computer, in `.minecraft/config/claudechat/knowledge/`. Delete that folder any time; it's rebuilt as needed.
-  - The mod's tools are served only to the `claude` process the mod starts, on `127.0.0.1` with a random token. The world tools are offered only while a single-player world is open.
+  - The mod's tools are served on `127.0.0.1` only. Each question gets a random token of its own, which works only until that question ends. The `claude` process gets it in a file only your account can read, deleted when the question ends. Anything that has the token can use the tools while the question runs, so another program running as you could too. The world tools are offered only while a single-player world is open.
 - **Your own MCP servers stay out.** Other MCP servers you've set up for Claude Code aren't loaded for Minecraft questions.
-- **What gets sent:** your question and the game details above go to Claude, the same as any Claude Code session.
+- **What gets sent:** the processing isn't local. Claude Code sends your question, the game details above, and whatever Claude reads or gets from the mod's tools (files, world data, the `look` screenshot) to Claude's service, the same as any Claude Code session.
 
 ## Limitations
 
