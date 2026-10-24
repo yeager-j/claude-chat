@@ -35,7 +35,6 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
-import java.util.stream.Stream;
 
 /**
  * A minimal MCP server ("Streamable HTTP" transport, JSON responses only) that gives Claude Code the mod's
@@ -82,12 +81,6 @@ public class McpServer {
 		}
 
 		this.worldOpen = worldOpen;
-	}
-
-	/** The mod's tools: decompiling mods, approvals, {@code look}, the world tools and {@code run_command}. */
-	public McpServer(ModTools modTools, WorldTools worldTools, GameCommands gameCommands, ViewSnapshot view) {
-		this(Stream.of(modTools.tools(), List.of(Approvals.tool(), view.tool()), worldTools.tools(), List.of(gameCommands.tool()))
-			.flatMap(List::stream).toList(), worldTools::available);
 	}
 
 	/** Are the world tools offered right now? */

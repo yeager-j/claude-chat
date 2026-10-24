@@ -4,7 +4,11 @@ import claudechat.Approvals;
 import claudechat.ChatActions;
 import claudechat.ClaudeChatClient;
 import claudechat.ClaudeConfig;
+import claudechat.GameRecipe;
+import claudechat.GameRecipes;
 import claudechat.KnowledgeBase;
+import claudechat.Materials;
+import claudechat.RecipeRenderer;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
@@ -73,6 +77,8 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	// 26.x uses SDL scancodes for input, not GLFW key codes.
 	private static final int KEY_ENTER = InputConstants.KEY_RETURN;
 	private static final int KEY_ESCAPE = InputConstants.KEY_ESCAPE;
+	/** The pack step's zip pack, as the server names it. */
+	private static final String OVERRIDE_PACK = "file/Better Dungeons.zip";
 
 	@Override
 	public void runTest(ClientGameTestContext context) {
@@ -134,6 +140,13 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				context.takeScreenshot("claudechat-preview");
 				context.getInput().pressKey(KEY_ESCAPE);
 
+				// 1b. Recipes come from the world's RecipeManager, every kind drawn from the same model; the trim recipe,
+				// which has no fixed result, is shown in chat for the screenshot.
+				checkRecipes(context);
+				openChat(context);
+				context.takeScreenshot("claudechat-recipes");
+				context.getInput().pressKey(KEY_ESCAPE);
+
 				// 2. Tab completion for /claude effort.
 				openChat(context);
 				context.getInput().typeChars("/claude effort ");
@@ -156,20 +169,31 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				context.takeScreenshot("claudechat-knowledge");
 				context.getInput().pressKey(KEY_ESCAPE);
 
-				// 4. Optionally, world data packs: a folder pack adding a loot table, and a zip pack overriding a vanilla one.
+				// 4. Optionally, world data packs: a folder pack adding a loot table, and a zip pack overriding a vanilla loot
+				// table and the piston recipe. Recipe grids, material lists and the data roots follow the server's packs.
 				if ("1".equals(System.getenv("CLAUDECHAT_PACK_TEST"))) {
 					Path datapacks = singleplayer.getServer().computeOnServer(server -> server.getWorldPath(LevelResource.DATAPACK_DIR));
 					writeTestPacks(datapacks);
 					singleplayer.getServer().runCommand("reload");
-					context.waitTicks(20);
+					context.waitFor(mc -> pistonCount() == 2, 60 * SECONDS);
 					context.waitFor(mc -> ClaudeChatClient.isKnowledgeReady(), 60 * SECONDS);
-					chat(context, "@claude what's in a secret vault chest? and what can dungeon chests have in this world?");
-					context.waitTicks(5);
-					context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
-					context.waitTicks(10);
-					openChat(context);
-					context.takeScreenshot("claudechat-datapack-answer");
-					context.getInput().pressKey(KEY_ESCAPE);
+					checkPackOverrides();
+
+					if ("1".equals(System.getenv("CLAUDECHAT_LIVE_TEST"))) {
+						chat(context, "@claude what's in a secret vault chest? and what can dungeon chests have in this world?");
+						context.waitTicks(5);
+						context.waitFor(mc -> !ClaudeChatClient.isBusy(), 300 * SECONDS);
+						context.waitTicks(10);
+						openChat(context);
+						context.takeScreenshot("claudechat-datapack-answer");
+						context.getInput().pressKey(KEY_ESCAPE);
+					}
+
+					// A disabled pack is gone from both, so later steps see vanilla pistons again.
+					singleplayer.getServer().runCommand("datapack disable \"" + OVERRIDE_PACK + "\"");
+					context.waitFor(mc -> pistonCount() == 1, 60 * SECONDS);
+					check(ClaudeChatClient.knowledge().dataRoots().stream().noneMatch(root -> root.toString().contains("Dungeons")),
+						"the disabled pack is still a data root: " + ClaudeChatClient.knowledge().dataRoots());
 				}
 
 				// 4b. Optionally, structure templates: search by blocks, trace to structures through pools, draw layers.
@@ -701,6 +725,58 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	}
 
 	/** Runs a world tool off the test thread (it waits on the server thread, which the test thread drives) and logs it. */
+	/**
+	 * The recipe model shared by grids and material lists, from the world's recipes: each kind is read into its own
+	 * shape, and a trim recipe (no fixed result) draws as a row, which goes to chat for the screenshot.
+	 */
+	private static void checkRecipes(ClientGameTestContext context) {
+		GameRecipes.Snapshot recipes = ClaudeChatClient.knowledge().recipes().snapshot();
+		check(recipes.find(Identifier.withDefaultNamespace("crafter")).orElse(null) instanceof GameRecipe.Shaped,
+			"crafter isn't a shaped recipe");
+		check(recipes.find(Identifier.withDefaultNamespace("iron_ingot_from_smelting_raw_iron")).orElse(null) instanceof GameRecipe.Cooking,
+			"raw iron smelting isn't a cooking recipe");
+		check(recipes.find(Identifier.withDefaultNamespace("piston")).flatMap(GameRecipe::resultItem).map(item -> item.value() == Items.PISTON)
+			.orElse(false), "no piston recipe");
+
+		RecipeRenderer renderer = new RecipeRenderer(ClaudeChatClient.knowledge());
+		RecipeRenderer.Lines trim = context.computeOnClient(mc ->
+			renderer.render(Identifier.withDefaultNamespace("sentry_armor_trim_smithing_template_smithing_trim")));
+		check(trim.grid(), "the trim recipe didn't draw: " + trim.lines());
+		context.runOnClient(mc -> trim.lines().forEach(mc.gui.hud.getChat()::addClientSystemMessage));
+		context.waitTicks(2);
+	}
+
+	/** How many pistons the world's piston recipe makes, as recipe grids and material lists see it; 0 without one. */
+	private static int pistonCount() {
+		return ClaudeChatClient.knowledge().recipes().snapshot().find(Identifier.withDefaultNamespace("piston"))
+			.flatMap(GameRecipe::makes)
+			.map(made -> made instanceof GameRecipe.Output.Stack stack ? stack.count() : 0)
+			.orElse(0);
+	}
+
+	/** The zip pack's piston recipe replaces vanilla's for grids and material lists alike, and its folder comes first. */
+	private static void checkPackOverrides() {
+		KnowledgeBase knowledge = ClaudeChatClient.knowledge();
+		Identifier pistonId = Identifier.withDefaultNamespace("piston");
+
+		Materials.Breakdown pistons = new Materials(knowledge).breakDown(Map.of(Materials.Material.item(pistonId), 2), Map.of());
+		LOGGER.info("pistons with the pack: {}", pistons);
+		check(pistons.crafts().size() == 1 && pistons.crafts().getFirst().recipe().id().equals(pistonId)
+				&& pistons.crafts().getFirst().crafts() == 1,
+			"the breakdown doesn't use the pack's piston recipe: " + pistons);
+		check(pistons.remaining().get(Materials.Material.item(Identifier.withDefaultNamespace("dirt"))) == 1,
+			"the pack's dirt isn't in the breakdown: " + pistons);
+
+		RecipeRenderer.Lines grid = new RecipeRenderer(knowledge).render(pistonId);
+		String text = grid.lines().stream().map(Component::getString).reduce("", String::concat);
+		check(grid.grid() && text.contains("2×"), "the piston grid doesn't show the pack's recipe: " + text);
+
+		List<Path> roots = knowledge.dataRoots();
+		LOGGER.info("data roots with the packs: {}", roots);
+		check(roots.getFirst().toString().contains("datapacks") && roots.getLast().toString().contains("minecraft-"),
+			"data roots aren't in the server's pack order: " + roots);
+	}
+
 	private static void check(boolean condition, String message) {
 		if (!condition) {
 			throw new AssertionError(message);
@@ -1057,17 +1133,24 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			{"type": "minecraft:chest", "pools": [{"rolls": 1, "entries": [
 			  {"type": "minecraft:item", "name": "minecraft:netherite_ingot"}]}]}
 			""";
+		// Two pistons from cobblestone, redstone and dirt, so both the count and an ingredient show the override.
+		String piston = """
+			{"type": "minecraft:crafting_shapeless", "ingredients": ["minecraft:cobblestone", "minecraft:redstone", "minecraft:dirt"],
+			 "result": {"id": "minecraft:piston", "count": 2}}
+			""";
 		try {
 			Path folder = datapacks.resolve("Secret Vaults");
 			Files.createDirectories(folder.resolve("data/claudetest/loot_table/chests"));
 			Files.writeString(folder.resolve("pack.mcmeta"), mcmeta.formatted("Secret vaults", format.major(), format.minor(), format.major(), format.minor()));
 			Files.writeString(folder.resolve("data/claudetest/loot_table/chests/secret_vault.json"), vault);
 
-			try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(datapacks.resolve("Better Dungeons.zip")))) {
+			try (ZipOutputStream zip = new ZipOutputStream(Files.newOutputStream(datapacks.resolve(OVERRIDE_PACK.substring("file/".length()))))) {
 				zip.putNextEntry(new ZipEntry("pack.mcmeta"));
 				zip.write(mcmeta.formatted("Better dungeons", format.major(), format.minor(), format.major(), format.minor()).getBytes(StandardCharsets.UTF_8));
 				zip.putNextEntry(new ZipEntry("data/minecraft/loot_table/chests/simple_dungeon.json"));
 				zip.write(dungeon.getBytes(StandardCharsets.UTF_8));
+				zip.putNextEntry(new ZipEntry("data/minecraft/recipe/piston.json"));
+				zip.write(piston.getBytes(StandardCharsets.UTF_8));
 			}
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);

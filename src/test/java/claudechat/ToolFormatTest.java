@@ -27,6 +27,7 @@ class ToolFormatTest {
 		assertEquals("stone", ToolFormat.id("minecraft:stone"));
 		assertEquals("stone", ToolFormat.id("stone"));
 		assertEquals("create:cogwheel", ToolFormat.id("create:cogwheel"));
+		assertEquals("#planks", ToolFormat.id("#minecraft:planks"));
 		assertEquals("village/plains/houses/plains_temple_3", ToolFormat.id("minecraft:village/plains/houses/plains_temple_3"));
 		assertEquals("Not An Id!", ToolFormat.id("Not An Id!"));
 		assertEquals("respawn_anchor", ToolFormat.id(Blocks.RESPAWN_ANCHOR));

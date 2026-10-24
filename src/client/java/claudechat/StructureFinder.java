@@ -171,7 +171,7 @@ public final class StructureFinder {
 		}
 		if (piece instanceof TemplateStructurePiece template) {
 			try {
-				return shortId(((TemplateStructurePieceAccessor) template).claudechat$templateLocation());
+				return ToolFormat.id(((TemplateStructurePieceAccessor) template).claudechat$templateLocation());
 			} catch (RuntimeException e) {
 				// a modded piece with an unusual template name; fall back to its class
 			}
@@ -182,23 +182,19 @@ public final class StructureFinder {
 	private static String elementName(StructurePoolElement element) {
 		if (element instanceof SinglePoolElement single) {
 			try {
-				return shortId(single.getTemplateLocation());
+				return ToolFormat.id(single.getTemplateLocation());
 			} catch (RuntimeException e) {
 				return "inline_template"; // built from a template object rather than a file
 			}
 		}
 		if (element instanceof FeaturePoolElement feature) {
 			return "feature/" + ((FeaturePoolElementAccessor) feature).claudechat$feature().unwrapKey()
-				.map(key -> shortId(key.identifier())).orElse("unnamed");
+				.map(key -> ToolFormat.id(key.identifier())).orElse("unnamed");
 		}
 		if (element instanceof ListPoolElement list) {
 			return String.join("+", list.getElements().stream().map(StructureFinder::elementName).toList());
 		}
 		return className(element.getClass());
-	}
-
-	private static String shortId(Identifier id) {
-		return id.getNamespace().equals("minecraft") ? id.getPath() : id.toString();
 	}
 
 	/**

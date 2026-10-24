@@ -39,8 +39,15 @@ public final class ToolFormat {
 		return id.getNamespace().equals(Identifier.DEFAULT_NAMESPACE) ? id.getPath() : id.toString();
 	}
 
-	/** {@link #id(Identifier)} for an id held as text; text that isn't an id is returned as it is. */
+	/**
+	 * {@link #id(Identifier)} for an id held as text, or a tag ("#minecraft:planks" → "#planks"); text that isn't an id is
+	 * returned as it is.
+	 */
 	public static String id(String id) {
+		if (id.startsWith("#")) {
+			return "#" + id(id.substring(1));
+		}
+
 		Identifier parsed = Identifier.tryParse(id);
 		return parsed == null ? id : id(parsed);
 	}

@@ -20,8 +20,7 @@ public final class Dimensions {
 
 	/** "overworld", "the_nether", or a modded dimension's full id ("aether:the_aether"). */
 	public static String name(ResourceKey<Level> dimension) {
-		Identifier id = dimension.identifier();
-		return id.getNamespace().equals(Identifier.DEFAULT_NAMESPACE) ? id.getPath() : id.toString();
+		return ToolFormat.id(dimension.identifier());
 	}
 
 	/**

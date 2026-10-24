@@ -5,7 +5,6 @@ import com.mojang.datafixers.util.Pair;
 import net.minecraft.core.HolderGetter;
 import net.minecraft.core.Registry;
 import net.minecraft.core.Vec3i;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.StructureUtils;
 import net.minecraft.nbt.CompoundTag;
@@ -194,11 +193,6 @@ public final class StructureTemplates {
 
 		StructureNbt.Contents contents = StructureNbt.read(template.get().save(new CompoundTag()));
 		return Optional.of(new Template(id, new Sources(server).origin(id), contents.palettes().size(), contents.volume(0)));
-	}
-
-	/** "minecraft:stone_bricks". */
-	public static String id(Block block) {
-		return BuiltInRegistries.BLOCK.getKey(block).toString();
 	}
 
 	// --- search -----------------------------------------------------------------------------------------------------

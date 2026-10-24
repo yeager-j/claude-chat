@@ -47,13 +47,13 @@ final class HolderReader {
 		}
 
 		BlockPos pos = SavedChunk.blockEntityPos(tag);
-		return Optional.of(new Holder(Holder.Kind.BLOCK, dimension, pos.getX(), pos.getY(), pos.getZ(), shortId(tag.getStringOr("id", "?")),
+		return Optional.of(new Holder(Holder.Kind.BLOCK, dimension, pos.getX(), pos.getY(), pos.getZ(), ToolFormat.id(tag.getStringOr("id", "?")),
 			name, loot.isEmpty() ? null : loot, false, items, provenance));
 	}
 
 	/** Entities worth finding: ones holding items (minecarts, item frames, armor stands, dropped items) or named or tamed. */
 	static Optional<Holder> entity(RegistryOps<Tag> ops, ResourceKey<Level> dimension, String typeId, CompoundTag tag, Provenance provenance) {
-		String type = shortId(typeId);
+		String type = ToolFormat.id(typeId);
 		String name = customName(ops, tag);
 		boolean tamed = tag.contains("Owner");
 		List<Item> items = items(ops, tag.getListOrEmpty("Items"));
@@ -139,7 +139,4 @@ final class HolderReader {
 		return ComponentSerialization.CODEC.parse(ops, name).result().map(Component::getString).filter(s -> !s.isBlank()).orElse(null);
 	}
 
-	private static String shortId(String id) {
-		return id.startsWith("minecraft:") ? id.substring("minecraft:".length()) : id;
-	}
 }

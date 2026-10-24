@@ -33,6 +33,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -157,6 +158,10 @@ public class KnowledgeBase {
 	private static final String MINECRAFT_ID = "minecraft";
 	/** The data folder inside a jar or a data pack. */
 	private static final String PACK_DATA = "data";
+	/** The server's pack id for Minecraft's own data. */
+	private static final String VANILLA_PACK = "vanilla";
+	/** How the server's pack ids name the world's own data packs: "file/" and the pack's file name. */
+	private static final String WORLD_PACK_PREFIX = "file/";
 	/** Words in mod names that don't identify a mod; Minecraft's own words are added to these. */
 	private static final Set<String> GENERIC_WORDS = Set.of("fabric", "mod", "mods", "api", "lib", "library");
 	/** Files older versions of this mod kept in the knowledge root. */
@@ -173,6 +178,9 @@ public class KnowledgeBase {
 	private final Path root = ClaudeConfig.dir().resolve("knowledge");
 	private final List<Source> sources;
 	private final Map<String, BuiltFolder> sourceFolders;
+	/** Each source by the id of every mod whose data it holds (nested jars too): Fabric names a mod's pack after its id. */
+	private final Map<String, Source> sourcesByModId;
+	private final GameRecipes recipes = new GameRecipes(this);
 	private final Decompiler decompiler = new Decompiler(root);
 	private final Object sweepLock = new Object();
 	private final AtomicInteger generation = new AtomicInteger();
@@ -184,22 +192,33 @@ public class KnowledgeBase {
 	});
 	private volatile List<WorldPack> worldPacks = List.of();
 	private volatile String worldName = "";
+	/** The folders whose data the game loads, highest priority first; see {@link #dataRoots()}. */
+	private volatile List<BuiltFolder> dataOrder;
 	private ModMentions mentions;
 
 	public KnowledgeBase(ClaudeConfig config) {
 		this.config = config;
 		this.sources = findSources();
 		Map<String, BuiltFolder> folders = new HashMap<>();
+		Map<String, Source> byModId = new HashMap<>();
 
 		for (Source source : sources) {
 			folders.put(source.id(), new BuiltFolder(root, source.dir(), inputKey(source)));
+			source.dataContainers().forEach(container -> byModId.putIfAbsent(container.getMetadata().getId(), source));
 		}
 
 		this.sourceFolders = Map.copyOf(folders);
+		this.sourcesByModId = Map.copyOf(byModId);
+		this.dataOrder = defaultDataOrder();
 	}
 
 	public Path root() {
 		return root;
+	}
+
+	/** The game's recipes: the world's own while one is open, otherwise read from {@link #dataRoots()}. */
+	public GameRecipes recipes() {
+		return recipes;
 	}
 
 	public List<Source> sources() {
@@ -341,70 +360,50 @@ public class KnowledgeBase {
 	}
 
 	/**
-	 * The data/ folders that exist, in override order: the world's data packs (last enabled first), then mods, then
-	 * Minecraft. A file found earlier in this list is the one the game actually uses.
+	 * The data/ folders that exist, highest priority first. A recipe or loot table found earlier in this list is the
+	 * one the game uses; tags are different, since the game merges a tag's files from every pack.
+	 * <p>
+	 * While a single-player world is open the order is the server's: its enabled packs (Minecraft, mods, the world's
+	 * data packs), last loaded first, leaving out disabled packs and built-in feature packs. Without a world (main
+	 * menu, multiplayer) it's every mod, then Minecraft: only a server knows which packs are on and their real order.
 	 */
 	public List<Path> dataRoots() {
-		List<Path> roots = new ArrayList<>();
-
-		for (WorldPack pack : worldPacks) {
-			if (packStatus(pack.folder()) == PackStatus.READY) {
-				roots.add(pack.folder().data());
-			}
-		}
-
-		List<Source> minecraftLast = sources.stream()
-			.sorted(Comparator.comparing(Source::isGame))
+		return dataOrder.stream()
+			.filter(folder -> folder.content() != Content.NONE)
+			.map(BuiltFolder::data)
+			.filter(Files::isDirectory)
 			.toList();
-
-		for (Source source : minecraftLast) {
-			if (folder(source).content() != Content.NONE) {
-				roots.add(folder(source).data());
-			}
-		}
-
-		return roots.stream().filter(Files::isDirectory).toList();
-	}
-
-	/** A file under data/, e.g. "minecraft/recipe/crafter.json", from whichever source has it. */
-	public Optional<Path> findDataFile(String relative) {
-		for (Path data : dataRoots()) {
-			Optional<Path> file = KnowledgeFiles.resolveInside(data, relative).filter(Files::isRegularFile);
-
-			if (file.isPresent()) {
-				return file;
-			}
-		}
-
-		return Optional.empty();
 	}
 
 	/**
-	 * The single-player world's enabled data packs changed (world opened, or /reload). {@code selectedIds} is the
-	 * server's enabled pack list in load order; only "file/..." packs come from the world's datapacks folder. A pack is
-	 * copied again whenever its files change.
+	 * The single-player world's enabled packs changed (world opened, or /reload). {@code selectedIds} is the server's
+	 * enabled pack list in load order: "vanilla" is Minecraft, "file/..." a pack in the world's datapacks folder, and a
+	 * mod's pack has the mod's id. It sets the order of {@link #dataRoots()}. A world pack is copied again whenever its
+	 * files change.
 	 */
 	public void setWorldPacks(String world, Path datapackDir, List<String> selectedIds) {
 		String worldFolder = KnowledgeFiles.folderName(datapackDir.toAbsolutePath().getParent().getFileName().toString());
-		List<WorldPack> packs = new ArrayList<>();
+		Map<String, WorldPack> packsById = new HashMap<>();
 
 		for (String id : selectedIds) {
-			if (!id.startsWith("file/")) {
+			if (!id.startsWith(WORLD_PACK_PREFIX)) {
 				continue;
 			}
 
-			String name = id.substring("file/".length());
+			String name = id.substring(WORLD_PACK_PREFIX.length());
 			Optional<Path> location = KnowledgeFiles.resolveInside(datapackDir, name).filter(Files::exists);
 
 			if (location.isPresent()) {
 				String dir = "datapacks/" + worldFolder + "/" + KnowledgeFiles.folderName(name);
-				packs.add(new WorldPack(name, location.get(), packFolder(dir, packKey(location.get()))));
+				packsById.put(id, new WorldPack(name, location.get(), packFolder(dir, packKey(location.get()))));
 			}
 		}
 
-		Collections.reverse(packs); // highest priority (loaded last) first
+		// Highest priority (loaded last) first.
+		List<WorldPack> packs = inPackOrder(selectedIds, id -> Optional.ofNullable(packsById.get(id)));
 		worldName = world;
-		worldPacks = List.copyOf(packs);
+		worldPacks = packs;
+		dataOrder = inPackOrder(selectedIds, id -> dataFolderOfPack(id, packsById));
 		generation.incrementAndGet();
 
 		for (WorldPack pack : packs) {
@@ -417,7 +416,43 @@ public class KnowledgeBase {
 	public void clearWorldPacks() {
 		worldPacks = List.of();
 		worldName = "";
+		dataOrder = defaultDataOrder();
 		generation.incrementAndGet();
+	}
+
+	/**
+	 * What the server's selected packs ({@code selectedIds}, lowest priority first) are in the knowledge base, highest
+	 * priority first. Packs {@code find} doesn't know are left out; a value several packs map to (a mod and its
+	 * nested jars) keeps the place of its highest-priority pack.
+	 */
+	static <T> List<T> inPackOrder(List<String> selectedIds, Function<String, Optional<T>> find) {
+		Set<T> order = new LinkedHashSet<>();
+
+		for (String id : selectedIds.reversed()) {
+			find.apply(id).ifPresent(order::add);
+		}
+
+		return List.copyOf(order);
+	}
+
+	/** Minecraft for "vanilla", a world pack for "file/...", otherwise the source holding the mod the pack is named after. */
+	private Optional<BuiltFolder> dataFolderOfPack(String packId, Map<String, WorldPack> worldPacksById) {
+		if (packId.startsWith(WORLD_PACK_PREFIX)) {
+			return Optional.ofNullable(worldPacksById.get(packId)).map(WorldPack::folder);
+		}
+
+		Optional<Source> source = packId.equals(VANILLA_PACK)
+			? sources.stream().filter(Source::isGame).findFirst()
+			: Optional.ofNullable(sourcesByModId.get(packId));
+		return source.map(this::folder);
+	}
+
+	/** Without a world: every mod, in the loader's order, then Minecraft. */
+	private List<BuiltFolder> defaultDataOrder() {
+		return sources.stream()
+			.sorted(Comparator.comparing(Source::isGame))
+			.map(this::folder)
+			.toList();
 	}
 
 	/** The part of the system prompt that tells Claude what reference files exist and how to use them. */

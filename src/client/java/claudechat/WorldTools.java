@@ -194,8 +194,8 @@ public final class WorldTools {
 				this::findBlocks),
 			Tool.of("find_biomes",
 				"Find patches of a biome near the player, nearest first: like /locate biome, but returns several separate "
-					+ "patches. Worked out from the seed without generating anything, sampling every 32 blocks across and 64 up "
-					+ "and down, so patches smaller than that can be missed. Searches the player's dimension, or where the biome "
+					+ "patches. Worked out from the seed without generating anything, sampling every " + BiomeFinder.STEP
+					+ " blocks across and " + BiomeFinder.VERTICAL_STEP + " up and down, so patches smaller than that can be missed. Searches the player's dimension, or where the biome "
 					+ "exists if not there (a warped forest asked about from the Overworld is searched in the Nether, around the "
 					+ "player's position / 8). y is a height where the biome is: underground biomes like deep_dark and lush_caves "
 					+ "are found at their depth. Biome ids are under data/<namespace>/worldgen/biome in the reference files.",
@@ -241,7 +241,8 @@ public final class WorldTools {
 				"A schematic's material list and contents. \"materials\" is the items needed to place every block, counted "
 					+ "like Litematica's material list (a double slab is 2 slabs, a door is 1 item, redstone wire is redstone dust, "
 					+ "water sources are water buckets). \"crafting\" breaks crafted components (pistons, repeaters, observers, "
-					+ "torches, hoppers...) down into ingredients using the game's recipes, and \"base_materials\" is the total "
+					+ "torches, hoppers...) down into ingredients using the game's recipes (each step's \"recipe\" id works in "
+					+ "[[recipe:...]]), and \"base_materials\" is the total "
 					+ "after that, e.g. all the redstone dust including what goes into pistons. Shapes of one material (planks, "
 					+ "slabs, trapdoors, storage blocks) aren't broken down. With compare_with, also checks a container in the "
 					+ "world (a chest's custom name, x y z, or \"inventory\": what the player carries plus their ender chest) "
@@ -957,8 +958,8 @@ public final class WorldTools {
 			out.add("regions", regions);
 		}
 
-		Map<String, Integer> noItem = new TreeMap<>();
-		Map<String, Integer> placed = Materials.asPlaced(s.volume(), noItem);
+		Map<Identifier, Integer> noItem = new TreeMap<>();
+		Map<Materials.Material, Integer> placed = Materials.asPlaced(s.volume(), noItem);
 		out.add("materials", countsJson(placed));
 		out.addProperty("total_items", placed.values().stream().mapToInt(Integer::intValue).sum());
 		if (!noItem.isEmpty()) {
@@ -982,7 +983,7 @@ public final class WorldTools {
 	}
 
 	/** Checks the containers matching {@code query} against the materials; see inspect_schematic's description. */
-	private JsonObject compare(String query, Map<String, Integer> placed) throws Exception {
+	private JsonObject compare(String query, Map<Materials.Material, Integer> placed) throws Exception {
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.HOLDERS);
 		WorldIndex.PlayerInfo player = snapshot.host();
 		List<String> used = new ArrayList<>();
@@ -1029,7 +1030,7 @@ public final class WorldTools {
 					+ (h.provenance() == Provenance.LIVE ? "" : " (" + h.provenance().label() + ")"));
 			}
 		}
-		Map<String, Integer> stock = new TreeMap<>();
+		Map<Materials.Material, Integer> stock = new TreeMap<>();
 		flatten(items, stock);
 
 		JsonObject out = new JsonObject();
@@ -1051,9 +1052,9 @@ public final class WorldTools {
 	}
 
 	/** Item counts by id, including what's inside shulker boxes and bundles (the box itself counts too). */
-	private static void flatten(List<WorldIndex.Item> items, Map<String, Integer> into) {
+	private static void flatten(List<WorldIndex.Item> items, Map<Materials.Material, Integer> into) {
 		for (WorldIndex.Item item : items) {
-			into.merge(item.id(), item.count(), Integer::sum);
+			into.merge(Materials.Material.item(Identifier.parse(item.id())), item.count(), Integer::sum);
 			flatten(item.contents(), into);
 		}
 	}
@@ -1066,11 +1067,11 @@ public final class WorldTools {
 		}
 	}
 
-	/** {"redstone": 41, ...}, most first. */
-	private static JsonObject countsJson(Map<String, Integer> counts) {
+	/** {"redstone": 41, "#planks": 6, ...}: items and tags in the shared id format, most first. */
+	private static JsonObject countsJson(Map<?, Integer> counts) {
 		JsonObject o = new JsonObject();
-		counts.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-			.forEach(e -> o.addProperty(ToolFormat.id(e.getKey()), e.getValue()));
+		counts.entrySet().stream().sorted(Map.Entry.comparingByValue(Comparator.reverseOrder()))
+			.forEach(e -> o.addProperty(ToolFormat.id(e.getKey().toString()), e.getValue()));
 		return o;
 	}
 
@@ -1085,9 +1086,10 @@ public final class WorldTools {
 				o.addProperty("left_over", c.made() - c.used());
 			}
 			JsonObject per = new JsonObject();
-			c.recipe().ingredients().forEach((ingredient, count) -> per.addProperty(ToolFormat.id(ingredient), count));
+			c.recipe().ingredients().forEach((ingredient, count) -> per.addProperty(ToolFormat.id(ingredient.toString()), count));
 			o.add("ingredients_per_craft", per);
-			o.addProperty("recipe", c.recipe().file());
+			// A bare path is Minecraft's, so the short id still works in [[recipe:...]].
+			o.addProperty("recipe", ToolFormat.id(c.recipe().id()));
 			array.add(o);
 		}
 		return array;
