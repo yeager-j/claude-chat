@@ -61,27 +61,11 @@ public class ClaudeChatClient implements ClientModInitializer {
 	/** This world's (or server's) questions; replaced when the player leaves or resets. Client thread. */
 	private static volatile Conversation conversation = new Conversation();
 
-	/** For the client game test: is a question still being answered? */
-	public static boolean isBusy() {
-		return conversation.busy();
-	}
-
-	/** For the client game test: has the knowledge base finished all its background builds? */
-	public static boolean isKnowledgeReady() {
-		return !knowledge.dataRoots().isEmpty() && !knowledge.isBusy();
-	}
-
-	/** For the client game test. */
-	public static KnowledgeBase knowledge() {
-		return knowledge;
-	}
-
-	/** For the client game test: settings it can't reach through commands, such as claudePath and the timeout. */
-	public static ClaudeConfig config() {
-		return config;
-	}
-
-	/** For the client game test: the MCP server, to call tools with a policy of its own. */
+	/**
+	 * For the client game test, which plays Claude's side of MCP: access without a question, for the calls it makes with
+	 * no world open (there's no chat to ask in) and for tool sessions longer than any question timeout it could test.
+	 * Calls whose result depends on a question's permissions go through a real question instead.
+	 */
 	public static McpServer mcp() {
 		return mcp;
 	}
