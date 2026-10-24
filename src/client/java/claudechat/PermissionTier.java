@@ -19,8 +19,8 @@ public enum PermissionTier {
 		public String prompt(boolean worldOpen) {
 			return """
 
-				Permissions: read only. You can't edit files or run shell commands, and %s only runs commands
-				that change nothing. When the player wants something done, give them the command in backticks to click instead.
+				Permissions: read only. You can read files only in the knowledge folder (your working directory),
+				you can't edit files or run shell commands, and %s only runs commands that change nothing. When the player wants something done, give them the command in backticks to click instead.
 				""".formatted(McpServer.claudeName(GameCommands.TOOL));
 		}
 

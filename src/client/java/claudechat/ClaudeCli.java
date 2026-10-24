@@ -10,18 +10,13 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
-import java.nio.file.attribute.AclEntry;
-import java.nio.file.attribute.AclEntryPermission;
-import java.nio.file.attribute.AclEntryType;
-import java.nio.file.attribute.AclFileAttributeView;
-import java.nio.file.attribute.PosixFilePermissions;
+import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.EnumSet;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.Optional;
-import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -40,6 +35,7 @@ public class ClaudeCli {
 	private static final boolean WINDOWS = System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows");
 	// After claude exits, how long its output may take to drain. A process it started can keep the pipe open.
 	private static final long OUTPUT_DRAIN_MILLIS = 10_000;
+	private static final SecureRandom RANDOM = new SecureRandom();
 
 	private final ClaudeConfig config;
 	private final KnowledgeBase knowledge;
@@ -104,16 +100,16 @@ public class ClaudeCli {
 		// directory. The tiers' pre-approved reads are relative to it (PermissionTier.PRE_APPROVED_READS).
 		Path workDir = knowledge.root();
 		Files.createDirectories(workDir);
-		Files.createDirectories(runsDir());
-		long id = runCount.incrementAndGet();
-		Path promptFile = runFile(id, "system-prompt.txt");
+		// The question's files, in a folder only the player's account can open: the MCP config holds the question's
+		// token, and the prompt the game state. They exist only while the question runs.
+		Path runDir = PrivateFiles.createDir(runsDir(), runDirName(runCount.incrementAndGet()));
+		Path promptFile = runDir.resolve("system-prompt.txt");
 		// Only this mod's MCP server: --strict-mcp-config also keeps the player's other MCP servers, configured for
-		// Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON. It holds the
-		// question's token, so it exists only while the question runs.
-		Path mcpConfig = runFile(id, "mcp.json");
+		// Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON.
+		Path mcpConfig = runDir.resolve("mcp.json");
 		try {
-			Files.writeString(promptFile, systemPrompt(request), StandardCharsets.UTF_8);
-			writeOwnerOnly(mcpConfig, grant.claudeConfig());
+			PrivateFiles.write(promptFile, systemPrompt(request));
+			PrivateFiles.write(mcpConfig, grant.claudeConfig());
 
 			ClaudeResult result = invoke(run, command(exe, mcpConfig, promptFile, request.policy(), request.resume()),
 				workDir, timeoutSeconds, onProgress);
@@ -132,6 +128,7 @@ public class ClaudeCli {
 		} finally {
 			Files.deleteIfExists(mcpConfig);
 			Files.deleteIfExists(promptFile);
+			Files.deleteIfExists(runDir);
 		}
 	}
 
@@ -177,9 +174,8 @@ public class ClaudeCli {
 			}
 			waitForExit(process, run.approvals(), timeoutSeconds);
 		} finally {
-			if (process.isAlive()) {
-				ClaudeRun.killWithDescendants(process);
-			}
+			// Also after a normal exit: whatever claude started must not outlive the question.
+			run.endProcess();
 		}
 
 		reader.join(OUTPUT_DRAIN_MILLIS);
@@ -208,54 +204,33 @@ public class ClaudeCli {
 		}
 	}
 
-	/**
-	 * Creates {@code file} readable only by its owner before writing {@code text} to it: POSIX permissions where the
-	 * file system has them, otherwise (Windows) an access list with a single entry, for the file's owner.
-	 */
-	static void writeOwnerOnly(Path file, String text) throws IOException {
-		Files.deleteIfExists(file);
-		Set<String> views = file.getFileSystem().supportedFileAttributeViews();
-		if (views.contains("posix")) {
-			Files.createFile(file, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
-		} else {
-			Files.createFile(file);
-			if (views.contains("acl")) {
-				AclFileAttributeView acl = Files.getFileAttributeView(file, AclFileAttributeView.class);
-				acl.setAcl(List.of(AclEntry.newBuilder()
-					.setType(AclEntryType.ALLOW)
-					.setPrincipal(acl.getOwner())
-					.setPermissions(EnumSet.allOf(AclEntryPermission.class))
-					.build()));
-			}
-		}
-
-		Files.writeString(file, text, StandardCharsets.UTF_8);
-	}
-
-	/** Where each question's prompt and MCP config live while it runs. */
+	/** Where each question's folder lives while it runs. */
 	private static Path runsDir() {
 		return ClaudeConfig.dir().resolve("runs");
 	}
 
 	/**
-	 * A question's file: named after this game's process as well as the question, since two game instances can share
-	 * a config folder.
+	 * A question's folder: named after this game's process as well as the question, since two game instances can share
+	 * a config folder, and random after that, so nobody can make it ahead of time.
 	 */
-	private static Path runFile(long run, String name) {
-		return runsDir().resolve(ProcessHandle.current().pid() + "-" + run + "-" + name);
+	private static String runDirName(long run) {
+		byte[] random = new byte[16];
+		RANDOM.nextBytes(random);
+		return ProcessHandle.current().pid() + "-" + run + "-" + HexFormat.of().formatHex(random);
 	}
 
 	/**
-	 * Files of questions that were running when a game crashed or was killed, and the single mcp.json older versions
-	 * used. Their tokens died with that game, but they needn't stay on disk. Another running game's files stay.
+	 * Folders of questions that were running when a game crashed or was killed, files older versions kept directly in
+	 * runs, and the single mcp.json before that. Their tokens died with that game, but they needn't stay on disk.
+	 * Another running game's files stay.
 	 */
 	private static void deleteLeftoverFiles() {
 		try {
 			Files.deleteIfExists(ClaudeConfig.dir().resolve("mcp.json"));
-			try (Stream<Path> files = Files.list(runsDir())) {
-				for (Path file : files.toList()) {
-					if (!ownerAlive(file)) {
-						Files.deleteIfExists(file);
+			try (Stream<Path> entries = Files.list(runsDir())) {
+				for (Path entry : entries.toList()) {
+					if (!ownerAlive(entry)) {
+						KnowledgeFiles.deleteTree(entry);
 					}
 				}
 			}
@@ -266,7 +241,7 @@ public class ClaudeCli {
 		}
 	}
 
-	/** Is the game that wrote this {@link #runFile} still running? */
+	/** Is the game that made this {@link #runDirName} folder (or an older version's file) still running? */
 	private static boolean ownerAlive(Path file) {
 		String name = file.getFileName().toString();
 		int dash = name.indexOf('-');
