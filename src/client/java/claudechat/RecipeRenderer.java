@@ -6,10 +6,17 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.Holder;
+import net.minecraft.core.HolderSet;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.resources.Identifier;
+import net.minecraft.tags.TagKey;
 import net.minecraft.world.item.Item;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -27,59 +34,102 @@ public final class RecipeRenderer {
 	private record Ingredient(List<Holder<Item>> items, String label) {
 	}
 
+	/**
+	 * Chat lines for a recipe. {@code grid} is true when they are the recipe's icon rows, which need every line to
+	 * start at the same x; false for a note such as "(no recipe found …)".
+	 */
+	public record Lines(List<Component> lines, boolean grid) {
+		private static Lines note(String text) {
+			return new Lines(List.of(Component.literal(text).withStyle(ChatFormatting.GRAY)), false);
+		}
+	}
+
 	private final KnowledgeBase knowledge;
-	private Map<String, Path> recipesByResult;
+	private Map<Identifier, Path> recipesByResult;
 	private int indexedGeneration = -1;
 
 	public RecipeRenderer(KnowledgeBase knowledge) {
 		this.knowledge = knowledge;
 	}
 
-	/** Lines for "[[recipe:minecraft:crafter]]". The id is a recipe file, or failing that, an item it makes. */
-	public List<Component> render(String recipeId) {
-		String id = recipeId.contains(":") ? recipeId.trim() : "minecraft:" + recipeId.trim();
-		String ns = id.substring(0, id.indexOf(':'));
-		String path = id.substring(id.indexOf(':') + 1);
-
-		Optional<Path> file = knowledge.findDataFile(ns + "/recipe/" + path + ".json")
-			.or(() -> Optional.ofNullable(recipesByResult().get(id)));
+	/** The lines for [[recipe:id]] on its own line: the recipe as a grid when one is found. */
+	public Lines render(Identifier id) {
+		Optional<Path> file = find(id);
 		if (file.isEmpty()) {
-			return List.of(Component.literal("(no recipe found for " + id + ")").withStyle(ChatFormatting.GRAY));
+			return Lines.note("(no recipe found for " + id + ")");
 		}
+
 		try {
-			JsonObject recipe = JsonParser.parseString(Files.readString(file.get())).getAsJsonObject();
-			return render(recipe);
+			return render(read(file.get()));
 		} catch (IOException | RuntimeException e) {
 			ClaudeChatClient.LOGGER.warn("Could not render recipe {}", id, e);
-			return List.of(Component.literal("(couldn't read recipe " + id + ")").withStyle(ChatFormatting.GRAY));
+			return Lines.note("(couldn't read recipe " + id + ")");
 		}
 	}
 
-	private List<Component> render(JsonObject recipe) {
-		String type = recipe.get("type").getAsString().replace("minecraft:", "");
-		MutableComponent result = result(recipe.get("result"));
+	/** What [[recipe:id]] in the middle of a sentence shows: the recipe's result, or the item with that id. */
+	public MutableComponent resultName(Identifier id) {
+		Optional<Path> file = find(id);
+		if (file.isEmpty()) {
+			return ItemIcons.named(id);
+		}
+
+		try {
+			return result(read(file.get()));
+		} catch (IOException | RuntimeException e) {
+			ClaudeChatClient.LOGGER.debug("Could not read recipe {}", id, e);
+			return ItemIcons.named(id);
+		}
+	}
+
+	/** The one place a recipe id gets its meaning: a recipe file of that name, or else a recipe that makes that item. */
+	private Optional<Path> find(Identifier id) {
+		return knowledge.findDataFile(id.getNamespace() + "/recipe/" + id.getPath() + ".json")
+			.or(() -> Optional.ofNullable(recipesByResult().get(id)));
+	}
+
+	private static JsonObject read(Path file) throws IOException {
+		return JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+	}
+
+	/** The recipe type without the "minecraft:" namespace: "crafting_shaped", "smithing_trim". */
+	private static String type(JsonObject recipe) {
+		return recipe.get("type").getAsString().replace("minecraft:", "");
+	}
+
+	private Lines render(JsonObject recipe) {
+		String type = type(recipe);
 		return switch (type) {
-			case "crafting_shaped" -> shaped(recipe, result);
-			case "crafting_shapeless" -> List.of(row(ingredients(recipe.getAsJsonArray("ingredients")), result, null));
-			case "smelting", "blasting", "smoking", "campfire_cooking" -> {
-				String station = switch (type) {
-					case "blasting" -> "Blast Furnace";
-					case "smoking" -> "Smoker";
-					case "campfire_cooking" -> "Campfire";
-					default -> "Furnace";
-				};
-				double seconds = (recipe.has("cookingtime") ? recipe.get("cookingtime").getAsInt() : 200) / 20.0;
-				String xp = recipe.has("experience") ? ", " + recipe.get("experience").getAsFloat() + " xp" : "";
-				yield List.of(row(List.of(ingredient(recipe.get("ingredient"))), result,
-					station + ", " + (seconds % 1 == 0 ? (int) seconds : seconds) + "s" + xp));
-			}
-			case "stonecutting" -> List.of(row(List.of(ingredient(recipe.get("ingredient"))), result, "Stonecutter"));
-			case "smithing_transform", "smithing_trim" -> List.of(row(List.of(
-				ingredient(recipe.get("template")), ingredient(recipe.get("base")), ingredient(recipe.get("addition"))), result, "Smithing Table"));
-			case "crafting_transmute" -> List.of(row(List.of(
-				ingredient(recipe.get("input")), ingredient(recipe.get("material"))), result, null));
-			default -> List.of(Component.literal("(special recipe: " + type + ")").withStyle(ChatFormatting.GRAY));
+			case "crafting_shaped" -> new Lines(shaped(recipe, counted(recipe)), true);
+			case "crafting_shapeless" -> grid(row(ingredients(recipe.getAsJsonArray("ingredients")), counted(recipe), null));
+			case "smelting", "blasting", "smoking", "campfire_cooking" -> grid(row(List.of(ingredient(recipe.get("ingredient"))),
+				counted(recipe), cookingNote(type, recipe)));
+			case "stonecutting" -> grid(row(List.of(ingredient(recipe.get("ingredient"))), counted(recipe),
+				Blocks.STONECUTTER.getName()));
+			case "smithing_transform", "smithing_trim" -> grid(row(List.of(ingredient(recipe.get("template")),
+				ingredient(recipe.get("base")), ingredient(recipe.get("addition"))), counted(recipe), Blocks.SMITHING_TABLE.getName()));
+			case "crafting_transmute" -> grid(row(List.of(ingredient(recipe.get("input")), ingredient(recipe.get("material"))),
+				counted(recipe), null));
+			default -> Lines.note("(special recipe: " + type + ")");
 		};
+	}
+
+	private static Lines grid(Component row) {
+		return new Lines(List.of(row), true);
+	}
+
+	/** "Blast Furnace, 5s, 0.1 xp", with the station's name in the player's language. */
+	private static Component cookingNote(String type, JsonObject recipe) {
+		Block station = switch (type) {
+			case "blasting" -> Blocks.BLAST_FURNACE;
+			case "smoking" -> Blocks.SMOKER;
+			case "campfire_cooking" -> Blocks.CAMPFIRE;
+			default -> Blocks.FURNACE;
+		};
+		double seconds = (recipe.has("cookingtime") ? recipe.get("cookingtime").getAsInt() : 200) / 20.0;
+		String time = seconds % 1 == 0 ? String.valueOf((int) seconds) : String.valueOf(seconds);
+		String xp = recipe.has("experience") ? ", " + recipe.get("experience").getAsFloat() + " xp" : "";
+		return station.getName().append(", " + time + "s" + xp);
 	}
 
 	/** A shaped recipe as a grid, with "→ result" on the middle row. */
@@ -108,7 +158,7 @@ public final class RecipeRenderer {
 	}
 
 	/** Ingredients in a row: "[a] + [b] → result (station)". */
-	private static Component row(List<Ingredient> ingredients, MutableComponent result, String station) {
+	private static Component row(List<Ingredient> ingredients, MutableComponent result, Component station) {
 		MutableComponent line = Component.literal("  ");
 		for (int i = 0; i < ingredients.size(); i++) {
 			if (i > 0) {
@@ -118,7 +168,7 @@ public final class RecipeRenderer {
 		}
 		line.append(Component.literal("  → ").withStyle(ChatFormatting.GRAY)).append(result);
 		if (station != null) {
-			line.append(Component.literal(" (" + station + ")").withStyle(ChatFormatting.GRAY));
+			line.append(Component.empty().withStyle(ChatFormatting.GRAY).append(" (").append(station).append(")"));
 		}
 		return line;
 	}
@@ -135,17 +185,29 @@ public final class RecipeRenderer {
 		return icon;
 	}
 
-	private MutableComponent result(JsonElement json) {
-		JsonObject result = json.getAsJsonObject();
-		int count = result.has("count") ? result.get("count").getAsInt() : 1;
+	/** The result with how many the recipe makes: "4× [icon] Torch". */
+	private static MutableComponent counted(JsonObject recipe) {
+		JsonObject result = recipe.getAsJsonObject("result");
+		int count = result != null && result.has("count") ? result.get("count").getAsInt() : 1;
 		MutableComponent out = Component.empty();
 		if (count > 1) {
 			out.append(Component.literal(count + "× ").withStyle(ChatFormatting.WHITE));
 		}
-		ItemIcons.find(result.get("id").getAsString()).ifPresentOrElse(
-			item -> out.append(ItemIcons.named(item)),
-			() -> out.append(Component.literal(result.get("id").getAsString())));
-		return out;
+		return out.append(result(recipe));
+	}
+
+	/**
+	 * What the recipe makes. A trim recipe has no result (the armor that goes in comes out trimmed), so it shows the
+	 * trim's name.
+	 */
+	private static MutableComponent result(JsonObject recipe) {
+		if (type(recipe).equals("smithing_trim")) {
+			Identifier pattern = Identifier.parse(recipe.get("pattern").getAsString());
+			return Component.translatableWithFallback(pattern.toLanguageKey("trim_pattern"),
+				ItemIcons.readableName(pattern) + " armor trim").withStyle(ChatFormatting.YELLOW);
+		}
+
+		return ItemIcons.named(Identifier.parse(recipe.getAsJsonObject("result").get("id").getAsString()));
 	}
 
 	private List<Ingredient> ingredients(JsonArray array) {
@@ -170,10 +232,11 @@ public final class RecipeRenderer {
 		List<String> names = new ArrayList<>();
 		for (String id : ids) {
 			if (id.startsWith("#")) {
-				names.add("any " + id.substring(1).replaceAll(".*[:/]", "").replace('_', ' '));
-				expandTag(id.substring(1), items, 0);
+				Identifier tag = Identifier.parse(id.substring(1));
+				names.add("any " + ItemIcons.readableName(tag));
+				items.addAll(tagItems(tag));
 			} else {
-				ItemIcons.find(id).ifPresent(item -> {
+				ItemIcons.find(Identifier.parse(id)).ifPresent(item -> {
 					items.add(item);
 					names.add(ItemIcons.name(item).getString());
 				});
@@ -182,39 +245,25 @@ public final class RecipeRenderer {
 		return new Ingredient(items, String.join(" or ", names));
 	}
 
-	private void expandTag(String tag, List<Holder<Item>> into, int depth) {
-		if (depth > 5) {
-			return;
-		}
-		String ns = tag.contains(":") ? tag.substring(0, tag.indexOf(':')) : "minecraft";
-		String path = tag.substring(tag.indexOf(':') + 1);
-		Optional<Path> file = knowledge.findDataFile(ns + "/tags/item/" + path + ".json");
-		if (file.isEmpty()) {
-			return;
-		}
-		try {
-			JsonArray values = JsonParser.parseString(Files.readString(file.get())).getAsJsonObject().getAsJsonArray("values");
-			for (JsonElement value : values) {
-				String id = value.isJsonObject() ? value.getAsJsonObject().get("id").getAsString() : value.getAsString();
-				if (id.startsWith("#")) {
-					expandTag(id.substring(1), into, depth + 1);
-				} else {
-					ItemIcons.find(id).ifPresent(into::add);
-				}
-			}
-		} catch (IOException | RuntimeException e) {
-			ClaudeChatClient.LOGGER.debug("Could not read tag {}", tag, e);
-		}
+	/**
+	 * The items in an item tag, from the tags the game loaded. Tag files merge across packs and mods (a mod's
+	 * planks.json adds to vanilla's), so the game's merged tag is the only correct answer.
+	 */
+	private static List<Holder<Item>> tagItems(Identifier tag) {
+		return BuiltInRegistries.ITEM.get(TagKey.create(Registries.ITEM, tag))
+			.map(HolderSet.Named::stream)
+			.map(Stream::toList)
+			.orElse(List.of());
 	}
 
 	/** Recipe files are named freely (iron_ingot_from_smelting_raw_iron), so also index them by what they make. */
-	private synchronized Map<String, Path> recipesByResult() {
+	private synchronized Map<Identifier, Path> recipesByResult() {
 		// Rebuild when new data has arrived (e.g. a mod finished extracting).
 		if (recipesByResult != null && indexedGeneration == knowledge.generation()) {
 			return recipesByResult;
 		}
 		indexedGeneration = knowledge.generation();
-		Map<String, Path> index = new HashMap<>();
+		Map<Identifier, Path> index = new HashMap<>();
 		List<Path> dataRoots = knowledge.dataRoots();
 		if (dataRoots.isEmpty()) {
 			return index; // knowledge base not built yet; try again next time
@@ -227,10 +276,10 @@ public final class RecipeRenderer {
 							try {
 								JsonObject recipe = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
 								if (recipe.has("result") && recipe.get("result").isJsonObject()) {
-									String result = recipe.getAsJsonObject("result").get("id").getAsString();
+									Identifier result = Identifier.parse(recipe.getAsJsonObject("result").get("id").getAsString());
 									// Prefer the recipe whose file is named after the item (the "main" recipe).
 									String fileName = file.getFileName().toString().replace(".json", "");
-									if (!index.containsKey(result) || result.endsWith(":" + fileName)) {
+									if (!index.containsKey(result) || result.getPath().equals(fileName)) {
 										index.put(result, file);
 									}
 								}

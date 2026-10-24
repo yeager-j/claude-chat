@@ -1,6 +1,9 @@
 package claudechat;
 
 import net.fabricmc.loader.api.FabricLoader;
+import net.fabricmc.loader.api.Version;
+import net.fabricmc.loader.api.VersionParsingException;
+import net.fabricmc.loader.api.metadata.version.VersionPredicate;
 import net.minecraft.ChatFormatting;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -11,6 +14,7 @@ import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.Level;
 
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
@@ -22,8 +26,15 @@ import java.util.regex.Pattern;
  * The click runs Xaero's own chat-sharing command (xaero_waypoint_add:...). Xaero intercepts it before it reaches the
  * server and opens its Add Waypoint screen, filled in, so the player confirms every waypoint. Nothing here links
  * against Xaero: the command format is the one players' shared waypoints use, which Xaero has kept for years.
+ * The escaping, colours, name limit and folder names below copy Xaero internals, so the button is offered only for
+ * the Xaero versions they were checked against.
  */
 public final class Waypoints {
+	private static final List<String> MINIMAP_IDS = List.of("xaerominimap", "xaerominimapfair");
+	// Checked against 26.6.0's decompiled sharing code. Raise after checking a newer major version.
+	private static final String KNOWN_GOOD_VERSIONS = ">=26.6.0 <27";
+	private static final boolean AVAILABLE = supportedMinimapLoaded();
+
 	private static final Pattern TAG = Pattern.compile(
 		"^\\s*(?<name>[^|]+?)\\s*\\|\\s*(?<x>-?\\d+)[\\s,]+(?<y>-?\\d+|~)[\\s,]+(?<z>-?\\d+)\\s*(?:\\|\\s*(?<dim>[\\w.:/-]+)\\s*)?$");
 	private static final Map<String, Identifier> DIMENSION_ALIASES = Map.of(
@@ -35,19 +46,46 @@ public final class Waypoints {
 	private static final int MAX_NAME = 32; // Xaero rejects longer shared names
 
 	/** A parsed tag. {@code y} is null when unknown (structures, biomes); Xaero then shows the waypoint without a height. */
-	public record Waypoint(String name, int x, Integer y, int z, Identifier dimension) {}
+	private record Waypoint(String name, int x, Integer y, int z, Identifier dimension) {}
 
 	private Waypoints() {
 	}
 
-	/** Is a minimap that understands the command installed? Without one the command would go to the server. */
+	/**
+	 * Is a minimap that understands the command installed, in a version known to read it as we write it? Without
+	 * one the command would go to the server.
+	 */
 	public static boolean available() {
-		FabricLoader loader = FabricLoader.getInstance();
-		return loader.isModLoaded("xaerominimap") || loader.isModLoaded("xaerominimapfair");
+		return AVAILABLE;
+	}
+
+	private static boolean supportedMinimapLoaded() {
+		VersionPredicate knownGood;
+		try {
+			knownGood = VersionPredicate.parse(KNOWN_GOOD_VERSIONS);
+		} catch (VersionParsingException e) {
+			throw new IllegalStateException(e);
+		}
+
+		for (String id : MINIMAP_IDS) {
+			Optional<Version> version = FabricLoader.getInstance().getModContainer(id).map(mod -> mod.getMetadata().getVersion());
+			if (version.isEmpty()) {
+				continue;
+			}
+
+			if (knownGood.test(version.get())) {
+				return true;
+			}
+
+			ClaudeChatClient.LOGGER.info("Waypoint buttons are off: {} {} isn't a version they were checked against ({})",
+				id, version.get().getFriendlyString(), KNOWN_GOOD_VERSIONS);
+		}
+
+		return false;
 	}
 
 	/** "Name|x y z|dimension"; the dimension is optional and defaults to the player's current one. */
-	public static Optional<Waypoint> parse(String tag) {
+	private static Optional<Waypoint> parse(String tag) {
 		Matcher m = TAG.matcher(tag);
 		if (!m.matches()) {
 			return Optional.empty();
@@ -79,7 +117,7 @@ public final class Waypoints {
 	 * The command a shared waypoint's "Add" link runs:
 	 * xaero_waypoint_add:name:initials:x:y:z:color:rotate:yaw:Internal-&lt;dimension folder&gt;-waypoints.
 	 */
-	public static String xaeroCommand(Waypoint waypoint) {
+	private static String xaeroCommand(Waypoint waypoint) {
 		String name = waypoint.name().replace(":", "^col^");
 		int color = COLORS[Math.floorMod(waypoint.name().hashCode(), COLORS.length)];
 		return "xaero_waypoint_add:" + name + ":" + initials(waypoint.name())
@@ -91,7 +129,7 @@ public final class Waypoints {
 	}
 
 	/** Xaero's folder for a dimension's waypoints (MinimapDimensionHelper.getDimensionDirectoryName). */
-	static String dimensionFolder(Identifier dimension) {
+	private static String dimensionFolder(Identifier dimension) {
 		if (dimension.equals(Level.OVERWORLD.identifier())) {
 			return "dim%0";
 		}
@@ -114,12 +152,23 @@ public final class Waypoints {
 		return Character.toString(Character.toUpperCase(first));
 	}
 
-	/** The chat button, or nothing if no minimap is installed or the tag doesn't parse. */
+	/**
+	 * The chat button for the text inside [[waypoint:…]]. Nothing without a supported minimap; the text as written,
+	 * dimmed, if it can't be read.
+	 */
 	public static MutableComponent button(String tag) {
-		Optional<Waypoint> parsed = available() ? parse(tag) : Optional.empty();
-		if (parsed.isEmpty()) {
+		if (!available()) {
 			return Component.empty();
 		}
+
+		Optional<Waypoint> parsed = parse(tag);
+		if (parsed.isEmpty()) {
+			ClaudeChatClient.LOGGER.warn("Couldn't read waypoint [[waypoint:{}]]", tag);
+			return Component.literal(tag).withStyle(style -> style
+				.withColor(ChatFormatting.GRAY)
+				.withHoverEvent(new HoverEvent.ShowText(Component.literal("Couldn't read this waypoint"))));
+		}
+
 		Waypoint waypoint = parsed.get();
 		String coords = waypoint.x() + " " + (waypoint.y() == null ? "~" : waypoint.y()) + " " + waypoint.z();
 		String where = waypoint.dimension().getPath().replaceFirst("^the_", "").replace('_', ' ');

@@ -1,5 +1,21 @@
 package claudechat;
 
+import claudechat.ChatMarkup.Bullet;
+import claudechat.ChatMarkup.Code;
+import claudechat.ChatMarkup.CodeLine;
+import claudechat.ChatMarkup.Emphasis;
+import claudechat.ChatMarkup.Heading;
+import claudechat.ChatMarkup.Inline;
+import claudechat.ChatMarkup.Item;
+import claudechat.ChatMarkup.Key;
+import claudechat.ChatMarkup.Line;
+import claudechat.ChatMarkup.Link;
+import claudechat.ChatMarkup.Numbered;
+import claudechat.ChatMarkup.Paragraph;
+import claudechat.ChatMarkup.RecipeGrid;
+import claudechat.ChatMarkup.RecipeResult;
+import claudechat.ChatMarkup.Text;
+import claudechat.ChatMarkup.Waypoint;
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
@@ -7,46 +23,26 @@ import net.minecraft.network.chat.HoverEvent;
 import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.network.chat.Style;
 
-import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.UnaryOperator;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 /**
- * Turns Claude's reply into chat components. Supports a Markdown subset plus four Minecraft tokens:
- * [[item_id]] (icon + name + tooltip), [[recipe:id]] (icon grid, on its own line), [[waypoint:Name|x y z|dimension]]
- * (an add-waypoint button for Xaero's Minimap) and {{key.inventory}} (the player's key).
+ * Turns Claude's reply into chat components, from the lines {@link ChatMarkup} parses: Markdown, item icons, recipe
+ * grids, waypoint buttons and key bindings.
  */
 public final class ChatFormatter {
-	private static final Pattern HEADING = Pattern.compile("^#{1,6}\\s+(.*)$");
-	private static final Pattern BULLET = Pattern.compile("^(\\s*)[-*+]\\s+(.*)$");
-	private static final Pattern NUMBERED = Pattern.compile("^(\\s*)(\\d+)[.)]\\s+(.*)$");
-	private static final Pattern RECIPE_LINE = Pattern.compile("^\\s*\\[\\[recipe:([^\\]]+)\\]\\]\\s*$");
-	private static final Pattern TABLE_DIVIDER = Pattern.compile("^\\s*\\|?\\s*:?-{2,}.*$");
-
-	// Order matters: earlier alternatives win when two start at the same place.
-	private static final Pattern INLINE = Pattern.compile(String.join("|",
-		"\\[\\[recipe:(?<recipe>[^\\]]+)\\]\\]",
-		"\\[\\[waypoint:(?<waypoint>[^\\]]+)\\]\\]",
-		"\\[\\[(?<item>[^\\]]+)\\]\\]",
-		"\\{\\{(?<key>[\\w.]+)\\}\\}",
-		"`(?<code>[^`]+)`",
-		"\\*\\*(?<bold>.+?)\\*\\*",
-		"~~(?<strike>.+?)~~",
-		"\\[(?<linktext>[^\\]]+)\\]\\((?<url>https?://[^)\\s]+)\\)",
-		"(?<![\\w*])\\*(?![\\s*])(?<italic>.+?)(?<![\\s*])\\*(?![\\w*])",
-		"(?<![\\w_])_(?![\\s_])(?<italic2>.+?)(?<![\\s_])_(?![\\w_])"));
+	/**
+	 * A formatted answer. {@code startsWithGrid} is true when the first line is a recipe grid, whose rows must all
+	 * start at the same x, so nothing (such as a [Claude] prefix) may go in front of it.
+	 */
+	public record Answer(List<Component> lines, boolean startsWithGrid) {
+	}
 
 	private final RecipeRenderer recipes;
 
 	public ChatFormatter(RecipeRenderer recipes) {
 		this.recipes = recipes;
-	}
-
-	public static boolean startsWithRecipe(String text) {
-		return text.strip().lines().findFirst().map(line -> RECIPE_LINE.matcher(line).matches()).orElse(false);
 	}
 
 	/** A progress note ("Checking the recipe data") as one dim italic line. Only the first line is kept. */
@@ -57,99 +53,78 @@ public final class ChatFormatter {
 		if (line.length() > 80) {
 			line = line.substring(0, 77).strip() + "...";
 		}
-		return styled(inline(line), s -> s.withItalic(true).withColor(ChatFormatting.GRAY));
+		return styled(inline(ChatMarkup.inline(line)), s -> s.withItalic(true).withColor(ChatFormatting.GRAY));
 	}
 
-	public List<Component> format(String text) {
+	/** The answer's chat lines; never empty. */
+	public Answer format(String text) {
 		List<Component> lines = new ArrayList<>();
-		for (String raw : text.replace("\r", "").replace("§", "").split("\n")) {
-			String line = raw.stripTrailing();
-			if (line.isBlank() || line.strip().startsWith("```") || TABLE_DIVIDER.matcher(line).matches() && line.contains("-")) {
-				continue;
-			}
+		boolean startsWithGrid = false;
 
-			Matcher m;
-			if ((m = RECIPE_LINE.matcher(line)).matches()) {
-				lines.addAll(recipes.render(m.group(1)));
-			} else if ((m = HEADING.matcher(line)).matches()) {
-				lines.add(styled(inline(m.group(1)), s -> s.withBold(true).withColor(ChatFormatting.GOLD)));
-			} else if ((m = BULLET.matcher(line)).matches()) {
-				lines.add(Component.empty()
-					.append(Component.literal(indent(m.group(1)) + "• ").withStyle(ChatFormatting.GRAY))
-					.append(inline(m.group(2))));
-			} else if ((m = NUMBERED.matcher(line)).matches()) {
-				lines.add(Component.empty()
-					.append(Component.literal(indent(m.group(1)) + m.group(2) + ". ").withStyle(ChatFormatting.GRAY))
-					.append(inline(m.group(3))));
-			} else if (line.strip().startsWith("|")) {
-				// Chat uses a proportional font, so tables can't line up; show each row as "a · b · c".
-				String row = line.strip().replaceAll("^\\||\\|$", "");
-				lines.add(inline(String.join(" · ", row.split("\\s*\\|\\s*")).strip()));
+		for (Line line : ChatMarkup.parse(text)) {
+			if (line instanceof RecipeGrid(var id)) {
+				RecipeRenderer.Lines recipe = recipes.render(id);
+				if (lines.isEmpty()) {
+					startsWithGrid = recipe.grid();
+				}
+				lines.addAll(recipe.lines());
 			} else {
-				lines.add(inline(line));
+				lines.add(line(line));
 			}
 		}
+
 		if (lines.isEmpty()) {
 			lines.add(Component.literal("(no answer)").withStyle(ChatFormatting.GRAY));
 		}
-		return lines;
+
+		return new Answer(lines, startsWithGrid);
 	}
 
-	/** Inline Markdown and tokens. Bold/italic/strike content is parsed recursively, so they can contain icons. */
-	private MutableComponent inline(String text) {
+	private MutableComponent line(Line line) {
+		return switch (line) {
+			case Heading(var text) -> styled(inline(text), s -> s.withBold(true).withColor(ChatFormatting.GOLD));
+			case Bullet(var depth, var text) -> Component.empty()
+				.append(Component.literal(indent(depth) + "• ").withStyle(ChatFormatting.GRAY))
+				.append(inline(text));
+			case Numbered(var depth, var number, var text) -> Component.empty()
+				.append(Component.literal(indent(depth) + number + ". ").withStyle(ChatFormatting.GRAY))
+				.append(inline(text));
+			case Paragraph(var text) -> inline(text);
+			case CodeLine(var text) -> Component.literal(text).withStyle(ChatFormatting.AQUA);
+			case RecipeGrid grid -> throw new IllegalArgumentException("Recipe grids take several lines: " + grid);
+		};
+	}
+
+	/** Bold/italic/strike content is built recursively, so it can contain icons. */
+	private MutableComponent inline(List<Inline> parts) {
 		// No color here: children override their parent's style, so headings and links set the color around this.
 		MutableComponent out = Component.empty();
-		Matcher m = INLINE.matcher(text);
-		int last = 0;
-		while (m.find()) {
-			if (m.start() > last) {
-				out.append(text.substring(last, m.start()));
-			}
-			out.append(token(m));
-			last = m.end();
-		}
-		if (last < text.length()) {
-			out.append(text.substring(last));
+		for (Inline part : parts) {
+			out.append(inline(part));
 		}
 		return out;
 	}
 
-	private MutableComponent token(Matcher m) {
-		if (m.group("recipe") != null) {
+	private MutableComponent inline(Inline part) {
+		return switch (part) {
+			case Text(var text) -> Component.literal(text);
+			case Item(var id) -> ItemIcons.named(id);
 			// A recipe in the middle of a sentence: show what it makes instead of a grid.
-			return item(m.group("recipe"));
-		}
-		if (m.group("waypoint") != null) {
-			return Waypoints.button(m.group("waypoint"));
-		}
-		if (m.group("item") != null) {
-			return item(m.group("item"));
-		}
-		if (m.group("key") != null) {
-			String key = m.group("key").startsWith("key.") ? m.group("key") : "key." + m.group("key");
-			return Component.literal("[").append(Component.keybind(key)).append("]").withStyle(ChatFormatting.YELLOW);
-		}
-		if (m.group("code") != null) {
-			return code(m.group("code"));
-		}
-		if (m.group("bold") != null) {
-			return styled(inline(m.group("bold")), s -> s.withBold(true));
-		}
-		if (m.group("strike") != null) {
-			return styled(inline(m.group("strike")), s -> s.withStrikethrough(true));
-		}
-		if (m.group("url") != null) {
-			return link(m.group("linktext"), m.group("url"));
-		}
-		String italic = m.group("italic") != null ? m.group("italic") : m.group("italic2");
-		return styled(inline(italic), s -> s.withItalic(true));
-	}
-
-	private static MutableComponent item(String id) {
-		String clean = id.replaceFirst("^\\s*#", "");
-		return ItemIcons.find(clean)
-			.map(ItemIcons::named)
-			.orElseGet(() -> Component.literal(clean.replaceAll(".*:", "").replace('_', ' ')));
+			case RecipeResult(var id) -> recipes.resultName(id);
+			case Waypoint(var tag) -> Waypoints.button(tag);
+			case Key(var key) -> Component.literal("[").append(Component.keybind(key)).append("]").withStyle(ChatFormatting.YELLOW);
+			case Code(var code) -> code(code);
+			case Emphasis(var style, var content) -> styled(inline(content), switch (style) {
+				case BOLD -> s -> s.withBold(true);
+				case ITALIC -> s -> s.withItalic(true);
+				case STRIKETHROUGH -> s -> s.withStrikethrough(true);
+			});
+			case Link(var label, var url) -> styled(inline(label), style -> style
+				.withColor(ChatFormatting.BLUE)
+				.withUnderlined(true)
+				.withClickEvent(new ClickEvent.OpenUrl(url))
+				.withHoverEvent(new HoverEvent.ShowText(Component.literal(url.toString()))));
+		};
 	}
 
 	/** `/command` is click-to-insert into the chat box; other code is just highlighted. */
@@ -163,24 +138,11 @@ public final class ChatFormatter {
 		return Component.literal(code).withStyle(ChatFormatting.AQUA);
 	}
 
-	private MutableComponent link(String label, String url) {
-		try {
-			URI uri = URI.create(url);
-			return styled(inline(label), style -> style
-				.withColor(ChatFormatting.BLUE)
-				.withUnderlined(true)
-				.withClickEvent(new ClickEvent.OpenUrl(uri))
-				.withHoverEvent(new HoverEvent.ShowText(Component.literal(url))));
-		} catch (IllegalArgumentException e) {
-			return inline(label);
-		}
-	}
-
 	private static MutableComponent styled(MutableComponent component, UnaryOperator<Style> style) {
 		return Component.empty().withStyle(style).append(component);
 	}
 
-	private static String indent(String whitespace) {
-		return "  ".repeat(Math.min(3, whitespace.length() / 2));
+	private static String indent(int depth) {
+		return "  ".repeat(depth);
 	}
 }
