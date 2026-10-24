@@ -12,6 +12,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 
 ## Test
 
+`.\gradlew.bat test` runs the fast unit tests in `src/test/java` (JUnit 5, no game client). `fabric-loader-junit` loads Minecraft classes, but nothing is bootstrapped, so keep logic under test free of registries and client state.
+
 `.\gradlew.bat runClientGameTest` starts the real client, creates a world, types into chat, and saves screenshots to `build\run\clientGameTest\screenshots\`. Read them to check rendering. The test is `src/gametest/java/claudechat/test/ClaudeChatClientGameTest.java`; optional steps are switched on with environment variables:
 
 | Env var | Step |
