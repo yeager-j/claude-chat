@@ -58,6 +58,28 @@ class RegionFilesTest {
 	}
 
 	@Test
+	void outOfRangeCoordinatesAreSkippedAndTheirSiblingsListed() throws IOException {
+		// A region's chunk coordinates are 32 times its own, so the last regions listed are the last whose chunks fit an int.
+		List<String> outOfRange = List.of(
+			"r.2147483648.0.mca", "r.0.-2147483649.mca", "r.2147483647.0.mca", "r.0.-2147483648.mca",
+			"r." + (RegionFiles.MAX_REGION + 1) + ".0.mca", "r.0." + (RegionFiles.MIN_REGION - 1) + ".mca",
+			"r." + "9".repeat(200) + ".0.mca", "r.0.-" + "1".repeat(200) + ".mca");
+		List<String> inRange = List.of("r.0.0.mca", "r." + RegionFiles.MAX_REGION + "." + RegionFiles.MIN_REGION + ".mca");
+		for (String name : outOfRange) {
+			Files.createFile(dir.resolve(name));
+		}
+		for (String name : inRange) {
+			Files.createFile(dir.resolve(name));
+		}
+
+		Set<String> regions = RegionFiles.list(dir, dir).stream()
+			.map(region -> region.regionX() + "," + region.regionZ())
+			.collect(Collectors.toSet());
+
+		assertEquals(Set.of("0,0", RegionFiles.MAX_REGION + "," + RegionFiles.MIN_REGION), regions);
+	}
+
+	@Test
 	void missingFolderHasNoRegions() throws IOException {
 		assertEquals(List.of(), RegionFiles.list(dir, dir.resolve("absent")));
 	}
