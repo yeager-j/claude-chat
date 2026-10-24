@@ -25,7 +25,6 @@ import net.minecraft.world.level.storage.TagValueOutput;
 import java.io.IOException;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
-import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -37,6 +36,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -59,6 +59,11 @@ import java.util.function.Consumer;
  * <p>
  * Everything known about one world lives in an object created when it opens and dropped when it closes, so a scan
  * still running for one world can't write into the next.
+ * <p>
+ * A world can come from anywhere, and opening one starts a scan of every saved chunk, so reading it is bounded:
+ * {@link RegionFiles} follows no links and reads each chunk within {@link RegionFiles#CHUNK_BYTES}, a chunk over that
+ * is skipped until the game saves it again, and the scan stops once the world closes. {@link VisitsFile} has limits
+ * of its own.
  */
 public class WorldIndex {
 	private static final Duration LIVE_CAPTURE_TIMEOUT = Duration.ofSeconds(20);
@@ -342,6 +347,8 @@ public class WorldIndex {
 		/** Read failures so far; guarded by the scan's lock. */
 		int failures;
 		volatile boolean closed;
+		/** For each chunk: stops once the world closes, or when a tool call reading it is interrupted. */
+		final NbtBudget chunkBudget = new NbtBudget(RegionFiles.CHUNK_BYTES, () -> closed || Thread.currentThread().isInterrupted());
 
 		World(MinecraftServer server) {
 			this.server = server;
@@ -446,7 +453,7 @@ public class WorldIndex {
 			Path dir = dimensionDirs.get(dimension).resolve(folder.name);
 			List<RegionFiles.Region> regions;
 			try {
-				regions = RegionFiles.list(dir);
+				regions = RegionFiles.list(root, dir);
 			} catch (IOException e) {
 				logFailure("Could not list " + dir, e);
 				return 0;
@@ -455,13 +462,16 @@ public class WorldIndex {
 			Set<ChunkKey> present = new HashSet<>();
 			int changed = 0;
 			for (RegionFiles.Region region : regions) {
-				try (FileChannel channel = FileChannel.open(region.file(), StandardOpenOption.READ)) {
+				if (closed) {
+					throw new CancellationException("The world was closed");
+				}
+				try (FileChannel channel = RegionFiles.open(region)) {
 					Optional<RegionFiles.Header> header = RegionFiles.readHeader(channel);
 					if (header.isEmpty()) {
 						keepKnown(folder, dimension, region, present);
 						continue;
 					}
-					changed += scanRegion(channel, dimension, region, header.get(), folder, handler, present);
+					changed += scanRegion(channel, dimension, region, header.get(), folder, handler, forget, present);
 				} catch (IOException e) {
 					logFailure("Could not read region " + region.file(), e);
 					keepKnown(folder, dimension, region, present);
@@ -479,7 +489,7 @@ public class WorldIndex {
 		}
 
 		private int scanRegion(FileChannel channel, ResourceKey<Level> dimension, RegionFiles.Region region, RegionFiles.Header header,
-			Folder folder, ChunkHandler handler, Set<ChunkKey> present) throws IOException {
+			Folder folder, ChunkHandler handler, Consumer<ChunkKey> forget, Set<ChunkKey> present) throws IOException {
 			int changed = 0;
 			for (int i = 0; i < header.locations().length; i++) {
 				int location = header.locations()[i];
@@ -495,12 +505,20 @@ public class WorldIndex {
 				}
 				// The game may be writing this region right now; a torn read just fails and is retried next time.
 				try {
-					Optional<CompoundTag> chunk = RegionFiles.readChunk(channel, region, location, key.x(), key.z());
+					Optional<CompoundTag> chunk = RegionFiles.readChunk(channel, region, location, key.x(), key.z(), chunkBudget);
 					if (chunk.isPresent()) {
 						handler.read(key, chunk.get());
 						folder.timestamps.put(key, timestamp);
 						changed++;
 					}
+				} catch (CancellationException e) {
+					throw e;
+				} catch (TooLargeException e) {
+					// It would be too large again next time, so skip it, as if it weren't readable, until it's saved again.
+					folder.timestamps.put(key, timestamp);
+					folder.holders.remove(key);
+					forget.accept(key);
+					logFailure("Skipping chunk " + key + ": " + e.getMessage(), e);
 				} catch (IOException | RuntimeException e) {
 					logFailure("Skipping chunk " + key + " for now", e);
 				}
@@ -538,7 +556,7 @@ public class WorldIndex {
 			if (dimensionDir == null) {
 				throw new IllegalArgumentException("No dimension " + key.dimension().identifier() + " in this world");
 			}
-			return RegionFiles.readChunk(dimensionDir.resolve(blockChunks.name), key.x(), key.z())
+			return RegionFiles.readChunk(root, dimensionDir.resolve(blockChunks.name), key.x(), key.z(), chunkBudget)
 				.map(tag -> new SavedChunk(upgrade(tag, DataFixTypes.CHUNK)));
 		}
 
@@ -578,7 +596,8 @@ public class WorldIndex {
 			try {
 				VisitsFile.read(root).forEach((key, ticks) -> recordedInhabited.merge(key, ticks, Math::max));
 			} catch (IOException e) {
-				ClaudeChatClient.LOGGER.warn("Could not read {}", root.resolve(VisitsFile.NAME), e);
+				// A file this mod wouldn't have written (over its limits, say) is left out rather than stopping the world.
+				ClaudeChatClient.LOGGER.warn("Could not read {}: {}", root.resolve(VisitsFile.NAME), e.getMessage());
 			}
 		}
 
