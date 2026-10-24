@@ -1,5 +1,6 @@
 package claudechat;
 
+import com.google.gson.JsonArray;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import org.junit.jupiter.api.AfterAll;
@@ -13,19 +14,38 @@ import java.net.InetAddress;
 import java.net.Socket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-/** The MCP server's HTTP and JSON-RPC handling, over a real socket. No tool is called, so no tools are needed. */
+/** The MCP server's HTTP and JSON-RPC handling and the tool contract, over a real socket, with stand-in tools. */
 class McpServerTest {
+	private static final Param<String> QUERY = Param.requiredText("query", "What to echo.");
+	private static final Param<Integer> LIMIT = Param.integer("limit", "Max results.", 5, 1, 20);
+
 	private static McpServer server;
 	private static int port;
 	private static String authorization;
 
 	@BeforeAll
 	static void start() {
-		server = new McpServer(null, null, null, null);
+		Tool echo = Tool.of("echo", "Echoes its arguments.", Tool.Requirement.NOTHING, List.of(QUERY, LIMIT), (arguments, context) -> {
+			JsonObject out = new JsonObject();
+			out.addProperty("query", arguments.get(QUERY));
+			out.addProperty("limit", arguments.get(LIMIT));
+			return Tool.Result.of(out);
+		});
+		Tool closed = Tool.of("closed", "Needs a world.", new Tool.Requirement(() -> false, "No world is open."), List.of(),
+			(arguments, context) -> Tool.Result.of(new JsonObject()));
+		Tool silent = Tool.of("silent", "Fails without a message.", Tool.Requirement.NOTHING, List.of(), (arguments, context) -> {
+			throw new IllegalStateException();
+		});
+		Tool picture = Tool.of("picture", "Returns an image.", Tool.Requirement.NOTHING, List.of(),
+			(arguments, context) -> new Tool.Result(new JsonObject(), new byte[] {1, 2, 3}));
+		server = new McpServer(List.of(echo, closed, silent, picture), () -> false);
 		server.start();
 		JsonObject minecraft = JsonParser.parseString(server.claudeConfig()).getAsJsonObject()
 			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
@@ -77,9 +97,99 @@ class McpServerTest {
 		assertEquals("2025-06-18", initialize("1999-01-01"));
 	}
 
+	@Test
+	void onlyAvailableToolsAreListed() throws IOException {
+		List<String> names = new ArrayList<>();
+		rpc("tools/list", "{}").getAsJsonObject("result").getAsJsonArray("tools")
+			.forEach(tool -> names.add(tool.getAsJsonObject().get("name").getAsString()));
+
+		assertEquals(List.of("echo", "silent", "picture"), names);
+	}
+
+	@Test
+	void schemaStatesDefaultsAndRequiredArguments() throws IOException {
+		JsonObject echo = rpc("tools/list", "{}").getAsJsonObject("result").getAsJsonArray("tools").get(0).getAsJsonObject();
+		JsonObject schema = echo.getAsJsonObject("inputSchema");
+		JsonObject limit = schema.getAsJsonObject("properties").getAsJsonObject("limit");
+
+		assertEquals("[\"query\"]", schema.getAsJsonArray("required").toString());
+		assertEquals(5, limit.get("default").getAsInt());
+		assertEquals(20, limit.get("maximum").getAsInt());
+		assertTrue(limit.get("description").getAsString().contains("Default 5, 1 to 20."));
+	}
+
+	@Test
+	void argumentsAreParsedDefaultedAndClamped() throws IOException {
+		assertEquals("{\"query\":\"x\",\"limit\":5}", callText("echo", "{\"query\": \" x \"}"));
+		assertEquals("{\"query\":\"x\",\"limit\":7}", callText("echo", "{\"query\": \"x\", \"limit\": \"7\"}"));
+		assertEquals("{\"query\":\"x\",\"limit\":20}", callText("echo", "{\"query\": \"x\", \"limit\": 100}"));
+	}
+
+	@Test
+	void badArgumentsAreToolErrors() throws IOException {
+		assertToolError("echo", "{}", "query is required.");
+		assertToolError("echo", "{\"query\": \"  \"}", "query must not be empty.");
+		assertToolError("echo", "{\"query\": \"x\", \"limit\": \"five\"}", "limit must be a whole number, not \"five\".");
+		assertToolError("echo", "{\"query\": \"x\", \"limit\": 2.5}", "limit must be a whole number, not 2.5.");
+		assertToolError("echo", "{\"query\": [\"x\"]}", "query must be text");
+		assertToolError("echo", "[1]", "arguments must be an object");
+	}
+
+	@Test
+	void unavailableToolFailsWhenCalled() throws IOException {
+		assertToolError("closed", "{}", "No world is open.");
+	}
+
+	@Test
+	void unknownToolIsAProtocolError() throws IOException {
+		JsonObject response = rpc("tools/call", "{\"name\": \"no_such_tool\", \"arguments\": {}}");
+
+		assertEquals(-32602, response.getAsJsonObject("error").get("code").getAsInt());
+		assertTrue(response.getAsJsonObject("error").get("message").getAsString().contains("no_such_tool"));
+	}
+
+	@Test
+	void anErrorWithoutAMessageStillSaysWhatFailed() throws IOException {
+		JsonObject result = rpc("tools/call", "{\"name\": \"silent\"}").getAsJsonObject("result");
+		String text = result.getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString();
+
+		assertTrue(result.get("isError").getAsBoolean());
+		assertFalse(text.contains("null"), text);
+		assertTrue(text.contains("IllegalStateException"), text);
+	}
+
+	@Test
+	void imagesFollowTheDataAsContent() throws IOException {
+		JsonArray content = rpc("tools/call", "{\"name\": \"picture\"}").getAsJsonObject("result").getAsJsonArray("content");
+
+		assertEquals("text", content.get(0).getAsJsonObject().get("type").getAsString());
+		JsonObject image = content.get(1).getAsJsonObject();
+		assertEquals("image", image.get("type").getAsString());
+		assertEquals("image/png", image.get("mimeType").getAsString());
+		assertEquals("AQID", image.get("data").getAsString());
+	}
+
+	private static void assertToolError(String tool, String arguments, String message) throws IOException {
+		JsonObject result = rpc("tools/call", "{\"name\": \"" + tool + "\", \"arguments\": " + arguments + "}").getAsJsonObject("result");
+		String text = result.getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString();
+
+		assertTrue(result.has("isError") && result.get("isError").getAsBoolean(), text);
+		assertTrue(text.contains(message), text);
+	}
+
+	private static String callText(String tool, String arguments) throws IOException {
+		JsonObject result = rpc("tools/call", "{\"name\": \"" + tool + "\", \"arguments\": " + arguments + "}").getAsJsonObject("result");
+		assertFalse(result.has("isError"), result.toString());
+		return result.getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString();
+	}
+
 	private static String initialize(String version) throws IOException {
-		String request = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"initialize\", \"params\": {\"protocolVersion\": \"" + version + "\"}}";
-		return body(exchange(post(authorization, request))).getAsJsonObject("result").get("protocolVersion").getAsString();
+		return rpc("initialize", "{\"protocolVersion\": \"" + version + "\"}").getAsJsonObject("result").get("protocolVersion").getAsString();
+	}
+
+	private static JsonObject rpc(String method, String params) throws IOException {
+		String request = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
+		return body(exchange(post(authorization, request)));
 	}
 
 	private static String post(String authorization, String json) {

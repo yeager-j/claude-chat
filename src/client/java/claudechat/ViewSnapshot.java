@@ -83,9 +83,6 @@ public final class ViewSnapshot {
 	private static final int COLUMNS = 49;
 	/** Screenshots are scaled down by a whole factor to at most about this wide. */
 	private static final int MAX_IMAGE_WIDTH = 1280;
-	private static final int DEFAULT_RANGE = 256;
-	private static final int MIN_RANGE = 8;
-	private static final int MAX_RANGE = 512;
 	private static final int MAX_DETAILS = 20;
 	private static final int MAX_ENTITIES = 50;
 	/** Positions kept per kind of block, to bound memory on wide views; past it, counts read "4096+". */
@@ -95,8 +92,17 @@ public final class ViewSnapshot {
 	/** Points on an entity's box checked for line of sight. */
 	private static final int SIGHT_POINTS = 7;
 
-	public JsonObject definition() {
-		return WorldTools.tool(TOOL,
+	private static final Param<Boolean> SCREENSHOT = Param.flag("screenshot", "Include the screenshot.", true);
+	private static final Param<Integer> MAX_DISTANCE = Param.integer("max_distance",
+		"How far rays go, in blocks; never past what fog and the render distance let the player see.", 256, 8, 512);
+
+	/** The look tool, offered while a world is loaded on the client: single-player or a server. */
+	public Tool tool() {
+		Tool.Requirement anyWorld = new Tool.Requirement(() -> {
+			Minecraft mc = Minecraft.getInstance();
+			return mc.level != null && mc.player != null;
+		}, "No world is open, so there's nothing to look at.");
+		return Tool.of(TOOL,
 			"What the player sees right now: a screenshot plus data about everything in it. The screenshot shows the "
 				+ "layout, but shaders and resource packs can make blocks look like something else, so go by the data for "
 				+ "what things are. Rays are cast through the player's screen, so only what the player could see is "
@@ -110,31 +116,15 @@ public final class ViewSnapshot {
 				+ "The screenshot includes the HUD and any open chat or screen, which cover part of the view; the data "
 				+ "doesn't. Use it for \"what am I looking at\", \"what's that\", or to understand the player's "
 				+ "surroundings.",
-			"""
-			{"type": "object", "properties": {
-			  "screenshot": {"type": "boolean", "description": "Include the screenshot (default true)."},
-			  "max_distance": {"type": "integer", "description": "How far rays go, in blocks (default 256, at most 512; never past what fog and the render distance let the player see)."}
-			}}
-			""");
-	}
-
-	/** The data, and the PNG of the same frame (null if not asked for or it couldn't be taken). */
-	public record Result(JsonObject data, byte[] png) {
-	}
-
-	/** A world is loaded on the client: single-player or a server. */
-	public boolean available() {
-		Minecraft mc = Minecraft.getInstance();
-		return mc.level != null && mc.player != null;
+			anyWorld, List.of(SCREENSHOT, MAX_DISTANCE),
+			(arguments, context) -> look(arguments.get(MAX_DISTANCE), arguments.get(SCREENSHOT)));
 	}
 
 	/**
-	 * Call from any thread but the client's: waits for the client thread to take the snapshot, then for the GPU to
-	 * hand back the screenshot.
+	 * The data, and the PNG of the same frame unless not asked for or it couldn't be taken. Call from any thread but
+	 * the client's: waits for the client thread to take the snapshot, then for the GPU to hand back the screenshot.
 	 */
-	public Result call(JsonObject args) throws Exception {
-		int requestedRange = Math.clamp(integer(args, "max_distance", DEFAULT_RANGE), MIN_RANGE, MAX_RANGE);
-		boolean screenshot = !args.has("screenshot") || args.get("screenshot").getAsBoolean();
+	private static Tool.Result look(int requestedRange, boolean screenshot) throws Exception {
 		Minecraft mc = Minecraft.getInstance();
 		CompletableFuture<byte[]> png = new CompletableFuture<>();
 
@@ -148,15 +138,15 @@ public final class ViewSnapshot {
 		}).get(20, TimeUnit.SECONDS);
 
 		if (!screenshot) {
-			return new Result(data, null);
+			return Tool.Result.of(data);
 		}
 
 		try {
-			return new Result(data, png.get(10, TimeUnit.SECONDS));
+			return new Tool.Result(data, png.get(10, TimeUnit.SECONDS));
 		} catch (Exception e) {
 			ClaudeChatClient.LOGGER.warn("Couldn't take the screenshot for look", e);
-			data.addProperty("screenshot", "couldn't be taken: " + e.getMessage());
-			return new Result(data, null);
+			data.addProperty("screenshot", "couldn't be taken: " + McpServer.errorText(e));
+			return Tool.Result.of(data);
 		}
 	}
 
@@ -229,7 +219,7 @@ public final class ViewSnapshot {
 			out.add("block_details", signs);
 		}
 
-		out.add("entities", entitiesJson(visibleEntities(mc, level, frame, tracer, range, firstPerson)));
+		addEntities(out, visibleEntities(mc, level, frame, tracer, range, firstPerson));
 		out.addProperty("rays", scan.rays);
 		out.addProperty("ms", (System.nanoTime() - start) / 1_000_000);
 		return out;
@@ -431,20 +421,20 @@ public final class ViewSnapshot {
 
 	private static JsonObject seenJson(Seen s, int cells, ViewFrame frame) {
 		JsonObject o = new JsonObject();
-		o.addProperty("block", shortId(s.id));
+		o.addProperty("block", ToolFormat.id(s.id));
 		// Clear blocks (the middle of a glass pane) are crossed but show what's behind them.
 		o.addProperty("screen_share", s.weight > 0 ? share(s.weight, cells) : "none: clear, only seen through");
 		o.addProperty("in_image", s.area.describe());
-		o.addProperty("nearest", posText(s.nearest));
-		o.addProperty("nearest_distance", Math.round(s.nearestDistance * 10) / 10.0);
-		o.addProperty("farthest_distance", Math.round(s.farthest));
+		o.addProperty("nearest", ToolFormat.position(s.nearest));
+		o.addProperty("nearest_distance_blocks", ToolFormat.distance(s.nearestDistance));
+		o.addProperty("farthest_distance_blocks", ToolFormat.distance(s.farthest));
 
 		if (s.positions.size() <= MAX_LISTED_POSITIONS) {
 			JsonArray positions = new JsonArray();
 			s.positions.stream().sorted(nearestFirst(frame.eye())).forEach(p -> {
 				ScreenPoint point = frame.project(Vec3.atCenterOf(p));
 				boolean shown = point != null && point.onScreen();
-				positions.add(posText(p) + (shown ? " (image " + point.describe() + ")" : ""));
+				positions.add(ToolFormat.position(p) + (shown ? " (image " + point.describe() + ")" : ""));
 			});
 			o.add("positions", positions);
 		} else {
@@ -453,7 +443,7 @@ public final class ViewSnapshot {
 		}
 
 		if (!s.through.isEmpty()) {
-			o.addProperty("seen_through", s.through.stream().map(ViewSnapshot::shortId).collect(Collectors.joining(", ")));
+			o.addProperty("seen_through", s.through.stream().map(ToolFormat::id).collect(Collectors.joining(", ")));
 		}
 
 		return o;
@@ -506,8 +496,8 @@ public final class ViewSnapshot {
 			}
 
 			JsonObject detail = new JsonObject();
-			detail.addProperty("block", shortId(BuiltInRegistries.BLOCK.getKey(sign.getBlockState().getBlock())));
-			detail.addProperty("position", posText(pos));
+			detail.addProperty("block", ToolFormat.id(sign.getBlockState().getBlock()));
+			detail.addProperty("position", ToolFormat.position(pos));
 			detail.addProperty("side", side == SignTextSlot.FRONT ? "front" : "back");
 			detail.addProperty("text", text);
 			details.add(detail);
@@ -527,9 +517,9 @@ public final class ViewSnapshot {
 		int requestedRange) {
 		JsonObject o = new JsonObject();
 		Vec3 eye = frame.eye();
-		o.addProperty("dimension", level.dimension().identifier().toString());
-		o.addProperty("eye_position", String.format(Locale.ROOT, "%.1f %.1f %.1f", eye.x, eye.y, eye.z));
-		o.addProperty("facing", WorldTools.compass(frame.forward().x * 100, frame.forward().z * 100));
+		o.addProperty("dimension", Dimensions.name(level.dimension()));
+		o.addProperty("eye_position", ToolFormat.position(eye.x, eye.y, eye.z));
+		o.addProperty("facing", ToolFormat.compass(frame.forward().x * 100, frame.forward().z * 100));
 		float pitch = frame.pitch();
 		o.addProperty("looking", Math.abs(pitch) < 10 ? "level" : (pitch < 0 ? "up " : "down ") + Math.round(Math.abs(pitch)) + "°");
 		o.addProperty("fov_vertical", Math.round(frame.fovVertical()));
@@ -540,7 +530,7 @@ public final class ViewSnapshot {
 
 		FluidState inFluid = level.getFluidState(BlockPos.containing(eye));
 		if (!inFluid.isEmpty()) {
-			o.addProperty("camera_in", shortId(SightTracer.fluidId(inFluid)));
+			o.addProperty("camera_in", ToolFormat.id(SightTracer.fluidId(inFluid)));
 		}
 
 		return o;
@@ -568,14 +558,9 @@ public final class ViewSnapshot {
 				return o;
 			}
 
-			o.addProperty("block", shortId(BuiltInRegistries.BLOCK.getKey(state.getBlock())));
-			o.addProperty("position", posText(block.getBlockPos()));
+			ToolFormat.addBlockState(o, state);
+			o.addProperty("position", ToolFormat.position(block.getBlockPos()));
 			o.addProperty("face", block.getDirection().getSerializedName());
-			String properties = state.getValues().map(Object::toString).collect(Collectors.joining(", "));
-			if (!properties.isEmpty()) {
-				o.addProperty("state", properties);
-			}
-
 			return o;
 		}
 
@@ -679,21 +664,19 @@ public final class ViewSnapshot {
 		return tracer.bright(light);
 	}
 
-	private static JsonArray entitiesJson(List<JsonObject> visible) {
-		JsonArray out = new JsonArray();
-		visible.stream().limit(MAX_ENTITIES).forEach(out::add);
+	/** "entities", nearest first, and a note on the farther ones past {@link #MAX_ENTITIES}. */
+	private static void addEntities(JsonObject out, List<JsonObject> visible) {
+		JsonArray entities = new JsonArray();
+		visible.stream().limit(MAX_ENTITIES).forEach(entities::add);
+		out.add("entities", entities);
 		if (visible.size() > MAX_ENTITIES) {
-			JsonObject more = new JsonObject();
-			more.addProperty("more", visible.size() - MAX_ENTITIES + " farther entities not listed");
-			out.add(more);
+			ToolFormat.noteMore(out, visible.size() - MAX_ENTITIES + " farther entities.");
 		}
-
-		return out;
 	}
 
 	private static JsonObject entityJson(Minecraft mc, Entity entity, ViewFrame frame) {
 		JsonObject o = new JsonObject();
-		o.addProperty("type", shortId(EntityType.getKey(entity.getType())));
+		o.addProperty("type", ToolFormat.id(EntityType.getKey(entity.getType())));
 		if (entity instanceof Player player) {
 			o.addProperty("name", player.getGameProfile().name());
 		} else if (entity.getCustomName() != null) {
@@ -701,8 +684,8 @@ public final class ViewSnapshot {
 		}
 
 		Vec3 center = entity.getBoundingBox().getCenter();
-		o.addProperty("position", String.format(Locale.ROOT, "%.1f %.1f %.1f", entity.getX(), entity.getY(), entity.getZ()));
-		o.addProperty("distance", Math.round(center.distanceTo(frame.eye()) * 10) / 10.0);
+		o.addProperty("position", ToolFormat.position(entity.getX(), entity.getY(), entity.getZ()));
+		o.addProperty("distance_blocks", ToolFormat.distance(center.distanceTo(frame.eye())));
 		String inImage = imageArea(entity.getBoundingBox(), frame);
 		if (inImage != null) {
 			o.addProperty("in_image", inImage);
@@ -737,7 +720,7 @@ public final class ViewSnapshot {
 		}
 
 		if (entity.getVehicle() != null) {
-			o.addProperty("riding", shortId(EntityType.getKey(entity.getVehicle().getType())));
+			o.addProperty("riding", ToolFormat.id(EntityType.getKey(entity.getVehicle().getType())));
 		}
 
 		return o;
@@ -764,29 +747,9 @@ public final class ViewSnapshot {
 		return area.describe();
 	}
 
-	// --- labels ---------------------------------------------------------------------------------------------------
-
+	/** The stack as the player sees it on hover: its name, custom or not. Enchantments only show as a glint. */
 	private static String itemText(ItemStack stack) {
-		String id = shortId(BuiltInRegistries.ITEM.getKey(stack.getItem()));
-		String name = stack.getHoverName().getString();
-		return (stack.getCount() > 1 ? stack.getCount() + " " : "") + id
-			+ (stack.getCustomName() != null ? " named \"" + name + "\"" : "");
-	}
-
-	/** "stone" for vanilla ids, the full id for mods. */
-	private static String shortId(Identifier id) {
-		return id.getNamespace().equals("minecraft") ? id.getPath() : id.toString();
-	}
-
-	private static String posText(BlockPos pos) {
-		return pos.getX() + " " + pos.getY() + " " + pos.getZ();
-	}
-
-	private static int integer(JsonObject args, String key, int fallback) {
-		try {
-			return args != null && args.has(key) && args.get(key).isJsonPrimitive() ? args.get(key).getAsInt() : fallback;
-		} catch (NumberFormatException e) {
-			return fallback;
-		}
+		return ToolFormat.item(stack.getCount(), BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(),
+			stack.getHoverName().getString(), List.of());
 	}
 }

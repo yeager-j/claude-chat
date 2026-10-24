@@ -54,9 +54,6 @@ public class ClaudeChatClient implements ClientModInitializer {
 	private static WorldIndex worldIndex;
 	private static McpServer mcp;
 	private static WorldTools worldTools;
-	private static ModTools modTools;
-	private static GameCommands gameCommands;
-	private static ViewSnapshot viewSnapshot;
 	private static final StatusLine status = new StatusLine();
 
 	/** For the client game test: is a question still being answered? */
@@ -72,21 +69,6 @@ public class ClaudeChatClient implements ClientModInitializer {
 	/** For the client game test. */
 	public static KnowledgeBase knowledge() {
 		return knowledge;
-	}
-
-	/** For the client game test: call the world tools directly, without Claude. */
-	public static WorldTools worldTools() {
-		return worldTools;
-	}
-
-	/** For the client game test: the look tool, called directly without Claude. */
-	public static ViewSnapshot viewSnapshot() {
-		return viewSnapshot;
-	}
-
-	/** For the client game test: run_command, called directly without Claude. */
-	public static GameCommands gameCommands() {
-		return gameCommands;
 	}
 
 	/** For the client game test: switch tiers and cheats without the confirm buttons. */
@@ -105,11 +87,11 @@ public class ClaudeChatClient implements ClientModInitializer {
 		knowledge = new KnowledgeBase(config);
 		worldIndex = new WorldIndex();
 		worldTools = new WorldTools(worldIndex, knowledge);
-		modTools = new ModTools(knowledge);
-		gameCommands = new GameCommands(config, worldIndex);
-		// Serves Claude the mod tools for the whole session, plus the world tools while a single-player world is open.
-		viewSnapshot = new ViewSnapshot();
-		mcp = new McpServer(modTools, worldTools, gameCommands, viewSnapshot);
+		// Served for the whole session; each tool says when it's available (look in any world, the world tools and
+		// run_command only in a single-player one).
+		List<Tool> tools = Stream.of(new ModTools(knowledge).tools(), List.of(Approvals.tool(), new ViewSnapshot().tool()),
+			worldTools.tools(), List.of(new GameCommands(config, worldIndex).tool())).flatMap(List::stream).toList();
+		mcp = new McpServer(tools, worldTools::available);
 		mcp.start();
 		cli = new ClaudeCli(config, knowledge, mcp);
 		formatter = new ChatFormatter(new RecipeRenderer(knowledge));

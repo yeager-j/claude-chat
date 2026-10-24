@@ -5,6 +5,7 @@
 	"client": [
 		"ChatComponentAccessor",
 		"FeaturePoolElementAccessor",
+		"GameRendererMixin",
 		"TemplateStructurePieceAccessor"
 	],
 	"injectors": {

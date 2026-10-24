@@ -5,7 +5,6 @@ import com.mojang.datafixers.util.Pair;
 import net.minecraft.core.HolderGetter;
 import net.minecraft.core.Registry;
 import net.minecraft.core.Vec3i;
-import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.gametest.framework.StructureUtils;
 import net.minecraft.nbt.CompoundTag;
@@ -201,11 +200,6 @@ public final class StructureTemplates {
 		} catch (TooLargeException e) {
 			throw new TooLargeException("Structure template " + id + " is too large to read: " + e.getMessage());
 		}
-	}
-
-	/** "minecraft:stone_bricks". */
-	public static String id(Block block) {
-		return BuiltInRegistries.BLOCK.getKey(block).toString();
 	}
 
 	// --- search -----------------------------------------------------------------------------------------------------

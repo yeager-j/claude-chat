@@ -21,8 +21,10 @@ import java.util.Set;
  * where already generated.
  */
 public final class BiomeFinder {
-	private static final int STEP = 32;
-	private static final int VERTICAL_STEP = 64;
+	/** Blocks between samples across, as /locate biome samples: patches smaller than this can be missed. */
+	public static final int STEP = 32;
+	/** Blocks between samples up and down. */
+	public static final int VERTICAL_STEP = 64;
 	/** /locate biome's radius is 6400 blocks; a whole 30000-block search is about 2.8M columns. */
 	private static final long MAX_SAMPLES = 20_000_000L;
 
