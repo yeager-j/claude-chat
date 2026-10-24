@@ -3,23 +3,18 @@ package claudechat;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.Holder;
-import net.minecraft.server.MinecraftServer;
-import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.core.Vec3i;
 import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
-import net.minecraft.core.Vec3i;
 import net.minecraft.resources.Identifier;
 import net.minecraft.resources.ResourceKey;
-import net.minecraft.world.level.Level;
-import net.minecraft.world.level.block.Blocks;
+import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.block.Block;
-import net.minecraft.world.level.block.state.BlockState;
-import net.minecraft.world.level.block.state.properties.Property;
+import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.dimension.DimensionType;
 import net.minecraft.world.level.levelgen.structure.BoundingBox;
 import net.minecraft.world.level.levelgen.structure.Structure;
@@ -34,23 +29,103 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.OptionalInt;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Function;
 import java.util.function.Predicate;
-import java.util.stream.Collectors;
 
 /**
  * The tools Claude gets for the player's single-player world, served over MCP by {@link McpServer}. They search the
  * live world (plus saved chunks) and do the distance math, so Claude can just report coordinates and directions.
  */
 public final class WorldTools {
+	/** Farther than any world border reaches, for "only within this many blocks". */
+	private static final int WORLD_SPAN = 60_000_000;
+	/** What "visited" means, in the descriptions, from the rule that decides it. */
+	private static final String VISITED_RULE = "players spent at least " + duration(Visit.VISITED_TICKS) + " within 128 blocks";
+
+	// --- arguments, one definition each, shared where they mean the same -----------------------------------------
+
+	private static final Param<String> DIMENSION_ALL = Param.text("dimension",
+		"overworld, the_nether, the_end, or a modded dimension id. Default: all, the player's first; only the player's with max_distance.");
+	private static final Param<String> DIMENSION_WHERE_IT_EXISTS = Param.text("dimension",
+		"Default: the player's dimension, or where it generates if not there (a fortress asked about from the Overworld is "
+			+ "searched in the Nether, around the player's position / 8).");
+	private static final Param<OptionalInt> NEAR = Param.optionalInteger("max_distance",
+		"Only within this many blocks of the player (of the player's position translated there, x/8 in the Nether, for another dimension).",
+		1, WORLD_SPAN);
+	private static final Param<Visit.Filter> VISITED = Param.choice("visited", "Whether " + VISITED_RULE + " of it.", Visit.Filter.ANY);
+	private static final Param<Integer> FEW_RESULTS = Param.integer("limit", "Max results.", 5, 1, 20);
+	private static final Param<Boolean> LAYERS = Param.flag("layers", "Also draw it layer by layer.", false);
+	private static final Param<OptionalInt> Y_FROM = Param.optionalInteger("y_from", "With layers: lowest y to draw, 0 = bottom. Default 0.");
+	private static final Param<OptionalInt> Y_TO = Param.optionalInteger("y_to", "With layers: highest y to draw. Default: the top.");
+
+	private static final Param<String> ITEM_QUERY = Param.requiredText("query",
+		"Item id or name, e.g. \"diamond\", \"minecraft:diamond\", \"mending\", or a container's custom name.");
+	private static final Param<Integer> HOLDER_LIMIT = Param.integer("limit", "Max results.", 10, 1, 50);
+	private static final Param<String> ENTITY_QUERY = Param.text("query",
+		"Entity type (\"wolf\"), custom name (\"Rex\") or held item. Empty: all.");
+
+	private static final Param<String> STRUCTURE = Param.requiredText("structure",
+		"Structure id (\"minecraft:village_plains\"), tag (\"#minecraft:village\"), or a word matched against tags and ids "
+			+ "(\"village\", \"ruined_portal\").");
+	private static final Param<String> IN_BIOME = Param.text("biome",
+		"Only structures with a piece in this biome: id (\"minecraft:warped_forest\"), tag (\"#minecraft:is_ocean\"), or a word (\"warped\").");
+	private static final Param<Integer> MIN_BIOME_SHARE = Param.integer("min_biome_share",
+		"With biome: only structures at least this percent in it, e.g. 75 for \"mostly in a warped forest\". Shares of several "
+			+ "matching biomes (a tag) add up. 0: any piece.", 0, 0, 100);
+	private static final Param<List<String>> WITH_PIECES = Param.texts("with_pieces",
+		"Only structures that have a piece whose name contains each of these, e.g. [\"ship\"] for an end city with a ship, "
+			+ "[\"temple\"] for a village with a temple, [\"library\"] for a stronghold with a library. To learn the names, "
+			+ "search without it and read the pieces.");
+	private static final Param<Integer> MIN_DISTANCE = Param.integer("min_distance", "Skip structures closer than this many blocks.", 0, 0, 30_000);
+	private static final Param<Integer> STRUCTURE_RANGE = Param.integer("max_distance", "Search radius in blocks.", 8000, 16, 30_000);
+
+	private static final Param<String> BLOCK = Param.requiredText("block",
+		"Block id (\"minecraft:respawn_anchor\"), tag (\"#minecraft:beds\"), or a word matched against tags and ids (\"bed\", \"anchor\").");
+	private static final Param<Map<String, String>> PROPERTIES = Param.custom("properties", propertiesSchema(), Map.of(), WorldTools::properties);
+	private static final Param<String> BLOCK_DATA = Param.text("data",
+		"Text the block entity's data must contain (case-insensitive), e.g. the mob in a spawner (\"skeleton\"), sign text or a custom name.");
+	private static final Param<String> DIMENSION_ONLY = Param.text("dimension", "Only this dimension (overworld, the_nether, the_end, or a modded id).");
+	private static final Param<OptionalInt> BLOCKS_NEAR = Param.optionalInteger("max_distance", "Only within this many blocks of the player.", 1, WORLD_SPAN);
+	private static final Param<Integer> BLOCK_LIMIT = Param.integer("limit", "Max results.", 5, 1, 30);
+
+	private static final Param<String> BIOME = Param.requiredText("biome",
+		"Biome id (\"minecraft:cherry_grove\"), tag (\"#minecraft:is_ocean\"), or a word (\"cherry\", \"mushroom\").");
+	private static final Param<Integer> MIN_SPACING = Param.integer("min_spacing", "Hits closer together than this many blocks count as one patch.",
+		256, 32, 30_000);
+	private static final Param<Integer> BIOME_RANGE = Param.integer("max_distance", "Search radius in blocks; /locate biome's is 6400.", 6400, 32, 30_000);
+
+	private static final Param<Integer> X = Param.requiredInteger("x", "");
+	private static final Param<OptionalInt> Y = Param.optionalInteger("y",
+		"Omit for the top block of the column (not allowed in the Nether, whose top is the roof).");
+	private static final Param<Integer> Z = Param.requiredInteger("z", "");
+	private static final Param<String> DIMENSION_OR_PLAYERS = Param.text("dimension", "Default: the player's dimension.");
+
+	private static final Param<List<String>> TEMPLATE_BLOCKS = Param.texts("blocks",
+		"Blocks the template should contain: ids (\"minecraft:mossy_stone_bricks\"), tags (\"#minecraft:logs\") or words (\"spawner\", \"lantern\").");
+	private static final Param<String> TEMPLATE_QUERY = Param.text("query",
+		"Only templates whose id, or the id of a structure using them, contains this text, e.g. a mod namespace (\"dungeons_arise\") or \"village\".");
+	private static final Param<OptionalInt> MAX_SIZE = Param.optionalInteger("max_size",
+		"Only templates no larger than this many blocks along any side.", 1, Integer.MAX_VALUE);
+	private static final Param<Integer> TEMPLATE_LIMIT = Param.integer("limit", "Max results.", 10, 1, 30);
+	private static final Param<String> TEMPLATE = Param.requiredText("template",
+		"Template id, e.g. \"minecraft:village/plains/houses/plains_small_house_1\" (the path under data/<namespace>/structure/, without .nbt).");
+
+	private static final Param<String> SCHEMATIC_QUERY = Param.text("query",
+		"Only files whose path (folders separated by /) or schematic name contains this text: the same files inspect_schematic chooses from.");
+	private static final Param<String> SCHEMATIC = Param.requiredText("schematic",
+		"File name (\"Witch Farm.litematic\", \"farms/Witch Farm\"), part of it, or the schematic's name. If several match, the error lists them.");
+	private static final Param<String> COMPARE_WITH = Param.text("compare_with",
+		"Container to check against: custom name (\"witch farm\"; every container with that name counts, e.g. both halves of a "
+			+ "double chest), \"x y z\", or \"inventory\" for what the player carries plus their ender chest.");
+
 	private final WorldIndex index;
 	private final StructureTemplates templates = new StructureTemplates();
 	private final Materials materials;
@@ -68,219 +143,131 @@ public final class WorldTools {
 		this.materials = new Materials(knowledge);
 	}
 
-	public JsonArray definitions() {
-		JsonArray tools = new JsonArray();
-		tools.add(tool("search_containers",
-			"Find where an item is in the player's world: chests, barrels, shulker boxes, minecarts, item frames etc., plus "
-				+ "the player's own inventory and ender chest. Searches item ids, item names, enchantments and container names, "
-				+ "including items inside shulker boxes and bundles. Nearest first, with exact distance and compass direction.",
-			"""
-			{"type": "object", "properties": {
-			  "query": {"type": "string", "description": "Item id or name, e.g. \\"minecraft:diamond\\", \\"diamond\\", \\"mending\\", or a container's custom name."},
-			  "dimension": {"type": "string", "description": "overworld, the_nether, the_end, or a modded dimension id. Default: all, the player's first; only the player's with max_distance."},
-			  "max_distance": {"type": "integer", "description": "Only within this many blocks of the player (of the player's position translated there, x/8 in the Nether, for another dimension)."},
-			  "limit": {"type": "integer", "description": "Max results (default 10)."}
-			}, "required": ["query"]}
-			"""));
-		tools.add(tool("search_entities",
-			"Find entities in the player's world that are named, tamed, or hold items: pets, named mobs, armor stands, "
-				+ "item frames, chest minecarts and boats, dropped items. Nearest first.",
-			"""
-			{"type": "object", "properties": {
-			  "query": {"type": "string", "description": "Entity type (\\"wolf\\"), custom name (\\"Rex\\") or held item. Empty: all."},
-			  "dimension": {"type": "string"},
-			  "max_distance": {"type": "integer"},
-			  "limit": {"type": "integer", "description": "Max results (default 10)."}
-			}}
-			"""));
-		tools.add(tool("get_player",
-			"The player's position, dimension, inventory and ender chest.",
-			"""
-			{"type": "object", "properties": {}}
-			"""));
-		tools.add(tool("find_structures",
-			"Find structures near the player, nearest first: like /locate, but returns several and can skip ones the player "
-				+ "has already visited. \"Visited\" means players spent at least a second within 128 blocks of some part of "
-				+ "the structure (Minecraft's per-chunk InhabitedTime, at most of any chunk its pieces cover); structures in "
-				+ "never-generated land are always unvisited. x/z is the /locate "
-				+ "position; each result also has the structure's bounding box, its pieces (rooms and parts, by template "
-				+ "or class name, with counts, e.g. \"end_city/ship\", \"village/plains/houses/plains_temple_3\", "
-				+ "\"stronghold/library\") and the biomes they occupy (share of sampled cells), all worked out from the seed "
-				+ "exactly as generation would, without generating anything. Pieces say what generates, not what's still "
-				+ "there (looted chests, a taken elytra). The biome filter matches a structure "
-				+ "if any of its pieces is in that biome, so a fortress that starts in a crimson forest and reaches into a "
-				+ "warped forest counts as in a warped forest. Structure ids are listed under data/<namespace>/worldgen/structure "
-				+ "in the reference files.",
-			"""
-			{"type": "object", "properties": {
-			  "structure": {"type": "string", "description": "Structure id (\\"minecraft:village_plains\\"), tag (\\"#minecraft:village\\"), or a word matched against tags and ids (\\"village\\", \\"ruined_portal\\")."},
-			  "biome": {"type": "string", "description": "Only structures with a piece in this biome: id (\\"minecraft:warped_forest\\"), tag (\\"#minecraft:is_ocean\\"), or a word (\\"warped\\")."},
-			  "min_biome_share": {"type": "integer", "description": "With biome: only structures at least this percent in it (0-100), e.g. 75 for \\"mostly in a warped forest\\". Shares of several matching biomes (a tag) add up. Default: any piece."},
-			  "dimension": {"type": "string", "description": "Default: the player's dimension, or where the structure generates if not there (a fortress asked about from the Overworld is searched in the Nether, around the player's position / 8)."},
-			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Default: any."},
-			  "with_pieces": {"type": "array", "items": {"type": "string"}, "description": "Only structures that have a piece whose name contains each of these, e.g. [\\"ship\\"] for an end city with a ship, [\\"temple\\"] for a village with a temple, [\\"library\\"] for a stronghold with a library. To learn the names, search without it and read the pieces."},
-			  "min_distance": {"type": "integer"},
-			  "max_distance": {"type": "integer", "description": "Search radius in blocks (default 8000, max 30000)."},
-			  "limit": {"type": "integer", "description": "Max results (default 5, max 20)."}
-			}, "required": ["structure"]}
-			"""));
-		tools.add(tool("find_blocks",
-			"Find the placed blocks nearest the player, by block id or tag, optionally narrowed by block state properties "
-				+ "and by text in the block's data (its block entity). Examples: a skeleton spawner is block \"spawner\" with "
-				+ "data \"skeleton\"; a fully charged respawn anchor is block \"respawn_anchor\" with properties {\"charges\": \"4\"}. "
-				+ "Searches the player's dimension first, then the others (only the player's with max_distance); in another "
-				+ "dimension, distances are from the player's position translated there (x/8 in the Nether). Covers loaded chunks live and every saved chunk; "
-				+ "it can't tell who placed a block. Block ids match the block.<namespace>.<id> keys in the lang files; "
-				+ "use search_containers for what's inside chests.",
-			"""
-			{"type": "object", "properties": {
-			  "block": {"type": "string", "description": "Block id (\\"minecraft:respawn_anchor\\"), tag (\\"#minecraft:beds\\"), or a word matched against tags and ids (\\"bed\\", \\"anchor\\")."},
-			  "properties": {"type": "object", "additionalProperties": {"type": "string"}, "description": "Block state properties that must match, e.g. {\\"charges\\": \\"4\\"} or {\\"facing\\": \\"north\\"}."},
-			  "data": {"type": "string", "description": "Text the block entity's data must contain (case-insensitive), e.g. the mob in a spawner (\\"skeleton\\"), sign text or a custom name."},
-			  "dimension": {"type": "string", "description": "Only this dimension (overworld, the_nether, the_end, or a modded id)."},
-			  "max_distance": {"type": "integer", "description": "Only within this many blocks of the player."},
-			  "limit": {"type": "integer", "description": "Max results (default 5, max 30)."}
-			}, "required": ["block"]}
-			"""));
-		tools.add(tool("find_biomes",
-			"Find patches of a biome near the player, nearest first: like /locate biome, but returns several separate "
-				+ "patches. Worked out from the seed without generating anything, sampling every 32 blocks across and 64 up "
-				+ "and down, so patches smaller than that can be missed. Searches the player's dimension, or where the biome "
-				+ "exists if not there (a warped forest asked about from the Overworld is searched in the Nether, around the "
-				+ "player's position / 8). y is a height where the biome is: underground biomes like deep_dark and lush_caves "
-				+ "are found at their depth. Biome ids are under data/<namespace>/worldgen/biome in the reference files.",
-			"""
-			{"type": "object", "properties": {
-			  "biome": {"type": "string", "description": "Biome id (\\"minecraft:cherry_grove\\"), tag (\\"#minecraft:is_ocean\\"), or a word (\\"cherry\\", \\"mushroom\\")."},
-			  "dimension": {"type": "string"},
-			  "visited": {"type": "string", "enum": ["any", "unvisited", "visited"], "description": "Whether players spent at least a second within 128 blocks of the spot. Default: any."},
-			  "min_spacing": {"type": "integer", "description": "Hits closer together than this many blocks count as one patch (default 256)."},
-			  "max_distance": {"type": "integer", "description": "Search radius in blocks (default 6400 like /locate, max 30000)."},
-			  "limit": {"type": "integer", "description": "Max results (default 5, max 20)."}
-			}, "required": ["biome"]}
-			"""));
-		tools.add(tool("inspect_location",
-			"What's at a position: the block, its state and data, the biome, and the column's top block. Loaded chunks are "
-				+ "read live and other generated chunks from the last save. Chunks that were never generated are predicted from "
-				+ "the seed without generating them: the biome is exact, but the block is only the base terrain (stone, water, "
-				+ "lava or air, before grass and other surface blocks, caves from carvers, trees, ores and structures). "
-				+ "\"source\" says which applies.",
-			"""
-			{"type": "object", "properties": {
-			  "x": {"type": "integer"},
-			  "y": {"type": "integer", "description": "Omit for the top block of the column (not allowed in the Nether, whose top is the roof)."},
-			  "z": {"type": "integer"},
-			  "dimension": {"type": "string", "description": "Default: the player's dimension."}
-			}, "required": ["x", "z"]}
-			"""));
-		tools.add(tool("search_structure_templates",
-			"Search structure templates, the .nbt building blocks that structures are made of (a village house, an ancient "
-				+ "city room, a modded tower), by the blocks they contain. Use it to identify a structure the player describes "
-				+ "(\"a small tower of mossy stone bricks with a spawner\"): pass the blocks they mention. Templates containing "
-				+ "the most of the requested blocks come first, then those with many of them that also make up much of the build. "
-				+ "Big buildings are often split into several templates (a main building plus add-ons), so look past small "
-				+ "pieces. Templates with several block variants (palettes) match on any of them. Covers Minecraft, mods, the "
-				+ "world's data packs and templates saved in the world with a structure block. Each result says which structures "
-				+ "can place it (traced through template pools; structures that place templates from code, like igloos or many "
-				+ "mods' own structures, aren't traced, so that list can be empty). Template files are gzipped NBT and can't be "
-				+ "read with Read; use inspect_structure_template for one template's details.",
-			"""
-			{"type": "object", "properties": {
-			  "blocks": {"type": "array", "items": {"type": "string"}, "description": "Blocks the template should contain: ids (\\"minecraft:mossy_stone_bricks\\"), tags (\\"#minecraft:logs\\") or words (\\"spawner\\", \\"lantern\\")."},
-			  "query": {"type": "string", "description": "Only templates whose id, or the id of a structure using them, contains this text, e.g. a mod namespace (\\"dungeons_arise\\") or \\"village\\"."},
-			  "max_size": {"type": "integer", "description": "Only templates no larger than this many blocks along any side."},
-			  "limit": {"type": "integer", "description": "Max results (default 10, max 30)."}
-			}}
-			"""));
-		tools.add(tool("inspect_structure_template",
-			"One structure template in detail: size, every block with its count, chests (with loot tables), spawners and "
-				+ "other block entities, entities, jigsaw connectors (which pools it attaches to), and the structures that can "
-				+ "place it. With layers, also draws it as text, one horizontal slice per y level: rows run north to south, "
-				+ "columns west to east, '.' is air, ' ' is nothing (structure void or not part of it: keeps whatever was there), "
-				+ "and a legend maps the other "
-				+ "characters to blocks. Blocks shown are before processors run, so a structure may swap some in the world "
-				+ "(cracked or mossy variants, random ores, decay).",
-			"""
-			{"type": "object", "properties": {
-			  "template": {"type": "string", "description": "Template id, e.g. \\"minecraft:village/plains/houses/plains_small_house_1\\" (the path under data/<namespace>/structure/, without .nbt)."},
-			  "layers": {"type": "boolean", "description": "Also draw it layer by layer (default false)."},
-			  "y_from": {"type": "integer", "description": "With layers: lowest y to draw, 0 = bottom of the template."},
-			  "y_to": {"type": "integer", "description": "With layers: highest y to draw."}
-			}, "required": ["template"]}
-			"""));
-		tools.add(tool("list_schematics",
-			"List the player's schematic files (Litematica .litematic, WorldEdit .schem, structure .nbt) from their "
-				+ "schematics folder, with name, author, size, and block count where the file records one (Litematica). The files "
-				+ "are gzipped NBT and can't be read with Read; use inspect_schematic.",
-			"""
-			{"type": "object", "properties": {
-			  "query": {"type": "string", "description": "Only files whose path (folders separated by /) or schematic name contains this text: the same files inspect_schematic chooses from."}
-			}}
-			"""));
-		tools.add(tool("inspect_schematic",
-			"A schematic's material list and contents. \"materials\" is the items needed to place every block, counted "
-				+ "like Litematica's material list (a double slab is 2 slabs, a door is 1 item, redstone wire is redstone dust, "
-				+ "water sources are water buckets). \"crafting\" breaks crafted components (pistons, repeaters, observers, "
-				+ "torches, hoppers...) down into ingredients using the game's recipes, and \"base_materials\" is the total "
-				+ "after that, e.g. all the redstone dust including what goes into pistons. Shapes of one material (planks, "
-				+ "slabs, trapdoors, storage blocks) aren't broken down. With compare_with, also checks a container in the "
-				+ "world (a chest's custom name, x y z, or \"inventory\") including shulker boxes in it: what's missing as "
-				+ "placed, and what's still missing if the player crafts components from what's there; \"useful_contents\" is what "
-				+ "they hold of the materials and their ingredients, \"not_needed\" the rest. With layers, draws it "
-				+ "like inspect_structure_template.",
-			"""
-			{"type": "object", "properties": {
-			  "schematic": {"type": "string", "description": "File name (\\"Witch Farm.litematic\\", \\"farms/Witch Farm\\"), part of it, or the schematic's name. If several match, the error lists them."},
-			  "compare_with": {"type": "string", "description": "Container to check against: custom name (\\"witch farm\\"; every container with that name counts, e.g. both halves of a double chest), \\"x y z\\", or \\"inventory\\"."},
-			  "layers": {"type": "boolean"},
-			  "y_from": {"type": "integer"},
-			  "y_to": {"type": "integer"}
-			}, "required": ["schematic"]}
-			"""));
-		return tools;
-	}
-
 	/** Is a single-player world open? The world tools need its integrated server. */
 	public boolean available() {
 		return index.server() != null;
 	}
 
-	public JsonElement call(String name, JsonObject args) throws Exception {
-		return switch (name) {
-			case "search_containers" -> searchHolders(args, holder -> holder.kind() != WorldIndex.Holder.Kind.ENTITY || !holder.items().isEmpty(), true);
-			case "search_entities" -> searchHolders(args, holder -> holder.kind() == WorldIndex.Holder.Kind.ENTITY, false);
-			case "get_player" -> getPlayer();
-			case "find_structures" -> findStructures(args);
-			case "find_blocks" -> findBlocks(args);
-			case "inspect_location" -> inspectLocation(args);
-			case "find_biomes" -> findBiomes(args);
-			case "search_structure_templates" -> searchTemplates(args);
-			case "inspect_structure_template" -> inspectTemplate(args);
-			case "list_schematics" -> listSchematics(args);
-			case "inspect_schematic" -> inspectSchematic(args);
-			default -> throw new IllegalArgumentException("Unknown tool: " + name);
-		};
+	/** The world tools, offered while a single-player world is open. */
+	public List<Tool> tools() {
+		Tool.Requirement world = new Tool.Requirement(this::available, "No single-player world is open, so the world tools aren't available.");
+		return List.of(
+			Tool.of("search_containers",
+				"Find where an item is in the player's world: chests, barrels, shulker boxes, minecarts, item frames etc., plus "
+					+ "the player's own inventory and ender chest. Searches item ids, item names, enchantments and container names, "
+					+ "including items inside shulker boxes and bundles. Nearest first, with exact distance and compass direction.",
+				world, List.of(ITEM_QUERY, DIMENSION_ALL, NEAR, HOLDER_LIMIT),
+				(args, context) -> searchHolders(args.get(ITEM_QUERY), args.get(DIMENSION_ALL), args.get(NEAR), args.get(HOLDER_LIMIT),
+					holder -> holder.kind() != WorldIndex.Holder.Kind.ENTITY || !holder.items().isEmpty())),
+			Tool.of("search_entities",
+				"Find entities in the player's world that are named, tamed, or hold items: pets, named mobs, armor stands, "
+					+ "item frames, chest minecarts and boats, dropped items. Nearest first.",
+				world, List.of(ENTITY_QUERY, DIMENSION_ALL, NEAR, HOLDER_LIMIT),
+				(args, context) -> searchHolders(args.get(ENTITY_QUERY), args.get(DIMENSION_ALL), args.get(NEAR), args.get(HOLDER_LIMIT),
+					holder -> holder.kind() == WorldIndex.Holder.Kind.ENTITY)),
+			Tool.of("get_player", "The player's position, dimension, inventory and ender chest.",
+				world, List.of(), (args, context) -> getPlayer()),
+			Tool.of("find_structures",
+				"Find structures near the player, nearest first: like /locate, but returns several and can skip ones the player "
+					+ "has already visited. \"Visited\" means " + VISITED_RULE + " of some part of the structure (Minecraft's "
+					+ "per-chunk InhabitedTime, at most of any chunk its pieces cover); structures in never-generated land are "
+					+ "always unvisited. x/z is the /locate position; each result also has the structure's bounding box, its "
+					+ "pieces (rooms and parts, by template or class name, with counts, e.g. \"end_city/ship\", "
+					+ "\"village/plains/houses/plains_temple_3\", \"stronghold/library\") and the biomes they occupy (share of "
+					+ "sampled cells), all worked out from the seed exactly as generation would, without generating anything. "
+					+ "Pieces say what generates, not what's still there (looted chests, a taken elytra). The biome filter "
+					+ "matches a structure if any of its pieces is in that biome, so a fortress that starts in a crimson forest "
+					+ "and reaches into a warped forest counts as in a warped forest. Structure ids are listed under "
+					+ "data/<namespace>/worldgen/structure in the reference files.",
+				world, List.of(STRUCTURE, IN_BIOME, MIN_BIOME_SHARE, DIMENSION_WHERE_IT_EXISTS, VISITED, WITH_PIECES, MIN_DISTANCE,
+					STRUCTURE_RANGE, FEW_RESULTS),
+				this::findStructures),
+			Tool.of("find_blocks",
+				"Find the placed blocks nearest the player, by block id or tag, optionally narrowed by block state properties "
+					+ "and by text in the block's data (its block entity). Examples: a skeleton spawner is block \"spawner\" with "
+					+ "data \"skeleton\"; a fully charged respawn anchor is block \"respawn_anchor\" with properties {\"charges\": \"4\"}. "
+					+ "Searches the player's dimension first, then the others (only the player's with max_distance); in another "
+					+ "dimension, distances are from the player's position translated there (x/8 in the Nether). Covers loaded "
+					+ "chunks live and every saved chunk; it can't tell who placed a block. Block ids match the "
+					+ "block.<namespace>.<id> keys in the lang files; use search_containers for what's inside chests.",
+				world, List.of(BLOCK, PROPERTIES, BLOCK_DATA, DIMENSION_ONLY, BLOCKS_NEAR, BLOCK_LIMIT),
+				this::findBlocks),
+			Tool.of("find_biomes",
+				"Find patches of a biome near the player, nearest first: like /locate biome, but returns several separate "
+					+ "patches. Worked out from the seed without generating anything, sampling every 32 blocks across and 64 up "
+					+ "and down, so patches smaller than that can be missed. Searches the player's dimension, or where the biome "
+					+ "exists if not there (a warped forest asked about from the Overworld is searched in the Nether, around the "
+					+ "player's position / 8). y is a height where the biome is: underground biomes like deep_dark and lush_caves "
+					+ "are found at their depth. Biome ids are under data/<namespace>/worldgen/biome in the reference files.",
+				world, List.of(BIOME, DIMENSION_WHERE_IT_EXISTS, VISITED, MIN_SPACING, BIOME_RANGE, FEW_RESULTS),
+				this::findBiomes),
+			Tool.of("inspect_location",
+				"What's at a position: the block, its state and data, the biome, and the column's top block. Loaded chunks are "
+					+ "read live and other generated chunks from the last save. Chunks that were never generated are predicted from "
+					+ "the seed without generating them: the biome is exact, but the block is only the base terrain (stone, water, "
+					+ "lava or air, before grass and other surface blocks, caves from carvers, trees, ores and structures). "
+					+ "\"source\" says which applies.",
+				world, List.of(X, Y, Z, DIMENSION_OR_PLAYERS),
+				this::inspectLocation),
+			Tool.of("search_structure_templates",
+				"Search structure templates, the .nbt building blocks that structures are made of (a village house, an ancient "
+					+ "city room, a modded tower), by the blocks they contain. Use it to identify a structure the player describes "
+					+ "(\"a small tower of mossy stone bricks with a spawner\"): pass the blocks they mention. Templates containing "
+					+ "the most of the requested blocks come first, then those with many of them that also make up much of the build. "
+					+ "Big buildings are often split into several templates (a main building plus add-ons), so look past small "
+					+ "pieces. Templates with several block variants (palettes) match on any of them. Covers Minecraft, mods, the "
+					+ "world's data packs and templates saved in the world with a structure block. Each result says which structures "
+					+ "can place it (traced through template pools; structures that place templates from code, like igloos or many "
+					+ "mods' own structures, aren't traced, so that list can be empty). Template files are gzipped NBT and can't be "
+					+ "read with Read; use inspect_structure_template for one template's details. Give blocks, a query, or both.",
+				world, List.of(TEMPLATE_BLOCKS, TEMPLATE_QUERY, MAX_SIZE, TEMPLATE_LIMIT),
+				this::searchTemplates),
+			Tool.of("inspect_structure_template",
+				"One structure template in detail: size, every block with its count, chests (with loot tables), spawners and "
+					+ "other block entities, entities, jigsaw connectors (which pools it attaches to), and the structures that can "
+					+ "place it. With layers, also draws it as text, one horizontal slice per y level: rows run north to south, "
+					+ "columns west to east, '.' is air, ' ' is nothing (structure void or not part of it: keeps whatever was there), "
+					+ "and a legend maps the other characters to blocks. Blocks shown are before processors run, so a structure may "
+					+ "swap some in the world (cracked or mossy variants, random ores, decay).",
+				world, List.of(TEMPLATE, LAYERS, Y_FROM, Y_TO),
+				this::inspectTemplate),
+			Tool.of("list_schematics",
+				"List the player's schematic files (Litematica .litematic, WorldEdit .schem, structure .nbt) from their "
+					+ "schematics folder, with name, author, size, and block count where the file records one (Litematica). The files "
+					+ "are gzipped NBT and can't be read with Read; use inspect_schematic.",
+				world, List.of(SCHEMATIC_QUERY),
+				(args, context) -> listSchematics(args.get(SCHEMATIC_QUERY))),
+			Tool.of("inspect_schematic",
+				"A schematic's material list and contents. \"materials\" is the items needed to place every block, counted "
+					+ "like Litematica's material list (a double slab is 2 slabs, a door is 1 item, redstone wire is redstone dust, "
+					+ "water sources are water buckets). \"crafting\" breaks crafted components (pistons, repeaters, observers, "
+					+ "torches, hoppers...) down into ingredients using the game's recipes, and \"base_materials\" is the total "
+					+ "after that, e.g. all the redstone dust including what goes into pistons. Shapes of one material (planks, "
+					+ "slabs, trapdoors, storage blocks) aren't broken down. With compare_with, also checks a container in the "
+					+ "world (a chest's custom name, x y z, or \"inventory\": what the player carries plus their ender chest) "
+					+ "including shulker boxes in it: what's missing as placed, and what's still missing if the player crafts "
+					+ "components from what's there; \"useful_contents\" is what they hold of the materials and their ingredients, "
+					+ "\"not_needed\" the rest. With layers, draws it like inspect_structure_template.",
+				world, List.of(SCHEMATIC, COMPARE_WITH, LAYERS, Y_FROM, Y_TO),
+				this::inspectSchematic));
 	}
 
 	// --- containers and entities ----------------------------------------------------------------------------------
 
 	/**
 	 * {@code kind} picks which holders the tool covers (the player's inventory and ender chest are holders too, so
-	 * "where are my emeralds?" finds the ones in their pockets).
+	 * "where are my emeralds?" finds the ones in their pockets). An empty query finds every holder of that kind.
 	 */
-	private JsonElement searchHolders(JsonObject args, Predicate<WorldIndex.Holder> kind, boolean queryRequired) throws Exception {
-		String query = string(args, "query", "").trim().toLowerCase(Locale.ROOT);
-		if (queryRequired && query.isEmpty()) {
-			throw new IllegalArgumentException("query is required");
-		}
-		int maxDistance = integer(args, "max_distance", Integer.MAX_VALUE);
-		int limit = Math.max(1, Math.min(50, integer(args, "limit", 10)));
+	private Tool.Result searchHolders(String queryText, String dimensionArgument, OptionalInt near, int limit,
+		Predicate<WorldIndex.Holder> kind) throws Exception {
+		String query = queryText.toLowerCase(Locale.ROOT);
+		int maxDistance = near.orElse(Integer.MAX_VALUE);
 
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.HOLDERS);
 		MinecraftServer server = snapshot.server();
 		WorldIndex.PlayerInfo host = snapshot.host();
-		Optional<ResourceKey<Level>> requested = Dimensions.parse(string(args, "dimension", ""), server.levelKeys());
-		List<ResourceKey<Level>> dimensions = Dimensions.searchOrder(host.dimension(), requested, maxDistance < Integer.MAX_VALUE, server.levelKeys());
+		Optional<ResourceKey<Level>> requested = Dimensions.parse(dimensionArgument, server.levelKeys());
+		List<ResourceKey<Level>> dimensions = Dimensions.searchOrder(host.dimension(), requested, near.isPresent(), server.levelKeys());
 		Map<ResourceKey<Level>, Origin> origins = new HashMap<>();
 		dimensions.forEach(dimension -> origins.put(dimension, originIn(server, host.origin(), dimension)));
 
@@ -329,10 +316,10 @@ public final class WorldTools {
 			r.addProperty("x", h.x());
 			r.addProperty("y", h.y());
 			r.addProperty("z", h.z());
-			addDirection(r, hit.origin(), h.x(), (double) h.y(), h.z());
+			ToolFormat.addDirection(r, hit.origin(), h.x(), (double) h.y(), h.z());
 			r.addProperty("data", h.provenance().label());
 			if (h.lootTable() != null) {
-				r.addProperty("unopened_loot_table", h.lootTable());
+				r.addProperty("unopened_loot_table", ToolFormat.id(h.lootTable()));
 			}
 			if (!hit.matches().isEmpty()) {
 				JsonArray matches = new JsonArray();
@@ -348,12 +335,12 @@ public final class WorldTools {
 		}
 		out.add("results", results);
 		if (hits.size() > limit) {
-			out.addProperty("note", (hits.size() - limit) + " more not shown; raise limit or narrow the search.");
+			ToolFormat.noteMore(out, (hits.size() - limit) + " more; raise limit or narrow the search.");
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
-	/** Matching stacks, including inside shulker boxes and bundles ("32 Emerald (minecraft:emerald) inside Shulker Box"). */
+	/** Matching stacks, including inside shulker boxes and bundles ("32 Emerald (emerald) inside Shulker Box"). */
 	private static void collectMatches(List<WorldIndex.Item> items, String query, String inside, List<String> out, int[] count) {
 		for (WorldIndex.Item item : items) {
 			boolean matches = !query.isEmpty() && (item.id().equals(query) || item.id().equals("minecraft:" + query)
@@ -361,9 +348,7 @@ public final class WorldTools {
 				|| item.enchantments().stream().anyMatch(e -> contains(e, query)));
 			if (matches) {
 				count[0] += item.count();
-				out.add(item.count() + " " + item.name() + " (" + item.id() + ")"
-					+ (item.enchantments().isEmpty() ? "" : " {" + String.join(", ", item.enchantments()) + "}")
-					+ (inside != null ? " inside " + inside : ""));
+				out.add(itemText(item) + (inside != null ? " inside " + inside : ""));
 			}
 			if (!item.contents().isEmpty()) {
 				collectMatches(item.contents(), query, item.name() + (inside != null ? " inside " + inside : ""), out, count);
@@ -389,7 +374,7 @@ public final class WorldTools {
 	}
 
 	/** Every player, the host (whose game this is) first. */
-	private JsonElement getPlayer() throws Exception {
+	private Tool.Result getPlayer() throws Exception {
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.VISITS);
 		UUID hostId = snapshot.host().id();
 		List<WorldIndex.PlayerInfo> hostFirst = snapshot.players().stream()
@@ -402,17 +387,14 @@ public final class WorldTools {
 			o.add("ender_chest", itemsJson(p.enderChest()));
 			players.add(o);
 		}
-		return players;
+		return Tool.Result.of(players);
 	}
 
 	// --- structures -----------------------------------------------------------------------------------------------
 
-	private JsonElement findStructures(JsonObject args) throws Exception {
-		String query = string(args, "structure", "");
-		Visit.Filter visited = Visit.Filter.parse(string(args, "visited", "any"));
-		int minDistance = integer(args, "min_distance", 0);
-		int maxDistance = Math.max(16, Math.min(30_000, integer(args, "max_distance", 8000)));
-		int limit = Math.max(1, Math.min(20, integer(args, "limit", 5)));
+	private Tool.Result findStructures(Arguments args, Tool.Context context) throws Exception {
+		String query = args.get(STRUCTURE);
+		int maxDistance = args.get(STRUCTURE_RANGE);
 
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.VISITS);
 		MinecraftServer server = snapshot.server();
@@ -425,39 +407,37 @@ public final class WorldTools {
 		if (structures.isEmpty()) {
 			throw new IllegalArgumentException("No structure or structure tag matches \"" + query + "\". Structure ids are under data/<namespace>/worldgen/structure.");
 		}
-		Set<String> biomes = biomeIds(server, string(args, "biome", ""));
-		int minShare = Math.max(0, Math.min(100, integer(args, "min_biome_share", 0)));
+		Set<String> biomes = biomeIds(server, args.get(IN_BIOME));
+		int minShare = args.get(MIN_BIOME_SHARE);
 		if (minShare > 0 && biomes.isEmpty()) {
 			throw new IllegalArgumentException("min_biome_share needs a biome.");
 		}
 		// "ship" or "temple" → matched against piece names like "end_city/ship" or "village/plains/houses/plains_temple_3".
-		List<String> pieceTerms = strings(args, "with_pieces").stream()
-			.map(t -> t.toLowerCase(Locale.ROOT).replace(' ', '_')).toList();
+		List<String> pieceTerms = args.get(WITH_PIECES).stream().map(t -> t.toLowerCase(Locale.ROOT).replace(' ', '_')).toList();
 
-		Optional<ResourceKey<Level>> requested = Dimensions.parse(string(args, "dimension", ""), server.levelKeys());
+		Optional<ResourceKey<Level>> requested = Dimensions.parse(args.get(DIMENSION_WHERE_IT_EXISTS), server.levelKeys());
 		// The generator's placements are worked out lazily on first use, which only the server thread may do.
 		List<ResourceKey<Level>> generatesIn = ServerTasks.call(server, () -> dimensionsWhere(server, level -> structures.stream()
 			.anyMatch(s -> !level.getChunkSource().getGeneratorState().getPlacementsForStructure(s).isEmpty())),
 			Duration.ofSeconds(20), "Finding where the structure generates");
 		ResourceKey<Level> dimension = Dimensions.whereItExists(host.dimension(), requested, generatesIn, "\"" + query + "\"");
 		Origin origin = originIn(server, host.origin(), dimension);
-		StructureFinder.Request request = new StructureFinder.Request(structures, minDistance, maxDistance, limit, visited, pieceTerms,
-			biomes, minShare);
+		StructureFinder.Request request = new StructureFinder.Request(structures, args.get(MIN_DISTANCE), maxDistance, args.get(FEW_RESULTS),
+			args.get(VISITED), pieceTerms, biomes, minShare);
 		List<StructureFinder.Found> found = StructureFinder.find(server.getLevel(dimension), origin, request, snapshot);
 
 		JsonObject out = new JsonObject();
 		out.add("player", playerPosition(host));
-		out.addProperty("searched", structures.size() == 1 ? RegistryQuery.id(structures.getFirst())
-			: structures.size() + " structure types matching \"" + query + "\"");
+		out.addProperty("searched", ToolFormat.searched(structures.stream().map(ToolFormat::id).toList(), query, "structure types"));
 		out.addProperty("dimension", Dimensions.name(dimension));
 		addOriginNote(out, List.of(origin));
 		JsonArray results = new JsonArray();
 		for (StructureFinder.Found f : found) {
 			JsonObject r = new JsonObject();
-			r.addProperty("structure", f.structure());
+			r.addProperty("structure", ToolFormat.id(f.structure()));
 			r.addProperty("x", f.x());
 			r.addProperty("z", f.z());
-			addDirection(r, origin, f.x(), null, f.z());
+			ToolFormat.addDirection(r, origin, f.x(), null, f.z());
 			r.addProperty("generated", f.visit().generated());
 			r.addProperty("time_players_spent_nearby_seconds", f.visit().seconds());
 			r.addProperty("visited", f.visit().visited());
@@ -467,7 +447,7 @@ public final class WorldTools {
 			JsonObject shares = new JsonObject();
 			footprint.biomeSamples().entrySet().stream()
 				.sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
-				.forEach(e -> shares.addProperty(e.getKey(), Math.max(1, Math.round(100f * e.getValue() / footprint.totalSamples())) + "%"));
+				.forEach(e -> shares.addProperty(ToolFormat.id(e.getKey()), Math.max(1, Math.round(100f * e.getValue() / footprint.totalSamples())) + "%"));
 			r.add("biomes", shares);
 			if (!biomes.isEmpty()) {
 				r.addProperty("share_in_requested_biome", Math.round(footprint.share(biomes)) + "%");
@@ -483,12 +463,12 @@ public final class WorldTools {
 		if (found.isEmpty()) {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
-	/** The ids of the biomes a biome argument names; none for a blank argument. */
+	/** The full ids of the biomes a biome argument names; none for a blank argument. */
 	private static Set<String> biomeIds(MinecraftServer server, String query) {
-		if (query.isBlank()) {
+		if (query.isEmpty()) {
 			return Set.of();
 		}
 		Set<String> biomes = new HashSet<>();
@@ -502,24 +482,19 @@ public final class WorldTools {
 
 	// --- blocks ---------------------------------------------------------------------------------------------------
 
-	private JsonElement findBlocks(JsonObject args) throws Exception {
-		String blockQuery = string(args, "block", "");
-		String data = string(args, "data", "").trim().toLowerCase(Locale.ROOT);
-		int maxDistance = integer(args, "max_distance", Integer.MAX_VALUE);
-		int limit = Math.max(1, Math.min(30, integer(args, "limit", 5)));
+	private Tool.Result findBlocks(Arguments args, Tool.Context context) throws Exception {
+		String blockQuery = args.get(BLOCK);
+		OptionalInt near = args.get(BLOCKS_NEAR);
+		int maxDistance = near.orElse(Integer.MAX_VALUE);
+		int limit = args.get(BLOCK_LIMIT);
 
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.VISITS);
 		MinecraftServer server = snapshot.server();
 		WorldIndex.PlayerInfo host = snapshot.host();
-		List<Block> blocks = BlockFinder.resolve(server.registryAccess(), blockQuery);
-		if (blocks.isEmpty()) {
-			throw new IllegalArgumentException("No block or block tag matches \"" + blockQuery + "\".");
-		}
-		Map<String, String> properties = properties(args);
-		checkProperties(blocks, properties);
-		BlockFinder.Query query = new BlockFinder.Query(new HashSet<>(blocks), properties, data);
-		Optional<ResourceKey<Level>> requested = Dimensions.parse(string(args, "dimension", ""), server.levelKeys());
-		List<ResourceKey<Level>> dimensions = Dimensions.searchOrder(host.dimension(), requested, maxDistance < Integer.MAX_VALUE, server.levelKeys());
+		List<Block> blocks = resolveBlocks(server, blockQuery);
+		BlockFinder.Query query = BlockFinder.Query.of(blocks, args.get(PROPERTIES), args.get(BLOCK_DATA));
+		Optional<ResourceKey<Level>> requested = Dimensions.parse(args.get(DIMENSION_ONLY), server.levelKeys());
+		List<ResourceKey<Level>> dimensions = Dimensions.searchOrder(host.dimension(), requested, near.isPresent(), server.levelKeys());
 
 		// The player's dimension first; other dimensions only fill the remaining slots.
 		JsonArray results = new JsonArray();
@@ -543,40 +518,38 @@ public final class WorldTools {
 		JsonObject out = new JsonObject();
 		out.add("player", playerPosition(host));
 		addOriginNote(out, origins);
-		out.addProperty("searched", blocks.size() == 1 ? BuiltInRegistries.BLOCK.getKey(blocks.getFirst()).toString()
-			: blocks.size() + " block types matching \"" + blockQuery + "\"");
+		out.addProperty("searched", ToolFormat.searched(blocks.stream().map(ToolFormat::id).toList(), blockQuery, "block types"));
 		out.add("results", results);
 		out.addProperty("saved_chunks_read", chunksRead);
 		if (truncated) {
-			out.addProperty("note", "Stopped after reading the nearest saved chunks that could hold this block; farther ones weren't searched.");
+			ToolFormat.noteMore(out, "Stopped after reading the nearest saved chunks that could hold this block; farther ones weren't searched.");
 		} else if (results.isEmpty()) {
-			out.addProperty("note", "None found in any generated chunk" + (maxDistance < Integer.MAX_VALUE ? " within " + maxDistance + " blocks." : "."));
+			out.addProperty("note", "None found in any generated chunk" + (near.isPresent() ? " within " + maxDistance + " blocks." : "."));
 		}
-		return out;
+		return Tool.Result.of(out);
+	}
+
+	/** Blocks matching a query: an id, a tag, or a word ("anchor" → respawn_anchor); see {@link RegistryQuery#resolve}. */
+	private static List<Block> resolveBlocks(MinecraftServer server, String query) {
+		List<Block> blocks = RegistryQuery.resolve(server.registryAccess(), Registries.BLOCK, query, RegistryQuery.Precedence.ID_FIRST)
+			.stream().map(Holder::value).toList();
+		if (blocks.isEmpty()) {
+			throw new IllegalArgumentException("No block or block tag matches \"" + query + "\".");
+		}
+		return blocks;
 	}
 
 	private static JsonObject blockJson(BlockFinder.Found found, Origin origin) {
 		JsonObject r = new JsonObject();
-		addBlockState(r, found.state());
+		ToolFormat.addBlockState(r, found.state());
 		r.addProperty("dimension", Dimensions.name(origin.dimension()));
 		r.addProperty("x", found.pos().getX());
 		r.addProperty("y", found.pos().getY());
 		r.addProperty("z", found.pos().getZ());
-		addDirection(r, origin, found.pos().getX(), (double) found.pos().getY(), found.pos().getZ());
+		ToolFormat.addDirection(r, origin, found.pos().getX(), (double) found.pos().getY(), found.pos().getZ());
 		r.addProperty("data", found.provenance().label());
 		addBlockEntity(r, found.blockEntity());
 		return r;
-	}
-
-	/** "block": "minecraft:respawn_anchor", "properties": {"charges": "4"}. */
-	private static void addBlockState(JsonObject r, BlockState state) {
-		r.addProperty("block", BlockFinder.id(state));
-		Map<String, String> properties = BlockFinder.properties(state);
-		if (!properties.isEmpty()) {
-			JsonObject props = new JsonObject();
-			properties.forEach(props::addProperty);
-			r.add("properties", props);
-		}
 	}
 
 	/** The block entity's data as trimmed SNBT, plus "spawns" for spawners. */
@@ -585,7 +558,7 @@ public final class WorldTools {
 			// Spawners and trial spawners keep the mob in SpawnData; say it plainly rather than leave it in the SNBT.
 			blockEntity.getCompound("SpawnData").flatMap(spawn -> spawn.getCompound("entity"))
 				.map(entity -> entity.getStringOr("id", "")).filter(id -> !id.isEmpty())
-				.ifPresent(id -> r.addProperty("spawns", id));
+				.ifPresent(id -> r.addProperty("spawns", ToolFormat.id(id)));
 			CompoundTag trimmed = blockEntity.copy();
 			for (String key : List.of("id", "x", "y", "z", "keepPacked", "components")) {
 				trimmed.remove(key);
@@ -597,14 +570,45 @@ public final class WorldTools {
 		}
 	}
 
+	/** The find_blocks "properties" argument: {"charges": "4"}, or the same written as "charges=4,facing=north". */
+	private static JsonObject propertiesSchema() {
+		JsonObject value = new JsonObject();
+		value.addProperty("type", "string");
+		JsonObject schema = new JsonObject();
+		schema.addProperty("type", "object");
+		schema.add("additionalProperties", value);
+		schema.addProperty("description", "Block state properties that must match, e.g. {\"charges\": \"4\"} or {\"facing\": \"north\"}.");
+		return schema;
+	}
+
+	private static Map<String, String> properties(JsonElement element) {
+		Map<String, String> properties = new LinkedHashMap<>();
+		if (element.isJsonObject()) {
+			for (Map.Entry<String, JsonElement> e : element.getAsJsonObject().entrySet()) {
+				if (!e.getValue().isJsonPrimitive()) {
+					throw new IllegalArgumentException("values must be text, like {\"charges\": \"4\"}, not " + e.getValue() + ".");
+				}
+				properties.put(e.getKey().trim(), e.getValue().getAsString().trim().toLowerCase(Locale.ROOT));
+			}
+		} else if (element.isJsonPrimitive()) {
+			for (String pair : element.getAsString().replaceAll("[\\[\\]{}]", "").split(",")) {
+				String[] kv = pair.split("[=:]", 2);
+				if (kv.length != 2) {
+					throw new IllegalArgumentException("must be pairs like \"charges=4,facing=north\", not \"" + element.getAsString() + "\".");
+				}
+				properties.put(kv[0].trim().replace("\"", ""), kv[1].trim().replace("\"", "").toLowerCase(Locale.ROOT));
+			}
+		} else {
+			throw new IllegalArgumentException("must be an object like {\"charges\": \"4\"}, not " + element + ".");
+		}
+		return properties;
+	}
+
 	// --- biomes --------------------------------------------------------------------------------------------------
 
-	private JsonElement findBiomes(JsonObject args) throws Exception {
-		String query = string(args, "biome", "");
-		Visit.Filter visited = Visit.Filter.parse(string(args, "visited", "any"));
-		int minSpacing = Math.max(32, integer(args, "min_spacing", 256));
-		int maxDistance = Math.max(32, Math.min(30_000, integer(args, "max_distance", 6400)));
-		int limit = Math.max(1, Math.min(20, integer(args, "limit", 5)));
+	private Tool.Result findBiomes(Arguments args, Tool.Context context) throws Exception {
+		String query = args.get(BIOME);
+		int maxDistance = args.get(BIOME_RANGE);
 
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.VISITS);
 		MinecraftServer server = snapshot.server();
@@ -613,117 +617,70 @@ public final class WorldTools {
 		if (biomes.isEmpty()) {
 			throw new IllegalArgumentException("No biome or biome tag matches \"" + query + "\". Biome ids are under data/<namespace>/worldgen/biome.");
 		}
-		Optional<ResourceKey<Level>> requested = Dimensions.parse(string(args, "dimension", ""), server.levelKeys());
+		Optional<ResourceKey<Level>> requested = Dimensions.parse(args.get(DIMENSION_WHERE_IT_EXISTS), server.levelKeys());
 		List<ResourceKey<Level>> existsIn = dimensionsWhere(server,
 			level -> level.getChunkSource().getGenerator().getBiomeSource().possibleBiomes().stream().anyMatch(biomes::contains));
 		ResourceKey<Level> dimension = Dimensions.whereItExists(host.dimension(), requested, existsIn, "\"" + query + "\"");
 		Origin origin = originIn(server, host.origin(), dimension);
-		BiomeFinder.Request request = new BiomeFinder.Request(biomes, maxDistance, minSpacing, limit, visited);
+		BiomeFinder.Request request = new BiomeFinder.Request(biomes, maxDistance, args.get(MIN_SPACING), args.get(FEW_RESULTS), args.get(VISITED));
 		BiomeFinder.Result result = BiomeFinder.find(server.getLevel(dimension), origin, request, snapshot.visits(dimension));
 
 		JsonObject out = new JsonObject();
 		out.add("player", playerPosition(host));
-		out.addProperty("searched", biomes.size() == 1 ? RegistryQuery.id(biomes.iterator().next())
-			: biomes.size() + " biomes matching \"" + query + "\"");
+		out.addProperty("searched", ToolFormat.searched(biomes.stream().map(ToolFormat::id).toList(), query, "biomes"));
 		out.addProperty("dimension", Dimensions.name(dimension));
 		addOriginNote(out, List.of(origin));
 		JsonArray results = new JsonArray();
 		for (BiomeFinder.Found f : result.found()) {
 			JsonObject r = new JsonObject();
-			r.addProperty("biome", f.biome());
+			r.addProperty("biome", ToolFormat.id(f.biome()));
 			r.addProperty("x", f.x());
 			r.addProperty("y", f.y());
 			r.addProperty("z", f.z());
-			addDirection(r, origin, f.x(), null, f.z());
+			ToolFormat.addDirection(r, origin, f.x(), null, f.z());
 			r.addProperty("generated", f.visit().generated());
 			r.addProperty("visited", f.visit().visited());
 			results.add(r);
 		}
 		out.add("results", results);
 		if (result.truncated()) {
-			out.addProperty("note", "Stopped early: the search area was too large. Narrow max_distance to search farther in parts.");
+			ToolFormat.noteMore(out, "Stopped early: the search area was too large. Narrow max_distance to search farther in parts.");
 		} else if (results.isEmpty()) {
 			out.addProperty("note", "None found within " + maxDistance + " blocks with these filters.");
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
 	// --- one position ---------------------------------------------------------------------------------------------
 
-	private JsonElement inspectLocation(JsonObject args) throws Exception {
-		if (args == null || !args.has("x") || !args.has("z")) {
-			throw new IllegalArgumentException("x and z are required");
-		}
-		int x = integer(args, "x", 0);
-		int z = integer(args, "z", 0);
-		Integer y = args.has("y") && !args.get("y").isJsonNull() ? integer(args, "y", 0) : null;
+	private Tool.Result inspectLocation(Arguments args, Tool.Context context) throws Exception {
+		int x = args.get(X);
+		int z = args.get(Z);
+		OptionalInt y = args.get(Y);
 
 		WorldIndex.Snapshot snapshot = index.snapshot(WorldIndex.Detail.VISITS);
 		MinecraftServer server = snapshot.server();
 		WorldIndex.PlayerInfo host = snapshot.host();
-		ResourceKey<Level> dimension = Dimensions.parse(string(args, "dimension", ""), server.levelKeys()).orElse(host.dimension());
+		ResourceKey<Level> dimension = Dimensions.parse(args.get(DIMENSION_OR_PLAYERS), server.levelKeys()).orElse(host.dimension());
 		Origin origin = originIn(server, host.origin(), dimension);
 
-		LocationInspector.Inspection inspection = LocationInspector.inspect(snapshot, server.getLevel(dimension), x, y, z);
+		LocationInspector.Inspection inspection = LocationInspector.inspect(snapshot, server.getLevel(dimension), x,
+			y.isPresent() ? y.getAsInt() : null, z);
 		JsonObject out = new JsonObject();
 		out.addProperty("dimension", Dimensions.name(dimension));
 		out.addProperty("x", x);
 		out.addProperty("y", inspection.y());
 		out.addProperty("z", z);
-		addDirection(out, origin, x, (double) inspection.y(), z);
+		ToolFormat.addDirection(out, origin, x, (double) inspection.y(), z);
 		addOriginNote(out, List.of(origin));
 		out.addProperty("source", inspection.source().label());
-		addBlockState(out, inspection.state());
+		ToolFormat.addBlockState(out, inspection.state());
 		addBlockEntity(out, inspection.blockEntity());
-		out.addProperty("biome", inspection.biome());
+		out.addProperty("biome", ToolFormat.id(inspection.biome()));
 		if (inspection.surfaceY() != null) {
 			out.addProperty("top_block_y", inspection.surfaceY());
 		}
-		return out;
-	}
-
-	/** {"charges": "4"}, or the same written as "charges=4,facing=north". */
-	private static Map<String, String> properties(JsonObject args) {
-		Map<String, String> properties = new LinkedHashMap<>();
-		if (args == null || !args.has("properties")) {
-			return properties;
-		}
-		JsonElement element = args.get("properties");
-		if (element.isJsonObject()) {
-			element.getAsJsonObject().entrySet().forEach(e -> properties.put(e.getKey().trim(),
-				e.getValue().isJsonPrimitive() ? e.getValue().getAsString().trim().toLowerCase(Locale.ROOT) : e.getValue().toString()));
-		} else if (element.isJsonPrimitive()) {
-			for (String pair : element.getAsString().replaceAll("[\\[\\]{}]", "").split(",")) {
-				String[] kv = pair.split("[=:]", 2);
-				if (kv.length == 2) {
-					properties.put(kv[0].trim().replace("\"", ""), kv[1].trim().replace("\"", "").toLowerCase(Locale.ROOT));
-				}
-			}
-		}
-		return properties;
-	}
-
-	/** Fail with the valid names and values rather than silently finding nothing. */
-	private static void checkProperties(List<Block> blocks, Map<String, String> properties) {
-		for (Map.Entry<String, String> wanted : properties.entrySet()) {
-			boolean valid = blocks.stream().anyMatch(block -> {
-				Property<?> property = block.getStateDefinition().getProperty(wanted.getKey());
-				return property != null && property.getValue(wanted.getValue()).isPresent();
-			});
-			if (!valid) {
-				Block block = blocks.getFirst();
-				String available = block.getStateDefinition().getProperties().stream()
-					.map(p -> p.getName() + " (" + p.getPossibleValues().stream().map(v -> valueName(p, v)).collect(Collectors.joining("|")) + ")")
-					.collect(Collectors.joining(", "));
-				throw new IllegalArgumentException("Property " + wanted.getKey() + "=" + wanted.getValue() + " doesn't exist for "
-					+ BuiltInRegistries.BLOCK.getKey(block) + ". Its properties: " + (available.isEmpty() ? "none" : available));
-			}
-		}
-	}
-
-	@SuppressWarnings("unchecked")
-	private static <T extends Comparable<T>> String valueName(Property<T> property, Object value) {
-		return property.getName((T) value);
+		return Tool.Result.of(out);
 	}
 
 	// --- structure templates --------------------------------------------------------------------------------------
@@ -732,6 +689,8 @@ public final class WorldTools {
 	private static final String LAYER_SYMBOLS = "#ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789@$%&*+=!~^<>/|:;";
 	/** About 10k tokens of drawing. */
 	private static final int MAX_LAYER_CELLS = 40_000;
+	private static final int MAX_BLOCK_ENTITIES = 40;
+	private static final int MAX_TEMPLATE_ENTITIES = 30;
 
 	/**
 	 * Slow first-use work, in the background when the world opens or reloads: the structure template index, the
@@ -768,35 +727,27 @@ public final class WorldTools {
 		}
 	}
 
-	private JsonElement searchTemplates(JsonObject args) throws Exception {
-		MinecraftServer server = index.server();
-		if (server == null) {
-			throw new IllegalStateException("No single-player world open.");
-		}
-		List<String> terms = strings(args, "blocks");
-		String query = string(args, "query", "").trim();
-		int limit = Math.max(1, Math.min(30, integer(args, "limit", 10)));
+	private Tool.Result searchTemplates(Arguments args, Tool.Context context) throws Exception {
+		MinecraftServer server = server();
+		List<String> terms = args.get(TEMPLATE_BLOCKS);
+		String query = args.get(TEMPLATE_QUERY);
+		int limit = args.get(TEMPLATE_LIMIT);
 		if (terms.isEmpty() && query.isEmpty()) {
 			throw new IllegalArgumentException("Give blocks, a query, or both.");
 		}
 		Map<String, Set<Block>> wanted = new LinkedHashMap<>();
 		for (String term : terms) {
-			List<Block> blocks = BlockFinder.resolve(server.registryAccess(), term);
-			if (blocks.isEmpty()) {
-				throw new IllegalArgumentException("No block or block tag matches \"" + term + "\".");
-			}
-			wanted.put(term, new HashSet<>(blocks));
+			wanted.put(term, new HashSet<>(resolveBlocks(server, term)));
 		}
 
 		StructureTemplates.Index templateIndex = templates.index(server);
 		StructureTemplates.SearchResult found = StructureTemplates.search(templateIndex,
-			new StructureTemplates.Query(wanted, query, integer(args, "max_size", Integer.MAX_VALUE)));
+			new StructureTemplates.Query(wanted, query, args.get(MAX_SIZE).orElse(Integer.MAX_VALUE)));
 		List<StructureTemplates.Hit> hits = found.hits();
 
 		JsonObject out = new JsonObject();
 		JsonObject searched = new JsonObject();
-		wanted.forEach((term, blocks) -> searched.addProperty(term, blocks.size() == 1
-			? StructureTemplates.id(blocks.iterator().next()) : blocks.size() + " blocks"));
+		wanted.forEach((term, blocks) -> searched.addProperty(term, ToolFormat.searched(blocks.stream().map(ToolFormat::id).toList(), term, "blocks")));
 		if (!wanted.isEmpty()) {
 			out.add("searched_blocks", searched);
 		}
@@ -812,9 +763,9 @@ public final class WorldTools {
 		for (StructureTemplates.Hit hit : hits.subList(0, Math.min(limit, hits.size()))) {
 			StructureTemplates.Summary t = hit.template();
 			JsonObject r = new JsonObject();
-			r.addProperty("template", t.id().toString());
+			r.addProperty("template", ToolFormat.id(t.id()));
 			r.addProperty("from", t.origin().describe());
-			r.addProperty("size", sizeText(t.size()));
+			r.addProperty("size", ToolFormat.size(t.size()));
 			r.addProperty("solid_blocks", t.countedBlocks());
 			if (!wanted.isEmpty()) {
 				JsonObject matching = new JsonObject();
@@ -824,11 +775,11 @@ public final class WorldTools {
 			}
 			JsonArray main = new JsonArray();
 			t.blockCounts().entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).limit(6)
-				.forEach(e -> main.add(StructureTemplates.id(e.getKey()) + " ×" + e.getValue()));
+				.forEach(e -> main.add(ToolFormat.id(e.getKey()) + " ×" + e.getValue()));
 			r.add("main_blocks", main);
 			if (!t.entityCounts().isEmpty()) {
 				JsonObject entities = new JsonObject();
-				t.entityCounts().forEach(entities::addProperty);
+				t.entityCounts().forEach((type, count) -> entities.addProperty(ToolFormat.id(type), count));
 				r.add("entities", entities);
 			}
 			addTemplateUsage(r, templateIndex, t.id(), 6);
@@ -836,17 +787,14 @@ public final class WorldTools {
 		}
 		out.add("results", results);
 		if (hits.size() > limit) {
-			out.addProperty("more", (hits.size() - limit) + " more not shown; add blocks, a query or max_size to narrow it.");
+			ToolFormat.noteMore(out, (hits.size() - limit) + " more; add blocks, a query or max_size to narrow it.");
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
-	private JsonElement inspectTemplate(JsonObject args) throws Exception {
-		MinecraftServer server = index.server();
-		if (server == null) {
-			throw new IllegalStateException("No single-player world open.");
-		}
-		String name = string(args, "template", "").trim().replaceFirst("\\.nbt$", "");
+	private Tool.Result inspectTemplate(Arguments args, Tool.Context context) throws Exception {
+		MinecraftServer server = server();
+		String name = args.get(TEMPLATE).replaceFirst("\\.nbt$", "");
 		Identifier id = Identifier.tryParse(name);
 		if (id == null) {
 			throw new IllegalArgumentException("\"" + name + "\" isn't a valid template id.");
@@ -854,15 +802,15 @@ public final class WorldTools {
 		StructureTemplates.Index templateIndex = templates.index(server);
 		StructureTemplates.Template t = StructureTemplates.load(server, id).orElse(null);
 		if (t == null) {
-			List<String> similar = templateIndex.similarTo(id, 10).stream().map(Identifier::toString).toList();
-			throw new IllegalArgumentException("No structure template " + id + "."
+			List<String> similar = templateIndex.similarTo(id, 10).stream().map(ToolFormat::id).toList();
+			throw new IllegalArgumentException("No structure template " + ToolFormat.id(id) + "."
 				+ (similar.isEmpty() ? " Use search_structure_templates to find one." : " Similar: " + String.join(", ", similar)));
 		}
 
 		JsonObject out = new JsonObject();
-		out.addProperty("template", id.toString());
+		out.addProperty("template", ToolFormat.id(id));
 		out.addProperty("from", t.origin().describe());
-		out.addProperty("size", sizeText(t.volume().size()));
+		out.addProperty("size", ToolFormat.size(t.volume().size()));
 		if (t.palettes() > 1) {
 			out.addProperty("palettes", t.palettes() + " block variants, one picked at random when placed; showing the first");
 		}
@@ -870,14 +818,17 @@ public final class WorldTools {
 		out.addProperty("solid_blocks", counts.values().stream().mapToInt(Integer::intValue).sum());
 		JsonObject blocks = new JsonObject();
 		counts.entrySet().stream().sorted(Map.Entry.<Block, Integer>comparingByValue().reversed()).limit(100)
-			.forEach(e -> blocks.addProperty(StructureTemplates.id(e.getKey()), e.getValue()));
+			.forEach(e -> blocks.addProperty(ToolFormat.id(e.getKey()), e.getValue()));
 		out.add("blocks", blocks);
+		if (counts.size() > 100) {
+			ToolFormat.noteMore(out, (counts.size() - 100) + " rarer kinds of block.");
+		}
 		addBlockEntities(out, t.volume());
 		addTemplateUsage(out, templateIndex, id, 20);
-		if (args != null && args.has("layers") && args.get("layers").getAsBoolean()) {
-			addLayers(out, t.volume(), args);
+		if (args.get(LAYERS)) {
+			addLayers(out, t.volume(), args.get(Y_FROM), args.get(Y_TO));
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
 	/** "block_entities" (chests with loot tables, spawners, signs...), "entities" and "jigsaw_connectors". */
@@ -885,32 +836,36 @@ public final class WorldTools {
 		JsonArray blockEntities = new JsonArray();
 		JsonArray jigsaws = new JsonArray();
 		int moreBlockEntities = 0;
+		int moreJigsaws = 0;
 		for (BlockVolume.BlockEntity b : volume.blockEntities()) {
 			JsonObject r = new JsonObject();
 			if (b.state().is(Blocks.JIGSAW)) {
-				r.addProperty("pos", posText(b.pos()));
-				String facing = BlockFinder.properties(b.state()).get("orientation");
+				if (jigsaws.size() >= MAX_BLOCK_ENTITIES) {
+					moreJigsaws++;
+					continue;
+				}
+				r.addProperty("pos", ToolFormat.position(b.pos()));
+				String facing = ToolFormat.properties(b.state()).get("orientation");
 				if (facing != null) {
 					r.addProperty("facing", facing);
 				}
-				for (String key : List.of("pool", "name", "target", "final_state")) {
+				for (String key : List.of("pool", "name", "target")) {
 					String value = b.data().getStringOr(key, "");
 					if (!value.isEmpty() && !value.equals("minecraft:empty")) {
-						r.addProperty(key.equals("final_state") ? "turns_into" : key, value);
+						r.addProperty(key, ToolFormat.id(value));
 					}
 				}
-				if (jigsaws.size() < 40) {
-					jigsaws.add(r);
-				}
+				b.data().getString("final_state").filter(state -> !state.isEmpty()).ifPresent(state -> r.addProperty("turns_into", ToolFormat.blockState(state)));
+				jigsaws.add(r);
 				continue;
 			}
-			if (blockEntities.size() >= 40) {
+			if (blockEntities.size() >= MAX_BLOCK_ENTITIES) {
 				moreBlockEntities++;
 				continue;
 			}
-			addBlockState(r, b.state());
-			r.addProperty("pos", posText(b.pos()));
-			b.data().getString("LootTable").ifPresent(loot -> r.addProperty("loot_table", loot));
+			ToolFormat.addBlockState(r, b.state());
+			r.addProperty("pos", ToolFormat.position(b.pos()));
+			b.data().getString("LootTable").ifPresent(loot -> r.addProperty("loot_table", ToolFormat.id(loot)));
 			CompoundTag rest = b.data().copy();
 			rest.remove("LootTable");
 			addBlockEntity(r, rest);
@@ -918,24 +873,30 @@ public final class WorldTools {
 		}
 		if (!blockEntities.isEmpty()) {
 			out.add("block_entities", blockEntities);
-			if (moreBlockEntities > 0) {
-				out.addProperty("more_block_entities", moreBlockEntities);
-			}
+		}
+		if (moreBlockEntities > 0) {
+			ToolFormat.noteMore(out, moreBlockEntities + " more block entities.");
 		}
 		if (!volume.entities().isEmpty()) {
 			JsonArray entities = new JsonArray();
-			volume.entities().stream().limit(30).forEach(e -> entities.add(e.type() + " at " + posText(e.pos())));
+			volume.entities().stream().limit(MAX_TEMPLATE_ENTITIES)
+				.forEach(e -> entities.add(ToolFormat.id(e.type()) + " at " + ToolFormat.position(e.pos())));
 			out.add("entities", entities);
+			if (volume.entities().size() > MAX_TEMPLATE_ENTITIES) {
+				ToolFormat.noteMore(out, (volume.entities().size() - MAX_TEMPLATE_ENTITIES) + " more entities.");
+			}
 		}
 		if (!jigsaws.isEmpty()) {
 			out.add("jigsaw_connectors", jigsaws);
+		}
+		if (moreJigsaws > 0) {
+			ToolFormat.noteMore(out, moreJigsaws + " more jigsaw connectors.");
 		}
 	}
 
 	// --- schematics -----------------------------------------------------------------------------------------------
 
-	private JsonElement listSchematics(JsonObject args) throws Exception {
-		String query = string(args, "query", "").trim();
+	private Tool.Result listSchematics(String query) throws Exception {
 		Schematics.Folder folder = Schematics.folder();
 		JsonObject out = new JsonObject();
 		out.addProperty("folder", folder.dir().toString());
@@ -953,7 +914,7 @@ public final class WorldTools {
 					if (!info.author().isEmpty()) {
 						r.addProperty("author", info.author());
 					}
-					r.addProperty("size", sizeText(info.size()));
+					r.addProperty("size", ToolFormat.size(info.size()));
 					info.recordedBlocks().ifPresent(blocks -> r.addProperty("blocks", blocks));
 				}
 				case Schematics.Unreadable unreadable -> r.addProperty("error", "unreadable: " + unreadable.error());
@@ -964,11 +925,11 @@ public final class WorldTools {
 		if (results.isEmpty()) {
 			out.addProperty("note", "No schematics" + (query.isEmpty() ? "" : " matching \"" + query + "\"") + " in that folder.");
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
-	private JsonElement inspectSchematic(JsonObject args) throws Exception {
-		String query = string(args, "schematic", "").trim();
+	private Tool.Result inspectSchematic(Arguments args, Tool.Context context) throws Exception {
+		String query = args.get(SCHEMATIC);
 		Schematics.Folder folder = Schematics.folder();
 		Schematics.Entry entry = switch (Schematics.match(folder.entries(), query)) {
 			case Schematics.Found found -> found.entry();
@@ -989,10 +950,10 @@ public final class WorldTools {
 		if (!info.description().isEmpty()) {
 			out.addProperty("description", info.description());
 		}
-		out.addProperty("size", sizeText(info.size()));
+		out.addProperty("size", ToolFormat.size(info.size()));
 		if (s.regions().size() > 1) {
 			JsonArray regions = new JsonArray();
-			s.regions().forEach(r -> regions.add(r.name() + ": " + sizeText(r.size()) + " at " + posText(r.position())));
+			s.regions().forEach(r -> regions.add(r.name() + ": " + ToolFormat.size(r.size()) + " at " + ToolFormat.position(r.position())));
 			out.add("regions", regions);
 		}
 
@@ -1009,15 +970,15 @@ public final class WorldTools {
 			out.add("base_materials", countsJson(full.remaining()));
 		}
 
-		String compare = string(args, "compare_with", "").trim();
+		String compare = args.get(COMPARE_WITH);
 		if (!compare.isEmpty()) {
 			out.add("comparison", compare(compare, placed));
 		}
 		addBlockEntities(out, s.volume());
-		if (args.has("layers") && args.get("layers").getAsBoolean()) {
-			addLayers(out, s.volume(), args);
+		if (args.get(LAYERS)) {
+			addLayers(out, s.volume(), args.get(Y_FROM), args.get(Y_TO));
 		}
-		return out;
+		return Tool.Result.of(out);
 	}
 
 	/** Checks the containers matching {@code query} against the materials; see inspect_schematic's description. */
@@ -1029,7 +990,9 @@ public final class WorldTools {
 		String q = query.toLowerCase(Locale.ROOT);
 		if (q.equals("inventory")) {
 			items.addAll(player.inventory());
+			items.addAll(player.enderChest());
 			used.add("inventory of " + player.name());
+			used.add("ender chest of " + player.name());
 		} else {
 			String[] parts = q.replace(",", " ").trim().split("\\s+");
 			Integer[] xyz = parts.length == 3 ? parseInts(parts) : null;
@@ -1049,7 +1012,7 @@ public final class WorldTools {
 				WorldIndex.Holder first = matches.getFirst();
 				for (WorldIndex.Holder h : snapshot.holders()) {
 					if (h != first && h.type().equals(first.type()) && h.dimension().equals(first.dimension()) && h.y() == first.y()
-						&& Math.abs(h.x() - first.x()) + Math.abs(h.z() - first.z()) == 1 && java.util.Objects.equals(h.name(), first.name())) {
+						&& Math.abs(h.x() - first.x()) + Math.abs(h.z() - first.z()) == 1 && Objects.equals(h.name(), first.name())) {
 						matches.add(h);
 					}
 				}
@@ -1103,10 +1066,11 @@ public final class WorldTools {
 		}
 	}
 
-	/** {"minecraft:redstone": 41, ...}, most first. */
+	/** {"redstone": 41, ...}, most first. */
 	private static JsonObject countsJson(Map<String, Integer> counts) {
 		JsonObject o = new JsonObject();
-		counts.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed()).forEach(e -> o.addProperty(e.getKey(), e.getValue()));
+		counts.entrySet().stream().sorted(Map.Entry.<String, Integer>comparingByValue().reversed())
+			.forEach(e -> o.addProperty(ToolFormat.id(e.getKey()), e.getValue()));
 		return o;
 	}
 
@@ -1114,14 +1078,14 @@ public final class WorldTools {
 		JsonArray array = new JsonArray();
 		for (Materials.Craft c : crafts) {
 			JsonObject o = new JsonObject();
-			o.addProperty("item", c.item());
+			o.addProperty("item", ToolFormat.id(c.item()));
 			o.addProperty("needed", c.used());
 			o.addProperty("craft_times", c.crafts());
 			if (c.made() > c.used()) {
 				o.addProperty("left_over", c.made() - c.used());
 			}
 			JsonObject per = new JsonObject();
-			c.recipe().ingredients().forEach(per::addProperty);
+			c.recipe().ingredients().forEach((ingredient, count) -> per.addProperty(ToolFormat.id(ingredient), count));
 			o.add("ingredients_per_craft", per);
 			o.addProperty("recipe", c.recipe().file());
 			array.add(o);
@@ -1129,7 +1093,7 @@ public final class WorldTools {
 		return array;
 	}
 
-	/** "used_by_structures" (traced through pools) and "in_pools". */
+	/** "used_by_structures" (traced through pools) and "in_pools", at most {@code max} of each. */
 	private static void addTemplateUsage(JsonObject r, StructureTemplates.Index index, Identifier id, int max) {
 		Set<Identifier> structures = index.structuresUsing(id);
 		Set<Identifier> pools = index.poolsListing(id);
@@ -1142,19 +1106,22 @@ public final class WorldTools {
 		if (structures.isEmpty() && pools.isEmpty()) {
 			r.addProperty("used_by_structures", "not in any template pool; probably placed by code (grep the namespace's src for the template path)");
 		}
+		if (structures.size() > max) {
+			ToolFormat.noteMore(r, (structures.size() - max) + " more structures using it.");
+		}
+		if (pools.size() > max) {
+			ToolFormat.noteMore(r, (pools.size() - max) + " more pools listing it.");
+		}
 	}
 
 	private static JsonArray idList(Set<Identifier> ids, int max) {
 		JsonArray array = new JsonArray();
-		ids.stream().limit(max).forEach(i -> array.add(i.toString()));
-		if (ids.size() > max) {
-			array.add("and " + (ids.size() - max) + " more");
-		}
+		ids.stream().limit(max).forEach(i -> array.add(ToolFormat.id(i)));
 		return array;
 	}
 
 	/** One text grid per y level, plus the legend. Skipped with a note if it would be too long. */
-	private static void addLayers(JsonObject out, BlockVolume volume, JsonObject args) {
+	private static void addLayers(JsonObject out, BlockVolume volume, OptionalInt from, OptionalInt to) {
 		Vec3i size = volume.size();
 		int sx = size.getX();
 		int sy = size.getY();
@@ -1162,8 +1129,8 @@ public final class WorldTools {
 		if (sx <= 0 || sy <= 0 || sz <= 0) {
 			return;
 		}
-		int yFrom = Math.max(0, Math.min(sy - 1, integer(args, "y_from", 0)));
-		int yTo = Math.max(yFrom, Math.min(sy - 1, integer(args, "y_to", sy - 1)));
+		int yFrom = Math.clamp(from.orElse(0), 0, sy - 1);
+		int yTo = Math.clamp(to.orElse(sy - 1), yFrom, sy - 1);
 		long perLayer = (long) sx * sz;
 		if (perLayer * (yTo - yFrom + 1) > MAX_LAYER_CELLS) {
 			long fits = MAX_LAYER_CELLS / perLayer;
@@ -1192,7 +1159,7 @@ public final class WorldTools {
 			char c = i < LAYER_SYMBOLS.length() ? LAYER_SYMBOLS.charAt(i) : '?';
 			symbols.put(byCount.get(i), c);
 			if (c != '?') {
-				legend.addProperty(String.valueOf(c), StructureTemplates.id(byCount.get(i)));
+				legend.addProperty(String.valueOf(c), ToolFormat.id(byCount.get(i)));
 			}
 		}
 		if (byCount.size() > LAYER_SYMBOLS.length()) {
@@ -1222,16 +1189,16 @@ public final class WorldTools {
 		out.add("layers", layers);
 	}
 
-	/** "9 wide (x) × 7 tall (y) × 11 deep (z)". */
-	private static String sizeText(Vec3i size) {
-		return size.getX() + " wide (x) × " + size.getY() + " tall (y) × " + size.getZ() + " deep (z)";
-	}
-
-	private static String posText(BlockPos pos) {
-		return pos.getX() + " " + pos.getY() + " " + pos.getZ();
-	}
-
 	// --- helpers --------------------------------------------------------------------------------------------------
+
+	/** The open world's server; the tool's requirement checked it, but the world may have closed since. */
+	private MinecraftServer server() {
+		MinecraftServer server = index.server();
+		if (server == null) {
+			throw new IllegalStateException("No single-player world is open.");
+		}
+		return server;
+	}
 
 	/** The player's position in {@code dimension}: as it is in their own, translated (x/8 into the Nether) in another. */
 	private static Origin originIn(MinecraftServer server, Origin home, ResourceKey<Level> dimension) {
@@ -1262,31 +1229,6 @@ public final class WorldTools {
 		}
 	}
 
-	/** "distance": 2830, "direction": "south-east" (plus "blocks_up"/"blocks_down" when y is known), from an origin in the same dimension. */
-	private static void addDirection(JsonObject r, Origin origin, double x, Double y, double z) {
-		double dx = x - origin.x();
-		double dz = z - origin.z();
-		r.addProperty("distance_blocks", Math.round(y == null ? origin.horizontalDistanceTo(x, z) : origin.distanceTo(x, y, z)));
-		r.addProperty("direction", compass(dx, dz));
-		if (y != null) {
-			long dy = Math.round(y - origin.y());
-			if (Math.abs(dy) >= 3) {
-				r.addProperty(dy > 0 ? "blocks_up" : "blocks_down", Math.abs(dy));
-			}
-		}
-	}
-
-	/** Minecraft compass: north is -Z, east is +X. */
-	static String compass(double dx, double dz) {
-		if (Math.abs(dx) < 2 && Math.abs(dz) < 2) {
-			return "here";
-		}
-		String[] names = {"north", "north-east", "east", "south-east", "south", "south-west", "west", "north-west"};
-		double angle = Math.toDegrees(Math.atan2(dx, -dz));
-		int index = (int) Math.round(((angle % 360) + 360) % 360 / 45) % 8;
-		return names[index];
-	}
-
 	private static JsonObject playerPosition(WorldIndex.PlayerInfo player) {
 		JsonObject o = new JsonObject();
 		o.addProperty("dimension", Dimensions.name(player.dimension()));
@@ -1299,13 +1241,11 @@ public final class WorldTools {
 	private static JsonArray itemsJson(List<WorldIndex.Item> items) {
 		JsonArray array = new JsonArray();
 		for (WorldIndex.Item item : items) {
-			String text = item.count() + " " + item.name() + " (" + item.id() + ")"
-				+ (item.enchantments().isEmpty() ? "" : " {" + String.join(", ", item.enchantments()) + "}");
 			if (item.contents().isEmpty()) {
-				array.add(text);
+				array.add(itemText(item));
 			} else {
 				JsonObject o = new JsonObject();
-				o.addProperty("item", text);
+				o.addProperty("item", itemText(item));
 				o.add("contains", itemsJson(item.contents()));
 				array.add(o);
 			}
@@ -1313,43 +1253,19 @@ public final class WorldTools {
 		return array;
 	}
 
+	private static String itemText(WorldIndex.Item item) {
+		return ToolFormat.item(item.count(), item.id(), item.name(), item.enchantments());
+	}
+
 	private static boolean contains(String haystack, String needle) {
 		return haystack != null && haystack.toLowerCase(Locale.ROOT).contains(needle);
 	}
 
-	static JsonObject tool(String name, String description, String schema) {
-		JsonObject tool = new JsonObject();
-		tool.addProperty("name", name);
-		tool.addProperty("description", description);
-		tool.add("inputSchema", JsonParser.parseString(schema));
-		return tool;
-	}
-
-	private static String string(JsonObject args, String key, String fallback) {
-		return args != null && args.has(key) && args.get(key).isJsonPrimitive() ? args.get(key).getAsString() : fallback;
-	}
-
-	/** A string array, or a comma-separated string, trimmed and without empty entries. */
-	private static List<String> strings(JsonObject args, String key) {
-		List<String> values = new ArrayList<>();
-		if (args != null && args.has(key)) {
-			JsonElement element = args.get(key);
-			if (element.isJsonArray()) {
-				element.getAsJsonArray().forEach(e -> values.add(e.getAsString()));
-			} else if (element.isJsonPrimitive()) {
-				values.addAll(List.of(element.getAsString().split(",")));
-			}
-			values.replaceAll(String::trim);
-			values.removeIf(String::isEmpty);
+	/** "a second", "5 seconds", or ticks when it isn't whole seconds. */
+	private static String duration(long ticks) {
+		if (ticks % 20 != 0) {
+			return ticks + " game ticks";
 		}
-		return values;
-	}
-
-	private static int integer(JsonObject args, String key, int fallback) {
-		try {
-			return args != null && args.has(key) && args.get(key).isJsonPrimitive() ? args.get(key).getAsInt() : fallback;
-		} catch (NumberFormatException e) {
-			return fallback;
-		}
+		return ticks == 20 ? "a second" : ticks / 20 + " seconds";
 	}
 }

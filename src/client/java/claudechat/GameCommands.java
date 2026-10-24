@@ -3,7 +3,6 @@ package claudechat;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.mojang.authlib.GameProfile;
 import com.mojang.brigadier.ParseResults;
 import com.mojang.brigadier.context.CommandContextBuilder;
 import com.mojang.brigadier.context.ParsedArgument;
@@ -40,6 +39,8 @@ import java.util.concurrent.TimeUnit;
  */
 public class GameCommands {
 	public static final String TOOL = "run_command";
+	private static final Param<String> COMMAND = Param.requiredText("command",
+		"The command, with or without the leading slash, e.g. \"time set day\".");
 
 	private final ClaudeConfig config;
 	private final WorldIndex index;
@@ -49,11 +50,15 @@ public class GameCommands {
 		this.index = index;
 	}
 
-	public boolean available() {
-		return index.server() != null;
+	/** The run_command tool; its description says what the current permissions and cheats setting let it run. */
+	public Tool tool() {
+		Tool.Requirement singlePlayer = new Tool.Requirement(() -> index.server() != null,
+			"No single-player world is open, so game commands can't run.");
+		return new Tool(TOOL, this::description, List.of(COMMAND), singlePlayer,
+			(arguments, context) -> Tool.Result.of(call(arguments.get(COMMAND))));
 	}
 
-	public JsonObject definition() {
+	private String description() {
 		String tier = switch (config.permissions) {
 			case READ_ONLY -> "Only commands that change nothing (time query, data get, gamerule <name>, locate, scoreboard"
 				+ " ... get, execute if/unless) run; the player's permissions are Read only, so others are refused.";
@@ -65,31 +70,21 @@ public class GameCommands {
 			? "Runs with command block permissions (cheats allowed), as the player."
 			: "Runs with the player's own permissions: in a world without cheats, cheat commands (give, gamemode, fill,"
 				+ " tp, data...) fail.";
-		return WorldTools.tool(TOOL,
-			"Run a Minecraft command in the player's single-player world, as the player (so @s and ~ are the player). "
-				+ tier + " " + cheats + " Returns the game's feedback. Prefer the other world tools for finding things; use"
-				+ " this for what they can't do. Every command you run is shown to the player in chat.",
-			"""
-			{"type": "object", "properties": {
-			  "command": {"type": "string", "description": "The command, with or without the leading slash, e.g. \\"time set day\\"."}
-			}, "required": ["command"]}
-			""");
+		return "Run a Minecraft command in the player's single-player world, as the player (so @s and ~ are the player). "
+			+ tier + " " + cheats + " Returns the game's feedback. Prefer the other world tools for finding things; use"
+			+ " this for what they can't do. Every command you run is shown to the player in chat.";
 	}
 
 	/** What a command would do, worked out on the server thread before running it. */
 	record Check(String error, boolean readOnly, String warning, boolean needsCheats) {
 	}
 
-	public JsonElement call(JsonObject args) throws Exception {
-		String command = args.has("command") ? args.get("command").getAsString().strip() : "";
-		if (command.startsWith("/")) {
-			command = command.substring(1);
-		}
-		if (command.isEmpty()) {
-			throw new IllegalArgumentException("command is required");
+	private JsonElement call(String command) throws Exception {
+		String cmd = command.startsWith("/") ? command.substring(1).strip() : command;
+		if (cmd.isEmpty()) {
+			throw new IllegalArgumentException("command is required.");
 		}
 		MinecraftServer server = server();
-		String cmd = command;
 		Check check = server.submit(() -> check(server, cmd)).get(30, TimeUnit.SECONDS);
 		if (check.error() != null) {
 			throw new IllegalArgumentException(check.error());
@@ -228,16 +223,12 @@ public class GameCommands {
 	}
 
 	/**
-	 * The player whose world this is, as the integrated server records it. Never anyone else: with the world open to
-	 * LAN, a guest could be first in the player list. Server thread.
+	 * The player whose world this is ({@link WorldIndex#host}). Never anyone else: with the world open to LAN, a guest
+	 * could be first in the player list. Server thread.
 	 */
 	private static ServerPlayer host(MinecraftServer server) {
-		GameProfile host = server.getSingleplayerProfile();
-		ServerPlayer player = host == null ? null : server.getPlayerList().getPlayer(host.id());
-		if (player == null) {
-			throw new IllegalStateException("The player who owns this world isn't in it, so game commands can't run.");
-		}
-		return player;
+		return WorldIndex.host(server).orElseThrow(() ->
+			new IllegalStateException("The player who owns this world isn't in it, so game commands can't run."));
 	}
 
 	private static String warning(CommandRules.Risk risk, CommandContextBuilder<CommandSourceStack> context, CommandSourceStack source) {

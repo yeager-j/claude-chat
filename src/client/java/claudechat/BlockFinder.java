@@ -1,10 +1,7 @@
 package claudechat;
 
 import net.minecraft.core.BlockPos;
-import net.minecraft.core.Holder;
-import net.minecraft.core.RegistryAccess;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
@@ -19,6 +16,7 @@ import net.minecraft.world.level.chunk.PalettedContainerFactory;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -41,18 +39,45 @@ public final class BlockFinder {
 	private static final int MAX_SAVED_CHUNKS = 4000;
 	private static final Duration LIVE_SCAN_TIMEOUT = Duration.ofSeconds(30);
 
-	public record Query(Set<Block> blocks, Map<String, String> properties, String data) {
+	/** A block state property and the value it must have. */
+	public record StateValue<T extends Comparable<T>>(Property<T> property, T value) {
 		boolean matches(BlockState state) {
-			if (!blocks.contains(state.getBlock())) {
-				return false;
+			return state.getValue(property).equals(value);
+		}
+	}
+
+	/**
+	 * What to find: each block that can match, with the state values it must have, and text the block entity's data
+	 * must contain (lower case; empty for any). {@link #of} parses property names and values once, per block.
+	 */
+	public record Query(Map<Block, List<StateValue<?>>> blocks, String data) {
+		/**
+		 * The blocks among {@code candidates} that have every one of {@code properties} ({"charges": "4"}) with a valid
+		 * value, and {@code data} as text to look for in their block entity's data.
+		 *
+		 * @throws IllegalArgumentException when none of them does, with the first block's properties and values
+		 */
+		public static Query of(Collection<Block> candidates, Map<String, String> properties, String data) {
+			Map<Block, List<StateValue<?>>> blocks = new LinkedHashMap<>();
+			for (Block block : candidates) {
+				stateValues(block, properties).ifPresent(values -> blocks.put(block, values));
 			}
-			for (Map.Entry<String, String> wanted : properties.entrySet()) {
-				Property<?> property = state.getBlock().getStateDefinition().getProperty(wanted.getKey());
-				if (property == null || !valueName(state, property).equals(wanted.getValue())) {
-					return false;
-				}
+
+			if (blocks.isEmpty()) {
+				Block first = candidates.iterator().next();
+				String available = first.getStateDefinition().getProperties().stream()
+					.map(p -> p.getName() + " (" + p.getPossibleValues().stream().map(v -> valueName(p, v)).collect(Collectors.joining("|")) + ")")
+					.collect(Collectors.joining(", "));
+				throw new IllegalArgumentException("No block matching the search has the properties " + properties + ". The properties of "
+					+ ToolFormat.id(first) + ": " + (available.isEmpty() ? "none" : available));
 			}
-			return true;
+
+			return new Query(blocks, data.toLowerCase(Locale.ROOT));
+		}
+
+		boolean matches(BlockState state) {
+			List<StateValue<?>> wanted = blocks.get(state.getBlock());
+			return wanted != null && wanted.stream().allMatch(value -> value.matches(state));
 		}
 
 		/** Data matching is plain text over the block entity's SNBT, so "skeleton" finds a skeleton spawner. */
@@ -60,40 +85,41 @@ public final class BlockFinder {
 			return data.isEmpty() || (blockEntity != null && blockEntity.toString().toLowerCase(Locale.ROOT).contains(data));
 		}
 
+		/** Full ids, as section palettes name blocks. */
 		Set<String> blockIds() {
-			return blocks.stream().map(block -> BuiltInRegistries.BLOCK.getKey(block).toString()).collect(Collectors.toSet());
+			return blocks.keySet().stream().map(block -> BuiltInRegistries.BLOCK.getKey(block).toString()).collect(Collectors.toSet());
 		}
 	}
 
 	public record Found(BlockPos pos, BlockState state, CompoundTag blockEntity, Provenance provenance, double distance) {
-		public String id() {
-			return BlockFinder.id(state);
-		}
-
-		public Map<String, String> properties() {
-			return BlockFinder.properties(state);
-		}
 	}
 
 	public record Result(List<Found> found, int savedChunksRead, boolean truncated) {
 	}
 
-	/** Blocks matching a query: an id, a tag, or a word ("anchor" → respawn_anchor); see {@link RegistryQuery#resolve}. */
-	public static List<Block> resolve(RegistryAccess access, String query) {
-		return RegistryQuery.resolve(access, Registries.BLOCK, query, RegistryQuery.Precedence.ID_FIRST).stream().map(Holder::value).toList();
-	}
+	/** {@code properties} as this block's state values; empty if it lacks one of them or a value is invalid for it. */
+	private static Optional<List<StateValue<?>>> stateValues(Block block, Map<String, String> properties) {
+		List<StateValue<?>> values = new ArrayList<>();
+		for (Map.Entry<String, String> wanted : properties.entrySet()) {
+			Property<?> property = block.getStateDefinition().getProperty(wanted.getKey());
+			Optional<StateValue<?>> value = property == null ? Optional.empty() : stateValue(property, wanted.getValue());
+			if (value.isEmpty()) {
+				return Optional.empty();
+			}
 
-	public static String id(BlockState state) {
-		return BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString();
-	}
-
-	/** Every state property, e.g. {"charges": "4"}. */
-	public static Map<String, String> properties(BlockState state) {
-		Map<String, String> out = new LinkedHashMap<>();
-		for (Property<?> property : state.getProperties()) {
-			out.put(property.getName(), valueName(state, property));
+			values.add(value.get());
 		}
-		return out;
+
+		return Optional.of(values);
+	}
+
+	private static <T extends Comparable<T>> Optional<StateValue<?>> stateValue(Property<T> property, String text) {
+		return property.getValue(text).map(value -> new StateValue<>(property, value));
+	}
+
+	@SuppressWarnings("unchecked")
+	private static <T extends Comparable<T>> String valueName(Property<T> property, Object value) {
+		return property.getName((T) value);
 	}
 
 	/**
@@ -202,9 +228,5 @@ public final class BlockFinder {
 		double dx = Math.max(0, Math.max(key.x() * 16 - origin.x(), origin.x() - (key.x() * 16 + 16)));
 		double dz = Math.max(0, Math.max(key.z() * 16 - origin.z(), origin.z() - (key.z() * 16 + 16)));
 		return Math.sqrt(dx * dx + dz * dz);
-	}
-
-	private static <T extends Comparable<T>> String valueName(BlockState state, Property<T> property) {
-		return property.getName(state.getValue(property));
 	}
 }

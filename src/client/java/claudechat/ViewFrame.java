@@ -1,15 +1,9 @@
 package claudechat;
 
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import com.mojang.blaze3d.vertex.PoseStack;
-import com.mojang.math.Axis;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.state.GameRenderState;
-import net.minecraft.client.renderer.state.OptionsRenderState;
-import net.minecraft.client.renderer.state.level.CameraEntityRenderState;
 import net.minecraft.client.renderer.state.level.CameraRenderState;
-import net.minecraft.client.renderer.state.level.PlayerRenderState;
-import net.minecraft.util.Mth;
 import net.minecraft.world.level.material.FogType;
 import net.minecraft.world.phys.Vec3;
 import org.joml.Matrix4f;
@@ -28,6 +22,12 @@ import java.util.Locale;
 public final class ViewFrame {
 	/** Below this clip-space depth a point is behind the camera, or too close to it to place in the image. */
 	private static final float MIN_DEPTH = 0.05f;
+	/**
+	 * The projection the level was last drawn with ({@link #levelDrawnWith}). Only the client thread touches it: it
+	 * renders the frames and takes the snapshots between them.
+	 */
+	private static final Matrix4f LEVEL_PROJECTION = new Matrix4f();
+	private static boolean levelDrawn;
 
 	private final Vec3 eye;
 	private final Matrix4fc viewProjection;
@@ -116,84 +116,29 @@ public final class ViewFrame {
 			throw new IllegalStateException("The world isn't being drawn right now.");
 		}
 
+		if (!levelDrawn) {
+			throw new IllegalStateException("The world hasn't been drawn yet.");
+		}
+
 		RenderTarget target = mc.gameRenderer.mainRenderTarget();
 		double fovVertical = Math.toDegrees(2 * Math.atan(1 / camera.projectionMatrix.m11()));
 		double fovHorizontal = Math.toDegrees(2 * Math.atan(1 / camera.projectionMatrix.m00()));
 		float fogEnd = camera.fogData.environmentalEnd;
 		float renderDistanceEnd = camera.fogData.renderDistanceEnd;
 
-		return new ViewFrame(camera.pos, levelProjection(state), camera.viewRotationMatrix, target.width, target.height,
+		return new ViewFrame(camera.pos, new Matrix4f(LEVEL_PROJECTION), camera.viewRotationMatrix, target.width, target.height,
 			camera.xRot, fovVertical, fovHorizontal, Math.min(fogEnd, renderDistanceEnd),
 			sightLimit(camera, fogEnd < renderDistanceEnd));
 	}
 
 	/**
-	 * The projection {@code GameRenderer.renderLevel} draws the level with: the camera's projection, then the hurt tilt,
-	 * view bobbing and the nausea or portal warp. The game builds it in private code with no hook, so this mirrors that
-	 * method; keep the two in step when updating Minecraft.
+	 * Render thread, from {@code GameRendererMixin}: the projection {@code GameRenderer.renderLevel} is about to draw
+	 * the level with, the camera's own after the hurt tilt, view bobbing and the nausea or portal warp. Kept so rays go
+	 * through the very matrix that drew the frame.
 	 */
-	private static Matrix4f levelProjection(GameRenderState state) {
-		CameraRenderState camera = state.levelRenderState.cameraRenderState;
-		OptionsRenderState options = state.optionsRenderState;
-		PlayerRenderState player = state.levelRenderState.playerRenderState;
-		Matrix4f projection = new Matrix4f(camera.projectionMatrix);
-		PoseStack bob = new PoseStack();
-
-		hurtTilt(camera.entityRenderState, options, bob);
-		if (options.bobView) {
-			viewBob(camera.entityRenderState, bob);
-		}
-
-		projection.mul(bob.last().pose());
-		float spin = Math.max(player.portalEffectIntensity, player.nauseaEffectIntensity)
-			* (options.screenEffectScale * options.screenEffectScale);
-		if (spin > 0) {
-			float skew = 5.0F / (spin * spin + 5.0F) - spin * 0.04F;
-			skew *= skew;
-			Vector3f axis = new Vector3f(0.0F, Mth.SQRT_OF_TWO / 2.0F, Mth.SQRT_OF_TWO / 2.0F);
-			float angle = player.spinningEffectAngle * (float) (Math.PI / 180.0);
-			projection.rotate(angle, axis);
-			projection.scale(1.0F / skew, 1.0F, 1.0F);
-			projection.rotate(-angle, axis);
-		}
-
-		return projection;
-	}
-
-	/** Mirrors {@code GameRenderer.bobHurt}. */
-	private static void hurtTilt(CameraEntityRenderState entity, OptionsRenderState options, PoseStack pose) {
-		if (!entity.isLiving) {
-			return;
-		}
-
-		if (entity.isDeadOrDying) {
-			float duration = Math.min(entity.deathTime, 20.0F);
-			pose.rotateDegrees(Axis.ZP, 40.0F - 8000.0F / (duration + 200.0F));
-		}
-
-		float hurt = entity.hurtTime;
-		if (hurt < 0.0F) {
-			return;
-		}
-
-		hurt /= entity.hurtDuration;
-		hurt = Mth.sin(hurt * hurt * hurt * hurt * (float) Math.PI);
-		pose.rotateDegrees(Axis.YP, -entity.hurtDir);
-		pose.rotateDegrees(Axis.ZP, (float) (-hurt * 14.0 * options.damageTiltStrength));
-		pose.rotateDegrees(Axis.YP, entity.hurtDir);
-	}
-
-	/** Mirrors {@code GameRenderer.bobView}. */
-	private static void viewBob(CameraEntityRenderState entity, PoseStack pose) {
-		if (!entity.isPlayer) {
-			return;
-		}
-
-		float walked = entity.backwardsInterpolatedWalkDistance;
-		float bob = entity.bob;
-		pose.translate(Mth.sin(walked * (float) Math.PI) * bob * 0.5F, -Math.abs(Mth.cos(walked * (float) Math.PI) * bob), 0.0F);
-		pose.rotateDegrees(Axis.ZP, Mth.sin(walked * (float) Math.PI) * bob * 3.0F);
-		pose.rotateDegrees(Axis.XP, Math.abs(Mth.cos(walked * (float) Math.PI - 0.2F) * bob) * 5.0F);
+	public static void levelDrawnWith(Matrix4fc projection) {
+		LEVEL_PROJECTION.set(projection);
+		levelDrawn = true;
 	}
 
 	/** What the fog distances of this frame come from, in the player's words. */

@@ -11,28 +11,36 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationTargetException;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.function.BooleanSupplier;
+import java.util.stream.Stream;
 
 /**
- * A minimal MCP server ("Streamable HTTP" transport, JSON responses only) that gives Claude Code the mod's tools for
- * the whole game session: {@link ModTools} always, {@link ViewSnapshot} while any world is open, {@link WorldTools}
- * only while a single-player world is open. Each
+ * A minimal MCP server ("Streamable HTTP" transport, JSON responses only) that gives Claude Code the mod's
+ * {@link Tool}s for the whole game session. It lists the tools that are available right now and checks again on each
+ * call, so the world tools come and go with the single-player world and {@code look} with any world. Each
  * question starts a new claude process, which lists the tools afresh. Listens on 127.0.0.1 on a random port and
  * requires a random bearer token. The token reaches claude in config/claudechat/mcp.json, which exists only while a
  * question runs (and is owner-only where the file system supports that), so another local process can use the server
@@ -52,24 +60,39 @@ public class McpServer {
 	private static final int MAX_BODY_BYTES = 32 * 1024 * 1024;
 	private static final int MAX_DRAIN_BYTES = 64 * 1024;
 
-	private final ModTools modTools;
-	private final WorldTools worldTools;
-	private final GameCommands gameCommands;
-	private final ViewSnapshot view;
+	/** JSON-RPC's code for a request whose params are wrong; MCP uses it for a call to a tool it doesn't have. */
+	private static final int INVALID_PARAMS = -32602;
+
+	/** By name, in the order tools/list gives them. */
+	private final Map<String, Tool> tools = new LinkedHashMap<>();
+	private final BooleanSupplier worldOpen;
 	private final String token = newToken();
 	private volatile ServerSocket socket;
 	private ExecutorService workers;
 
+	/**
+	 * @param tools     every tool the server can offer, each with a unique name
+	 * @param worldOpen whether the single-player world tools are offered right now, for the system prompt
+	 */
+	public McpServer(List<Tool> tools, BooleanSupplier worldOpen) {
+		for (Tool tool : tools) {
+			if (this.tools.putIfAbsent(tool.name(), tool) != null) {
+				throw new IllegalArgumentException("Two tools are named " + tool.name());
+			}
+		}
+
+		this.worldOpen = worldOpen;
+	}
+
+	/** The mod's tools: decompiling mods, approvals, {@code look}, the world tools and {@code run_command}. */
 	public McpServer(ModTools modTools, WorldTools worldTools, GameCommands gameCommands, ViewSnapshot view) {
-		this.modTools = modTools;
-		this.worldTools = worldTools;
-		this.gameCommands = gameCommands;
-		this.view = view;
+		this(Stream.of(modTools.tools(), List.of(Approvals.tool(), view.tool()), worldTools.tools(), List.of(gameCommands.tool()))
+			.flatMap(List::stream).toList(), worldTools::available);
 	}
 
 	/** Are the world tools offered right now? */
 	public boolean worldOpen() {
-		return worldTools.available();
+		return worldOpen.getAsBoolean();
 	}
 
 	private static String newToken() {
@@ -416,23 +439,21 @@ public class McpServer {
 			}
 			case "ping" -> response.add("result", new JsonObject());
 			case "tools/list" -> {
-				JsonArray tools = modTools.definitions();
-				// Always listed so --permission-prompt-tool finds it; --disallowedTools hides it from Claude itself.
-				tools.add(Approvals.definition());
-				if (view.available()) {
-					tools.add(view.definition());
-				}
-				if (worldTools.available()) {
-					tools.addAll(worldTools.definitions());
-				}
-				if (gameCommands.available()) {
-					tools.add(gameCommands.definition());
-				}
+				JsonArray definitions = new JsonArray();
+				tools.values().stream().filter(Tool::available).forEach(tool -> definitions.add(tool.definition()));
 				JsonObject result = new JsonObject();
-				result.add("tools", tools);
+				result.add("tools", definitions);
 				response.add("result", result);
 			}
-			case "tools/call" -> response.add("result", callTool(params));
+			case "tools/call" -> {
+				JsonElement name = params.get("name");
+				Tool tool = name != null && name.isJsonPrimitive() ? tools.get(name.getAsString()) : null;
+				if (tool == null) {
+					return error(message.get("id"), INVALID_PARAMS, "Unknown tool: " + name);
+				}
+
+				response.add("result", callTool(tool, params.get("arguments")));
+			}
 			default -> {
 				return error(message.get("id"), -32601, "Method not found: " + method);
 			}
@@ -440,48 +461,52 @@ public class McpServer {
 		return response;
 	}
 
-	private JsonObject callTool(JsonObject params) {
-		String name = params.has("name") ? params.get("name").getAsString() : "";
-		JsonObject args = params.has("arguments") && params.get("arguments").isJsonObject() ? params.getAsJsonObject("arguments") : new JsonObject();
+	/**
+	 * The MCP result of one call. A failure, bad arguments included, is a result with {@code isError} rather than a
+	 * JSON-RPC error, so Claude reads what went wrong and can try again.
+	 */
+	private static JsonObject callTool(Tool tool, JsonElement arguments) {
 		JsonObject result = new JsonObject();
-		JsonArray content = new JsonArray();
-		JsonObject text = new JsonObject();
-		text.addProperty("type", "text");
-		JsonObject image = null;
 		try {
-			JsonElement output;
-			if (name.equals(Approvals.TOOL)) {
-				output = Approvals.handlePrompt(args);
-			} else if (modTools.has(name)) {
-				output = modTools.call(name, args);
-			} else if (name.equals(ViewSnapshot.TOOL) && view.available()) {
-				ViewSnapshot.Result look = view.call(args);
-				output = look.data();
-				if (look.png() != null) {
-					image = new JsonObject();
-					image.addProperty("type", "image");
-					image.addProperty("data", Base64.getEncoder().encodeToString(look.png()));
-					image.addProperty("mimeType", "image/png");
-				}
-			} else if (name.equals(GameCommands.TOOL) && gameCommands.available()) {
-				output = gameCommands.call(args);
-			} else if (worldTools.available()) {
-				output = worldTools.call(name, args);
-			} else {
-				throw new IllegalStateException("No single-player world is open, so the world tools aren't available.");
+			if (arguments != null && !arguments.isJsonNull() && !arguments.isJsonObject()) {
+				throw new IllegalArgumentException("arguments must be an object, not " + arguments + ".");
 			}
-			text.addProperty("text", output.toString());
+
+			JsonObject given = arguments != null && arguments.isJsonObject() ? arguments.getAsJsonObject() : new JsonObject();
+			result.add("content", tool.call(given, new Tool.Context()).content());
 		} catch (Exception e) {
-			Throwable cause = e.getCause() != null && e instanceof java.util.concurrent.ExecutionException ? e.getCause() : e;
-			ClaudeChatClient.LOGGER.warn("Tool {} failed", name, cause);
-			text.addProperty("text", "Error: " + cause.getMessage());
+			Throwable cause = rootCause(e);
+			ClaudeChatClient.LOGGER.warn("Tool {} failed", tool.name(), cause);
+			JsonArray content = new JsonArray();
+			content.add(Tool.Result.text("Error: " + errorText(cause)));
+			result.add("content", content);
 			result.addProperty("isError", true);
 		}
-		content.add(text);
-		if (image != null) {
-			content.add(image);
-		}
-		result.add("content", content);
+
 		return result;
+	}
+
+	/** The exception a wrapper (a failed future, a reflective call) stands for. */
+	private static Throwable rootCause(Throwable e) {
+		Throwable cause = e;
+		while ((cause instanceof ExecutionException || cause instanceof CompletionException || cause instanceof InvocationTargetException)
+			&& cause.getCause() != null) {
+			cause = cause.getCause();
+		}
+
+		return cause;
+	}
+
+	/** What Claude is told went wrong: the message, or for an exception without one, what kind of failure it was. */
+	static String errorText(Throwable error) {
+		if (error.getMessage() != null && !error.getMessage().isBlank()) {
+			return error.getMessage();
+		}
+
+		return switch (error) {
+			case TimeoutException _ -> "The game didn't answer in time.";
+			case InterruptedException _, CancellationException _ -> "The call was cancelled.";
+			default -> "The tool failed (" + error.getClass().getSimpleName() + ", no details). The game log has more.";
+		};
 	}
 }

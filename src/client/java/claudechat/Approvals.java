@@ -14,6 +14,7 @@ import net.minecraft.sounds.SoundEvents;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
@@ -124,33 +125,48 @@ public final class Approvals {
 
 	// --- Claude Code's permission prompts -------------------------------------------------------------------------
 
-	public static JsonObject definition() {
-		return WorldTools.tool(TOOL,
-			"Internal: answers Claude Code's permission prompts by asking the player in chat. Not for direct use.",
-			"""
-			{"type": "object", "properties": {
-			  "tool_name": {"type": "string"},
-			  "input": {"type": "object"},
-			  "tool_use_id": {"type": "string"}
-			}, "required": ["tool_name", "input"]}
-			""");
+	private static final Param<String> TOOL_NAME = Param.requiredText("tool_name", "");
+	private static final Param<JsonObject> INPUT = Param.requiredObject("input", "");
+	private static final Param<String> TOOL_USE_ID = Param.text("tool_use_id", "");
+
+	// The asked-about tool's own input: every field the request shows must be there, so it never reads "edit a file".
+	private static final Param<String> COMMAND = Param.requiredText("command", "");
+	private static final Param<String> DESCRIPTION = Param.text("description", "");
+	private static final Param<String> FILE_PATH = Param.requiredText("file_path", "");
+	private static final Param<String> OLD_STRING = Param.requiredExactText("old_string", "");
+	private static final Param<String> NEW_STRING = Param.requiredExactText("new_string", "");
+	private static final Param<Boolean> REPLACE_ALL = Param.flag("replace_all", "", false);
+	private static final Param<String> CONTENT = Param.requiredExactText("content", "");
+
+	/**
+	 * The {@code approve} tool. Always offered, so --permission-prompt-tool finds it; --disallowedTools hides it from
+	 * Claude itself. A prompt it can't read fails, which Claude Code takes as a denial.
+	 */
+	public static Tool tool() {
+		return Tool.of(TOOL, "Internal: answers Claude Code's permission prompts by asking the player in chat. Not for direct use.",
+			Tool.Requirement.NOTHING, List.of(TOOL_NAME, INPUT, TOOL_USE_ID),
+			(arguments, context) -> Tool.Result.of(handlePrompt(arguments.get(TOOL_NAME), arguments.get(INPUT))));
 	}
 
 	/** The --permission-prompt-tool contract: {behavior: allow, updatedInput} or {behavior: deny, message}. */
-	public static JsonElement handlePrompt(JsonObject args) {
-		String tool = args.has("tool_name") ? args.get("tool_name").getAsString() : "?";
-		JsonObject input = args.has("input") && args.get("input").isJsonObject() ? args.getAsJsonObject("input") : new JsonObject();
+	private static JsonElement handlePrompt(String tool, JsonObject input) {
 		boolean allowed = switch (tool) {
-			case "Bash", "PowerShell" -> ask("run a " + (tool.equals("Bash") ? "shell" : "PowerShell") + " command",
-				code(string(input, "command"), string(input, "description")), null);
-			case "Edit" -> ask("edit " + displayPath(string(input, "file_path")),
-				diff(string(input, "old_string"), string(input, "new_string"), bool(input, "replace_all")), null);
+			case "Bash", "PowerShell" -> {
+				Arguments command = Arguments.parse(List.of(COMMAND, DESCRIPTION), input);
+				yield ask("run a " + (tool.equals("Bash") ? "shell" : "PowerShell") + " command",
+					code(command.get(COMMAND), command.get(DESCRIPTION)), null);
+			}
+			case "Edit" -> {
+				Arguments edit = Arguments.parse(List.of(FILE_PATH, OLD_STRING, NEW_STRING, REPLACE_ALL), input);
+				yield ask("edit " + displayPath(edit.get(FILE_PATH)),
+					diff(edit.get(OLD_STRING), edit.get(NEW_STRING), edit.get(REPLACE_ALL)), null);
+			}
 			case "Write" -> {
-				String path = string(input, "file_path");
-				String content = string(input, "content");
-				boolean exists = !path.isEmpty() && Files.exists(Path.of(path));
+				Arguments write = Arguments.parse(List.of(FILE_PATH, CONTENT), input);
+				String path = write.get(FILE_PATH);
+				String content = write.get(CONTENT);
 				String size = lines(content.lines().count()) + ", " + content.length() + " characters";
-				yield ask((exists ? "overwrite " : "create ") + displayPath(path),
+				yield ask((Files.exists(Path.of(path)) ? "overwrite " : "create ") + displayPath(path),
 					copyable(Component.literal(size).withStyle(ChatFormatting.GRAY), withCopyHint(content), content), null);
 			}
 			default -> ask("use " + tool, code(input.toString(), null), null);
@@ -207,9 +223,6 @@ public final class Approvals {
 
 	/** Paths inside the game folder relative to it: "config/foo.json" rather than a long absolute path. */
 	private static String displayPath(String path) {
-		if (path.isEmpty()) {
-			return "a file";
-		}
 		Path gameDir = FabricLoader.getInstance().getGameDir().toAbsolutePath().normalize();
 		Path p = Path.of(path).toAbsolutePath().normalize();
 		return p.startsWith(gameDir) ? gameDir.relativize(p).toString().replace('\\', '/') : p.toString();
@@ -222,14 +235,6 @@ public final class Approvals {
 	/** {@code text} cut at {@code max} characters, saying how much was cut so a cut never passes for the whole. */
 	private static String clip(String text, int max) {
 		return text.length() <= max ? text : text.substring(0, max) + "… (" + (text.length() - max) + " more characters)";
-	}
-
-	private static String string(JsonObject obj, String key) {
-		return obj.has(key) && obj.get(key).isJsonPrimitive() ? obj.get(key).getAsString() : "";
-	}
-
-	private static boolean bool(JsonObject obj, String key) {
-		return obj.has(key) && obj.get(key).isJsonPrimitive() && obj.get(key).getAsBoolean();
 	}
 
 	private static void info(String message) {

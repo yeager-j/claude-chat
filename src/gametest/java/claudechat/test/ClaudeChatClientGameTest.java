@@ -13,7 +13,6 @@ import claudechat.StructureFinder;
 import net.minecraft.resources.ResourceKey;
 import java.util.Map;
 import java.util.TreeMap;
-import claudechat.ViewSnapshot;
 import claudechat.Waypoints;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.gui.components.AbstractWidget;
@@ -29,6 +28,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
 import net.minecraft.server.level.ServerLevel;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.List;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -87,6 +87,14 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		check(noWorldTools.contains("decompile_mod") && !noWorldTools.contains("find_structures"), "wrong tools without a world: " + noWorldTools);
 		JsonObject unknown = mcpCall("tools/call", "{\"name\": \"decompile_mod\", \"arguments\": {\"mod\": \"no_such_mod\"}}");
 		check(unknown.has("isError") && unknown.get("isError").getAsBoolean(), "unknown mod id didn't fail: " + unknown);
+		// Availability is checked on every call, not only when listing; an unknown name is a JSON-RPC error.
+		JsonObject closed = mcpCall("tools/call", "{\"name\": \"find_structures\", \"arguments\": {\"structure\": \"village\"}}");
+		check(closed.has("isError") && closed.toString().contains("No single-player world"), "world tool ran without a world: " + closed);
+		JsonObject noSuchTool = mcpResponse("tools/call", "{\"name\": \"no_such_tool\", \"arguments\": {}}");
+		check(noSuchTool.has("error") && noSuchTool.getAsJsonObject("error").get("code").getAsInt() == -32602,
+			"unknown tool isn't an invalid-params error: " + noSuchTool);
+		JsonObject noMod = mcpCall("tools/call", "{\"name\": \"decompile_mod\", \"arguments\": {}}");
+		check(noMod.has("isError") && noMod.toString().contains("mod is required"), "missing required argument accepted: " + noMod);
 		long decompileStart = System.nanoTime();
 		JsonObject decompiled = mcpCall("tools/call", "{\"name\": \"decompile_mod\", \"arguments\": {\"mod\": \"claudechat-test\"}}");
 		LOGGER.info("decompile_mod claudechat-test ({} ms) -> {}", (System.nanoTime() - decompileStart) / 1_000_000, decompiled);
@@ -171,15 +179,15 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					JsonObject trial = logTool(context, "search_structure_templates", "{\"blocks\": [\"trial_spawner\"], \"query\": \"trial_chambers\", \"limit\": 3}");
 					check(trial.get("templates_indexed").getAsInt() > 500, "too few templates indexed");
 					check(trial.getAsJsonArray("results").get(0).getAsJsonObject().getAsJsonArray("used_by_structures")
-						.toString().contains("minecraft:trial_chambers"), "trial spawner template not traced to trial chambers");
+						.toString().contains("\"trial_chambers\""), "trial spawner template not traced to trial chambers");
 					JsonObject city = logTool(context, "search_structure_templates", "{\"blocks\": [\"sculk shrieker\", \"reinforced_deepslate\", \"soul lantern\"], \"limit\": 3}");
-					check(city.getAsJsonArray("results").toString().contains("minecraft:ancient_city/"),
+					check(city.getAsJsonArray("results").toString().contains("\"ancient_city/"),
 						"sculk shrieker search didn't find an ancient city piece");
 					logTool(context, "search_structure_templates", "{\"blocks\": [\"mossy_stone_bricks\", \"spawner\"], \"limit\": 5}");
 					logTool(context, "search_structure_templates", "{\"blocks\": [\"barrel\", \"brewing_stand\"], \"limit\": 5}");
 					JsonObject house = logTool(context, "inspect_structure_template",
 						"{\"template\": \"minecraft:village/plains/houses/plains_small_house_1\", \"layers\": true}");
-					check(house.getAsJsonArray("used_by_structures").toString().contains("minecraft:village_plains"), "house not traced to plains villages");
+					check(house.getAsJsonArray("used_by_structures").toString().contains("\"village_plains\""), "house not traced to plains villages");
 					check(house.getAsJsonArray("layers").size() > 3, "house layers missing");
 					check("vanilla".equals(house.get("from").getAsString()), "house isn't from the vanilla pack: " + house.get("from"));
 					logTool(context, "inspect_structure_template", "{\"template\": \"minecraft:igloo/bottom\"}");
@@ -226,7 +234,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 						JsonObject farm = logTool(context, "inspect_schematic", "{\"schematic\": \"farms\\\\witch farm\"}");
 						check(farm.getAsJsonArray("regions").size() == 2, "the two-region schematic lost a region: " + farm);
 						JsonObject spawner = logTool(context, "inspect_schematic", "{\"schematic\": \"Old Spawner\"}");
-						check(spawner.getAsJsonArray("block_entities").toString().contains("\"spawns\":\"minecraft:skeleton\""),
+						check(spawner.getAsJsonArray("block_entities").toString().contains("\"spawns\":\"skeleton\""),
 							"the 1.12 spawner wasn't upgraded: " + spawner);
 						check(files.toString().matches(".*\"old/Broken.litematic\",\"error\":\"unreadable.*"), "the broken file isn't marked unreadable");
 					}
@@ -236,7 +244,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					check(!materials.isEmpty(), "schematic has no materials");
 
 					// A chest (or two) named "Witch Farm" with every material except one redstone dust, or one of the first item.
-					String shortItem = materials.has("minecraft:redstone") ? "minecraft:redstone" : materials.keySet().iterator().next();
+					String shortItem = materials.has("redstone") ? "redstone" : materials.keySet().iterator().next();
 					List<String> stacks = new ArrayList<>();
 					for (var entry : materials.entrySet()) {
 						int count = entry.getValue().getAsInt() - (entry.getKey().equals(shortItem) ? 1 : 0);
@@ -355,6 +363,13 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					logTool(context, "find_blocks", "{\"block\": \"respawn anchor\"}");
 					logTool(context, "find_blocks", "{\"block\": \"minecraft:respawn_anchor\", \"properties\": {\"charges\": \"4\"}}");
 					logTool(context, "find_blocks", "{\"block\": \"#minecraft:beds\", \"dimension\": \"the_nether\"}");
+					// Arguments are parsed, not defaulted: a wrong type or an empty required query is an error.
+					check(toolError(context, "find_blocks", "{\"block\": \"spawner\", \"limit\": \"five\"}").contains("limit must be a whole number"),
+						"a malformed limit was accepted");
+					check(toolError(context, "find_blocks", "{\"block\": \"spawner\", \"max_distance\": \"500 blocks\"}").contains("max_distance"),
+						"a malformed max_distance was accepted");
+					check(toolError(context, "find_structures", "{\"structure\": \" \"}").contains("structure must not be empty"),
+						"an empty structure query was accepted");
 
 					// One position three ways: saved, then predicted from the seed, then generated; the prediction's biome must hold.
 					logTool(context, "inspect_location", "{\"x\": 2000, \"y\": 100, \"z\": 2002}");
@@ -373,7 +388,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 					var fortresses = warped.getAsJsonArray("results");
 					check(!fortresses.isEmpty(), "no fortress reaching into a warped forest");
 					JsonObject fortress = fortresses.get(0).getAsJsonObject();
-					check(fortress.getAsJsonObject("biomes").has("minecraft:warped_forest"), "biome filter let through " + fortress);
+					check(fortress.getAsJsonObject("biomes").has("warped_forest"), "biome filter let through " + fortress);
 					int fortressX = fortress.get("x").getAsInt();
 					int fortressZ = fortress.get("z").getAsInt();
 					String actualBounds = singleplayer.getServer().computeOnServer(s -> {
@@ -658,17 +673,27 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		return r;
 	}
 
-	/** run_command's result, or {"error": message} as Claude would see it. */
+	/** run_command's result over MCP, or {"error": the error text Claude gets} when the call fails. */
 	private static JsonObject callRunCommand(String command) {
 		JsonObject args = new JsonObject();
 		args.addProperty("command", command);
-		try {
-			return ClaudeChatClient.gameCommands().call(args).getAsJsonObject();
-		} catch (Exception e) {
+		JsonObject result = mcpCall("tools/call", "{\"name\": \"run_command\", \"arguments\": " + args + "}");
+		String text = resultText(result);
+		if (isError(result)) {
 			JsonObject error = new JsonObject();
-			error.addProperty("error", String.valueOf(e.getMessage()));
+			error.addProperty("error", text);
 			return error;
 		}
+		return JsonParser.parseString(text).getAsJsonObject();
+	}
+
+	private static boolean isError(JsonObject result) {
+		return result.has("isError") && result.get("isError").getAsBoolean();
+	}
+
+	/** The text content of an MCP tool result: the data as JSON, or the error. */
+	private static String resultText(JsonObject result) {
+		return result.getAsJsonArray("content").get(0).getAsJsonObject().get("text").getAsString();
 	}
 
 	private static boolean hasDiamond(net.fabricmc.fabric.api.client.gametest.v1.context.TestServerContext server) {
@@ -831,23 +856,21 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	}
 
 	/**
-	 * Calls look directly rather than through logTool, to keep its screenshot, saved next to the test's own as
-	 * {@code <name>.png}. Returns the data.
+	 * Calls look over MCP rather than through logTool, to keep its screenshot (the image content after the data),
+	 * saved next to the test's own as {@code <name>.png}. Returns the data.
 	 */
 	private static JsonObject callLook(ClientGameTestContext context, String name) {
 		long start = System.nanoTime();
-		CompletableFuture<ViewSnapshot.Result> result = CompletableFuture.supplyAsync(() -> {
-			try {
-				return ClaudeChatClient.viewSnapshot().call(new JsonObject());
-			} catch (Exception e) {
-				throw new RuntimeException(e);
-			}
-		});
+		CompletableFuture<JsonObject> result = CompletableFuture.supplyAsync(() -> mcpCall("tools/call", "{\"name\": \"look\", \"arguments\": {}}"));
 		context.waitFor(mc -> result.isDone(), 60 * SECONDS);
-		JsonObject look = result.join().data();
+		check(!isError(result.join()), "look failed: " + result.join());
+		JsonObject look = JsonParser.parseString(resultText(result.join())).getAsJsonObject();
 		LOGGER.info("tool look {} ({} ms) -> {}", name, (System.nanoTime() - start) / 1_000_000, look);
-		byte[] png = result.join().png();
-		check(png != null && png.length > 1000, "no screenshot: " + look.get("screenshot"));
+		var content = result.join().getAsJsonArray("content");
+		check(content.size() == 2 && "image/png".equals(content.get(1).getAsJsonObject().get("mimeType").getAsString()),
+			"no screenshot: " + look.get("screenshot"));
+		byte[] png = Base64.getDecoder().decode(content.get(1).getAsJsonObject().get("data").getAsString());
+		check(png.length > 1000, "screenshot too small: " + png.length + " bytes");
 		try {
 			Files.write(FabricLoader.getInstance().getGameDir().resolve("screenshots/" + name + ".png"), png);
 		} catch (IOException e) {
@@ -894,17 +917,20 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		check(saved, "couldn't save the test tower");
 	}
 
+	/**
+	 * Calls a tool over MCP as Claude does, off the test thread (world tools wait on the server thread, which the test
+	 * thread drives), and logs it. Throws with the error text Claude would get if the call fails.
+	 */
 	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {
 		long start = System.nanoTime();
-		CompletableFuture<JsonElement> result = CompletableFuture.supplyAsync(() -> {
-			try {
-				return ClaudeChatClient.worldTools().call(name, JsonParser.parseString(args).getAsJsonObject());
-			} catch (Exception e) {
-				throw new RuntimeException(e);
-			}
-		});
+		CompletableFuture<JsonObject> result = CompletableFuture.supplyAsync(() ->
+			mcpCall("tools/call", "{\"name\": \"" + name + "\", \"arguments\": " + args + "}"));
 		context.waitFor(mc -> result.isDone(), 120 * SECONDS);
-		JsonElement json = result.join();
+		String text = resultText(result.join());
+		if (isError(result.join())) {
+			throw new IllegalStateException(text);
+		}
+		JsonElement json = JsonParser.parseString(text);
 		LOGGER.info("tool {} {} ({} ms) -> {}", name, args, (System.nanoTime() - start) / 1_000_000, json);
 		return json.isJsonObject() ? json.getAsJsonObject() : new JsonObject();
 	}
@@ -964,6 +990,11 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 
 	/** One JSON-RPC request to the mod's MCP server, with the URL and token claude gets; returns its result. */
 	private static JsonObject mcpCall(String method, String params) {
+		return mcpResponse(method, params).getAsJsonObject("result");
+	}
+
+	/** One JSON-RPC request to the mod's MCP server; returns the whole response, result or error. */
+	private static JsonObject mcpResponse(String method, String params) {
 		JsonObject server = JsonParser.parseString(ClaudeChatClient.mcp().claudeConfig()).getAsJsonObject()
 			.getAsJsonObject("mcpServers").getAsJsonObject("minecraft");
 		String body = "{\"jsonrpc\": \"2.0\", \"id\": 1, \"method\": \"" + method + "\", \"params\": " + params + "}";
@@ -973,7 +1004,7 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				.header("Content-Type", "application/json")
 				.POST(HttpRequest.BodyPublishers.ofString(body))
 				.build(), HttpResponse.BodyHandlers.ofString());
-			return JsonParser.parseString(response.body()).getAsJsonObject().getAsJsonObject("result");
+			return JsonParser.parseString(response.body()).getAsJsonObject();
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
 		} catch (InterruptedException e) {
