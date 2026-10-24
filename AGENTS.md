@@ -42,7 +42,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `ClaudeCli` | Runs `claude -p`: system prompt, flags, MCP config, timeout (kills `claude` and its child processes) |
 | `ClaudeStream`, `ClaudeResult` | Reads the stream-json output: progress notes, and the final `result` event parsed once (retry only on a missing session) |
 | `ClaudeConfig` | `config/claudechat.properties`; `configVersion` drives migrations |
-| `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand) with Vineflower in a separate JVM; extracts data and lang files; world data packs; the prompt's file map |
+| `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand); extracts data and lang files; world data packs; each source's `Status`; the prompt's file map |
+| `BuiltFolder`, `Decompiler`, `ModMentions`, `KnowledgeFiles` | One built folder (layout, marker holding the input key, progress, publish by rename, removing superseded folders); Vineflower in a separate JVM; which mods a question names; contained-path and copy helpers |
 | `ChatMarkup`, `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset parsed into lines (pure, unit-tested) → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON, with tags from the game's merged tag registry |
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while a known-good version of Xaero's Minimap is loaded: `KNOWN_GOOD_VERSIONS`) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
