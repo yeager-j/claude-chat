@@ -11,13 +11,16 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Template summaries (all palettes, one counting rule) and search ranking, without a server. */
@@ -52,6 +55,88 @@ class StructureTemplatesTest {
 		assertEquals(Map.of(Blocks.STONE, 1, Blocks.MOSSY_COBBLESTONE, 1), summary.blockCounts());
 		assertEquals(1, summary.countedBlocks());
 		assertEquals(Set.of(Identifier.parse("minecraft:village/plains/streets")), summary.jigsawPools());
+	}
+
+	@Test
+	void manyPalettesOverALargeBoxAreSummarizedInOnePass() throws IOException {
+		// The most palettes over a 2^22-position box: a volume per palette would fill 64 boxes.
+		CompoundTag tag = new CompoundTag();
+		tag.put("size", ints(256, 64, 256));
+		ListTag palettes = new ListTag();
+		for (int i = 0; i < StructureNbt.MAX_PALETTES; i++) {
+			palettes.add(i == 5 ? palette("minecraft:stone", "minecraft:gold_block") : palette("minecraft:stone", "minecraft:air"));
+		}
+		tag.put("palettes", palettes);
+		ListTag blocks = new ListTag();
+		blocks.add(entry(0, 0));
+		blocks.add(entry(1, 1));
+		blocks.add(entry(2, 1));
+		blocks.add(entry(2, 0));
+		tag.put("blocks", blocks);
+
+		StructureTemplates.Summary summary = StructureTemplates.summarize(Identifier.parse("test:wide"), VANILLA, StructureNbt.read(tag));
+
+		// (2 0 0) is listed twice; the last entry wins, as when the game places it.
+		assertEquals(Map.of(Blocks.STONE, 2, Blocks.GOLD_BLOCK, 1), summary.blockCounts());
+		assertEquals(3, summary.countedBlocks());
+		assertEquals(new Vec3i(256, 64, 256), summary.size());
+	}
+
+	@Test
+	void anEntryMissingFromAnyPaletteIsAnError() {
+		CompoundTag tag = new CompoundTag();
+		tag.put("size", ints(1, 1, 1));
+		ListTag palettes = new ListTag();
+		palettes.add(palette("minecraft:stone", "minecraft:dirt"));
+		palettes.add(palette("minecraft:stone"));
+		tag.put("palettes", palettes);
+		ListTag blocks = new ListTag();
+		blocks.add(entry(0, 1));
+		tag.put("blocks", blocks);
+
+		IOException e = assertThrows(IOException.class, () -> StructureTemplates.summarize(Identifier.parse("test:short"), VANILLA, StructureNbt.read(tag)));
+		assertTrue(e.getMessage().contains("has state 1"), e.getMessage());
+	}
+
+	@Test
+	void summarizingStopsWhenCancelled() {
+		CompoundTag tag = new CompoundTag();
+		tag.put("size", ints(1, 1, 1));
+		tag.put("palette", palette("minecraft:stone"));
+		ListTag blocks = new ListTag();
+		blocks.add(entry(0, 0));
+		tag.put("blocks", blocks);
+
+		assertThrows(CancellationException.class,
+			() -> StructureTemplates.summarize(Identifier.parse("test:cancelled"), VANILLA, StructureNbt.read(tag), () -> true));
+	}
+
+	@Test
+	void moreBlockEntriesThanPositionsAreRefusedBeforeUpgrading() {
+		// A 2×1×1 box listing the same block three times.
+		CompoundTag tag = new CompoundTag();
+		tag.put("size", ints(2, 1, 1));
+		tag.put("palette", palette("minecraft:stone"));
+		ListTag blocks = new ListTag();
+		for (int i = 0; i < 3; i++) {
+			blocks.add(entry(0, 0));
+		}
+		tag.put("blocks", blocks);
+
+		TooLargeException e = assertThrows(TooLargeException.class, () -> StructureNbt.upgrade(tag, SchematicFixtures.currentVersion()));
+		assertTrue(e.getMessage().contains("3 block entries, more than the 2 positions"), e.getMessage());
+	}
+
+	@Test
+	void aBuildStopsOnceItsWorkOrTimeRunsOut() {
+		StructureTemplates.BuildBudget work = new StructureTemplates.BuildBudget(100, null);
+		work.charge(100);
+		assertTrue(work.exhausted().isEmpty());
+		work.charge(1);
+		assertTrue(work.exhausted().orElseThrow().contains("work limit"));
+
+		StructureTemplates.BuildBudget time = new StructureTemplates.BuildBudget(100, Duration.ofSeconds(-1));
+		assertTrue(time.exhausted().orElseThrow().contains("time limit"));
 	}
 
 	@Test
