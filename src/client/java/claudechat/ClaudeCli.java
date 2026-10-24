@@ -1,23 +1,18 @@
 package claudechat;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.fabricmc.loader.api.FabricLoader;
 
-import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
@@ -28,11 +23,13 @@ import java.util.stream.Stream;
 
 /** Answers questions by running the local Claude Code CLI ("claude -p"), which uses whatever account it is signed in to. */
 public class ClaudeCli {
+	private static final boolean WINDOWS = System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows");
 	// Always offered and never asked about: Claude can search the knowledge folder and the web.
 	private static final String TOOLS = "Read,Grep,Glob,WebSearch,WebFetch";
 	// Added for Ask for approval and Full access. Shell commands that only read are still allowed without asking.
-	private static final String WRITE_TOOLS = "Bash,Edit,Write"
-		+ (System.getProperty("os.name").toLowerCase().contains("win") ? ",PowerShell" : "");
+	private static final String WRITE_TOOLS = "Bash,Edit,Write" + (WINDOWS ? ",PowerShell" : "");
+	// After claude exits, how long its output may take to drain. A process it started can keep the pipe open.
+	private static final long OUTPUT_DRAIN_MILLIS = 10_000;
 	private static final String SYSTEM_PROMPT = """
 		You are answering a question typed into Minecraft chat by the player. Your reply is shown in the game's chat box.
 		- Answer for the exact game version and mods listed below. Mechanics change between versions, so don't trust memory
@@ -137,25 +134,34 @@ public class ClaudeCli {
 	}
 
 	/**
-	 * {@code onProgress} gets the short status lines Claude writes between tool calls, on a background thread.
-	 * {@code mentionText} is the question plus the namespaces of whatever the player is holding or looking at; any
-	 * data-only mod it names gets decompiled first.
+	 * Answers a question in the background. {@code onProgress} gets the short status lines Claude writes between tool
+	 * calls, on a background thread. {@code mentionText} is the question plus the namespaces of whatever the player is
+	 * holding or looking at; any data-only mod it names gets decompiled first.
+	 *
+	 * @return the answer text; on failure, completes exceptionally with an exception whose message is for the player
 	 */
 	public CompletableFuture<String> ask(String question, String gameContext, String mentionText, Consumer<String> onProgress) {
-		return CompletableFuture.supplyAsync(() -> {
+		CompletableFuture<String> answer = new CompletableFuture<>();
+		executor.execute(() -> {
 			try {
-				for (KnowledgeBase.Source mod : knowledge.mentionedWithoutCode(mentionText)) {
-					onProgress.accept("Decompiling " + mod.label());
-					knowledge.buildCodeNow(mod, message -> { });
-				}
-				return run(question, gameContext, onProgress);
-			} catch (IOException e) {
-				throw new RuntimeException(e.getMessage(), e);
+				decompileMentionedMods(mentionText, onProgress);
+				answer.complete(run(question, gameContext, onProgress));
 			} catch (InterruptedException e) {
 				Thread.currentThread().interrupt();
-				throw new RuntimeException("Interrupted", e);
+				answer.completeExceptionally(new IOException("Stopped before Claude answered.", e));
+			} catch (Throwable e) {
+				// Whatever went wrong must complete the answer, or the player could never ask again.
+				answer.completeExceptionally(e);
 			}
-		}, executor);
+		});
+		return answer;
+	}
+
+	private void decompileMentionedMods(String mentionText, Consumer<String> onProgress) throws IOException, InterruptedException {
+		for (KnowledgeBase.Source mod : knowledge.mentionedWithoutCode(mentionText)) {
+			onProgress.accept("Decompiling " + mod.label());
+			knowledge.buildCodeNow(mod, message -> { });
+		}
 	}
 
 	private String run(String question, String gameContext, Consumer<String> onProgress) throws IOException, InterruptedException {
@@ -167,59 +173,64 @@ public class ClaudeCli {
 		Files.createDirectories(workDir);
 		Path promptFile = writeSystemPrompt(gameContext);
 
-		JsonObject result = invoke(exe, workDir, promptFile, question, sessionId, onProgress);
-		if (result.has("is_error") && result.get("is_error").getAsBoolean() && sessionId != null) {
-			// The saved conversation may be gone; try once more as a new conversation.
-			sessionId = null;
+		String resume = sessionId;
+		ClaudeResult result = invoke(exe, workDir, promptFile, question, resume, onProgress);
+		if (resume != null && result.missingSession()) {
+			// The saved conversation is gone, e.g. Claude Code's history was cleared. Nothing ran, so asking again is safe.
 			result = invoke(exe, workDir, promptFile, question, null, onProgress);
 		}
-		String text = resultText(result);
-		return text.isBlank() ? "(no answer)" : text;
+
+		// Follow-ups continue this conversation, even after an error.
+		result.sessionId().ifPresent(id -> sessionId = id);
+		if (result.isError()) {
+			throw new IOException(result.errorMessage());
+		}
+
+		return result.text().isBlank() ? "(no answer)" : result.text();
 	}
 
 	private Path writeSystemPrompt(String gameContext) throws IOException {
+		boolean worldOpen = mcp.worldOpen();
 		Path promptFile = ClaudeConfig.dir().resolve("system-prompt.txt");
 		String systemPrompt = SYSTEM_PROMPT
 			+ (Waypoints.available() ? WAYPOINT_PROMPT : "")
 			+ "\nCurrent game state:\n" + gameContext
-			+ (mcp.worldOpen() ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
+			+ (worldOpen ? WORLD_TOOLS_PROMPT : NO_WORLD_TOOLS_PROMPT)
 			+ LOOK_PROMPT
-			+ permissionsPrompt()
+			+ permissionsPrompt(worldOpen)
 			+ "\n" + knowledge.describeForPrompt()
 			+ (config.extraInstructions.isEmpty() ? "" : "\n" + config.extraInstructions + "\n");
 		Files.writeString(promptFile, systemPrompt, StandardCharsets.UTF_8);
 		return promptFile;
 	}
 
-	private String permissionsPrompt() {
+	private String permissionsPrompt(boolean worldOpen) {
 		if (config.permissions == ClaudeConfig.Permissions.READ_ONLY) {
 			return READ_ONLY_PROMPT;
 		}
-		String commands = mcp.worldOpen() ? ", plus game commands with mcp__minecraft__run_command" : "";
+		String commands = worldOpen ? ", plus game commands with mcp__minecraft__run_command" : "";
 		String approval = config.permissions == ClaudeConfig.Permissions.ASK
 			? "The player approves each change in chat. If they deny one, don't try another way to do it."
 			: "Nothing asks the player first, so be careful.";
 		return ACT_PROMPT.formatted(commands, approval);
 	}
 
-	/** The answer text; remembers the session so follow-ups continue the conversation. */
-	private String resultText(JsonObject result) throws IOException {
-		if (result.has("session_id")) {
-			sessionId = result.get("session_id").getAsString();
-		}
-		String text = result.has("result") ? result.get("result").getAsString() : "";
-		if (result.has("is_error") && result.get("is_error").getAsBoolean()) {
-			throw new IOException(text.isBlank() ? "Claude Code reported an error." : text);
-		}
-		return text;
-	}
-
-	private JsonObject invoke(String exe, Path workDir, Path promptFile, String question, String resume,
+	/** Runs claude once and returns its result event. {@code resume} is the session to continue, or null for a new one. */
+	private ClaudeResult invoke(String exe, Path workDir, Path promptFile, String question, String resume,
 		Consumer<String> onProgress) throws IOException, InterruptedException {
 		// Only this mod's MCP server: --strict-mcp-config also keeps the player's other MCP servers, configured for
-		// Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON.
+		// Claude Code in general, out of Minecraft questions. A file avoids Windows quoting of JSON. It holds the
+		// server's bearer token, so it exists only while claude runs.
 		Path mcpConfig = ClaudeConfig.dir().resolve("mcp.json");
-		Files.writeString(mcpConfig, mcp.claudeConfig(), StandardCharsets.UTF_8);
+		writeOwnerOnly(mcpConfig, mcp.claudeConfig());
+		try {
+			return runProcess(command(exe, mcpConfig, promptFile, resume), workDir, question, onProgress);
+		} finally {
+			Files.deleteIfExists(mcpConfig);
+		}
+	}
+
+	private List<String> command(String exe, Path mcpConfig, Path promptFile, String resume) {
 		List<String> command = new ArrayList<>(List.of(exe, "-p",
 			"--output-format", "stream-json", "--verbose",
 			"--model", config.model,
@@ -227,50 +238,84 @@ public class ClaudeCli {
 			"--strict-mcp-config",
 			"--append-system-prompt-file", promptFile.toString()));
 		command.addAll(permissionFlags());
-		if (!config.effort.isEmpty()) {
-			command.add("--effort");
-			command.add(config.effort);
-		}
+		config.effort.flag().ifPresent(effort -> command.addAll(List.of("--effort", effort)));
 		if (resume != null) {
 			command.add("--resume");
 			command.add(resume);
 		}
+		return command;
+	}
 
+	/**
+	 * Starts claude, sends the question and waits for it, reading its output on a thread of its own. On a timeout, an
+	 * interrupt or any other failure, claude and every process it started are killed.
+	 */
+	private ClaudeResult runProcess(List<String> command, Path workDir, String question, Consumer<String> onProgress)
+		throws IOException, InterruptedException {
 		Path errLog = ClaudeConfig.dir().resolve("last-error.log");
 		Process process = new ProcessBuilder(command)
 			.directory(workDir.toFile())
 			.redirectError(errLog.toFile())
 			.start();
 
-		// The question goes over stdin so quotes and special characters survive Windows argument parsing.
-		try (OutputStream stdin = process.getOutputStream()) {
-			stdin.write(question.getBytes(StandardCharsets.UTF_8));
-		}
-		StreamResult stream = new StreamResult();
-		CompletableFuture<Void> reader = CompletableFuture.runAsync(() -> readStream(process.getInputStream(), onProgress, stream));
+		ClaudeStream stream = new ClaudeStream(onProgress);
+		Thread reader = new Thread(() -> stream.read(process.getInputStream()), "Claude Chat output");
+		reader.setDaemon(true);
+		reader.start();
 
+		try {
+			// The question goes over stdin so quotes and special characters survive Windows argument parsing.
+			try (OutputStream stdin = process.getOutputStream()) {
+				stdin.write(question.getBytes(StandardCharsets.UTF_8));
+			}
+			waitForExit(process);
+		} finally {
+			Approvals.cancelAll();
+			if (process.isAlive()) {
+				killWithDescendants(process);
+			}
+		}
+
+		reader.join(OUTPUT_DRAIN_MILLIS);
+		Optional<ClaudeResult> result = stream.result();
+		if (result.isPresent()) {
+			return result.get();
+		}
+
+		String err = Files.exists(errLog) ? Files.readString(errLog).strip() : "";
+		String detail = !err.isEmpty() ? err : stream.head();
+		throw new IOException("Claude Code failed (exit " + process.exitValue() + "): "
+			+ (detail.length() > 300 ? detail.substring(0, 300) + "..." : detail));
+	}
+
+	/** Waits for claude to exit; throws once it has worked longer than the timeout. */
+	private void waitForExit(Process process) throws IOException, InterruptedException {
 		// Time spent waiting for the player to Allow or Deny doesn't count towards the timeout.
 		long started = System.currentTimeMillis();
 		long waitedBefore = Approvals.waitedMillis();
-		try {
-			while (!process.waitFor(1, TimeUnit.SECONDS)) {
-				long working = System.currentTimeMillis() - started - (Approvals.waitedMillis() - waitedBefore);
-				if (!Approvals.isWaiting() && working > config.timeoutSeconds * 1000L) {
-					process.destroyForcibly();
-					throw new IOException("Claude took longer than " + config.timeoutSeconds + "s and was stopped.");
-				}
+		while (!process.waitFor(1, TimeUnit.SECONDS)) {
+			long working = System.currentTimeMillis() - started - (Approvals.waitedMillis() - waitedBefore);
+			if (!Approvals.isWaiting() && working > config.timeoutSeconds * 1000L) {
+				throw new IOException("Claude took longer than " + config.timeoutSeconds + "s and was stopped.");
 			}
-		} finally {
-			Approvals.cancelAll();
 		}
-		reader.join();
-		if (stream.result != null) {
-			return stream.result;
+	}
+
+	/** Shell commands claude started would outlive it, and could keep changing files, if only claude were killed. */
+	private static void killWithDescendants(Process process) {
+		// Listed first: once claude is gone, its children are no longer its descendants.
+		List<ProcessHandle> descendants = process.descendants().toList();
+		process.destroyForcibly();
+		descendants.forEach(ProcessHandle::destroyForcibly);
+	}
+
+	/** Writes a file only its owner can read, where the file system supports that (not on Windows). */
+	private static void writeOwnerOnly(Path file, String text) throws IOException {
+		Files.deleteIfExists(file);
+		if (file.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+			Files.createFile(file, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")));
 		}
-		String err = Files.exists(errLog) ? Files.readString(errLog).strip() : "";
-		String detail = !err.isEmpty() ? err : stream.raw.toString().strip();
-		throw new IOException("Claude Code failed (exit " + process.exitValue() + "): "
-			+ (detail.length() > 300 ? detail.substring(0, 300) + "..." : detail));
+		Files.writeString(file, text, StandardCharsets.UTF_8);
 	}
 
 	/**
@@ -296,86 +341,12 @@ public class ClaudeCli {
 		};
 	}
 
-	private static final class StreamResult {
-		JsonObject result;
-		final StringBuilder raw = new StringBuilder();
-	}
-
-	/**
-	 * Reads stream-json events. Each text block arrives as its own event, and only afterwards do we learn whether a tool
-	 * call follows it. So text is held back: if more activity follows, it was a progress note; the last one is the answer
-	 * (which also arrives in the final "result" event).
-	 */
-	private static void readStream(InputStream in, Consumer<String> onProgress, StreamResult out) {
-		String pending = null;
-		try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8))) {
-			String line;
-			while ((line = reader.readLine()) != null) {
-				if (out.raw.length() < 2000) {
-					out.raw.append(line).append('\n');
-				}
-				JsonObject event;
-				try {
-					event = JsonParser.parseString(line).getAsJsonObject();
-				} catch (RuntimeException e) {
-					continue;
-				}
-				String type = event.has("type") ? event.get("type").getAsString() : "";
-				if (type.equals("result")) {
-					out.result = event;
-				} else if (type.equals("assistant") || type.equals("user")) {
-					String text = type.equals("assistant") ? textOf(event) : null;
-					boolean toolActivity = type.equals("user") || hasBlock(event, "tool_use");
-					if (pending != null && (text != null || toolActivity)) {
-						onProgress.accept(pending);
-						pending = null;
-					}
-					if (text != null) {
-						pending = text;
-					}
-				}
-			}
-		} catch (IOException e) {
-			ClaudeChatClient.LOGGER.debug("Claude output stream closed", e);
-		}
-	}
-
-	private static String textOf(JsonObject event) {
-		StringBuilder sb = new StringBuilder();
-		for (JsonElement block : contentBlocks(event)) {
-			JsonObject obj = block.getAsJsonObject();
-			if ("text".equals(obj.get("type").getAsString()) && obj.has("text")) {
-				sb.append(obj.get("text").getAsString());
-			}
-		}
-		String text = sb.toString().strip();
-		return text.isEmpty() ? null : text;
-	}
-
-	private static boolean hasBlock(JsonObject event, String blockType) {
-		for (JsonElement block : contentBlocks(event)) {
-			if (blockType.equals(block.getAsJsonObject().get("type").getAsString())) {
-				return true;
-			}
-		}
-		return false;
-	}
-
-	private static JsonArray contentBlocks(JsonObject event) {
-		if (event.has("message") && event.getAsJsonObject("message").has("content")
-			&& event.getAsJsonObject("message").get("content").isJsonArray()) {
-			return event.getAsJsonObject("message").getAsJsonArray("content");
-		}
-		return new JsonArray();
-	}
-
 	private Optional<String> findExecutable() {
-		if (!config.claudePath.isEmpty()) {
-			return Optional.of(config.claudePath);
+		if (config.claudePath.isPresent()) {
+			return config.claudePath.map(Path::toString);
 		}
 
-		boolean windows = System.getProperty("os.name").toLowerCase().contains("win");
-		String name = windows ? "claude.exe" : "claude";
+		String name = WINDOWS ? "claude.exe" : "claude";
 		String path = System.getenv("PATH");
 		if (path != null) {
 			for (String entry : path.split(File.pathSeparator)) {
@@ -394,7 +365,7 @@ public class ClaudeCli {
 
 		// Fallback: the copy bundled with the Claude desktop app (%APPDATA%\Claude\claude-code\<version>\<hash>\claude.exe).
 		String appData = System.getenv("APPDATA");
-		if (windows && appData != null) {
+		if (WINDOWS && appData != null) {
 			Path bundled = Path.of(appData, "Claude", "claude-code");
 			if (Files.isDirectory(bundled)) {
 				try (Stream<Path> files = Files.find(bundled, 3, (p, attrs) -> attrs.isRegularFile() && p.getFileName().toString().equals(name))) {

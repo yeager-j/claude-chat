@@ -39,7 +39,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | File | Role |
 | --- | --- |
 | `ClaudeChatClient` | Entry point: `/claude` commands, `@claude` chat hook, lifecycle events |
-| `ClaudeCli` | Runs `claude -p`: system prompt, stream-json parsing, progress notes, MCP config |
+| `ClaudeCli` | Runs `claude -p`: system prompt, flags, MCP config, timeout (kills `claude` and its child processes) |
+| `ClaudeStream`, `ClaudeResult` | Reads the stream-json output: progress notes, and the final `result` event parsed once (retry only on a missing session) |
 | `ClaudeConfig` | `config/claudechat.properties`; `configVersion` drives migrations |
 | `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand) with Vineflower in a separate JVM; extracts data and lang files; world data packs; the prompt's file map |
 | `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
@@ -96,7 +97,8 @@ Minecraft 26.x ships **unobfuscated** with Mojang's names, so there are no mappi
 
 **claude CLI**
 - **Install and sign-in:** the Claude desktop app's bundled `claude.exe` isn't signed in for standalone use. The real CLI is in `~/.local/bin`, which is often not on the game's PATH, so `ClaudeCli.findExecutable` checks it explicitly.
-- **stream-json events:** `--output-format stream-json` needs `--verbose`. Each content block is its own `assistant` event, so text is only known to be a progress note once a later tool call arrives (`readStream`).
+- **stream-json events:** `--output-format stream-json` needs `--verbose`. Each content block is its own `assistant` event, so text is only known to be a progress note once a later tool call arrives (`ClaudeStream`).
+- **Missing session:** `--resume <id>` for a conversation Claude Code no longer has prints a `result` event with `is_error`, `num_turns: 0` and `errors: ["No conversation found with session ID: …"]`. Only that is retried as a new conversation; any other error may come after tools ran.
 - **Windows argument quoting:** this breaks JSON and long strings. The system prompt and MCP config go in files (`--append-system-prompt-file`, `--mcp-config <file>`), and the question goes over stdin.
 - **Tool flags:** `--tools` limits built-in tools. MCP tools are allowed with `--allowedTools mcp__minecraft`, and `--strict-mcp-config` keeps the user's other MCP servers out.
 - **Permission prompts under `-p`:** there's no terminal to ask in. `--permission-prompt-tool mcp__minecraft__approve` sends each prompt to our MCP tool as `{tool_name, input, tool_use_id}`. It answers `{"behavior":"allow","updatedInput":…}` or `{"behavior":"deny","message":…}`. `--disallowedTools` hides the tool from Claude but it still handles prompts. Shell commands that only read never prompt. A 150 s wait in the tool was fine.

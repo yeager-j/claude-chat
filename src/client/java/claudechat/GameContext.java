@@ -25,7 +25,7 @@ public final class GameContext {
 	public static String describe(Minecraft mc) {
 		StringBuilder sb = new StringBuilder();
 		sb.append("Minecraft Java Edition ").append(SharedConstants.getCurrentVersion().name()).append(" with Fabric.\n");
-		sb.append("Multiplayer: ").append(mc.getSingleplayerServer() == null ? "yes (server)" : "no (single-player)").append('\n');
+		// Single-player or multiplayer is stated by ClaudeCli's prompt, from whether the world tools are offered.
 
 		LocalPlayer player = mc.player;
 		Level level = mc.level;
@@ -37,7 +37,7 @@ public final class GameContext {
 			sb.append("Dimension: ").append(level.dimension().identifier()).append('\n');
 			sb.append("Biome: ").append(level.getBiome(pos).getRegisteredName()).append('\n');
 			sb.append("Position: ").append(pos.getX()).append(' ').append(pos.getY()).append(' ').append(pos.getZ()).append('\n');
-			sb.append("Health: ").append(Math.round(player.getHealth())).append("/20\n");
+			sb.append("Health: ").append(Math.round(player.getHealth())).append('/').append(Math.round(player.getMaxHealth())).append('\n');
 			sb.append("Weather: ").append(level.isRaining() ? "raining" : "clear").append('\n');
 
 			ItemStack held = player.getMainHandItem();

@@ -27,8 +27,10 @@ import java.util.concurrent.Executors;
  * the whole game session: {@link ModTools} always, {@link ViewSnapshot} while any world is open, {@link WorldTools}
  * only while a single-player world is open. Each
  * question starts a new claude process, which lists the tools afresh. Listens on 127.0.0.1 on a random port and
- * requires a random bearer token, so only the claude process this mod starts can use it. Plain sockets rather than the
- * JDK's HTTP server, which some launchers' trimmed Java runtimes don't include.
+ * requires a random bearer token. The token reaches claude in config/claudechat/mcp.json, which exists only while a
+ * question runs (and is owner-only where the file system supports that), so another local process can use the server
+ * only if it can read the player's files during a question. Plain sockets rather than the JDK's HTTP server, which some
+ * launchers' trimmed Java runtimes don't include.
  */
 public class McpServer {
 	private static final String FALLBACK_PROTOCOL = "2025-06-18";
