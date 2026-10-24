@@ -1,10 +1,14 @@
 package claudechat.test;
 
+import claudechat.ClaudeConfig;
 import com.mojang.brigadier.suggestion.Suggestion;
 import com.mojang.brigadier.suggestion.Suggestions;
 import net.minecraft.client.multiplayer.chat.GuiMessage;
 import net.minecraft.network.chat.HoverEvent;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.Path;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.IntStream;
@@ -14,8 +18,8 @@ import static claudechat.test.Game.check;
 
 /**
  * What every run checks in a world: the world tools are offered, /claude preview and recipe grids draw, tab completion
- * offers the effort levels, /claude knowledge lists the sources, and the status line updates in place until the
- * answer replaces it.
+ * offers the effort levels, /claude knowledge lists the sources, Claude starts in the knowledge folder, and the status
+ * line updates in place until the answer replaces it.
  */
 final class BasicsStep {
 	private static final String PROGRESS_NOTE = "Checking the fake data";
@@ -64,6 +68,18 @@ final class BasicsStep {
 		check(trim.contains("item/sentry_armor_trim_smithing_template") && !trim.contains("[Smithing Template]"),
 			"the trim recipe has no icons: " + trim);
 		game.screenshot("claudechat-recipes");
+		workingDirectory(game);
+	}
+
+	/** Claude starts in the knowledge folder: the reads Read only pre-approves ({@code Read(./**)}) are relative to it. */
+	private static void workingDirectory(Game game) {
+		try {
+			Path knowledge = ClaudeConfig.dir().resolve("knowledge").toRealPath();
+			Path started = game.claudeWorkingDirectory().toRealPath();
+			check(started.equals(knowledge), "claude started in " + started + ", not the knowledge folder " + knowledge);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
 	}
 
 	private static int indexOf(List<String> lines, String text) {

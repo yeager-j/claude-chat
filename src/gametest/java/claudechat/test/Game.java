@@ -320,6 +320,15 @@ final class Game {
 		}
 	}
 
+	/** The working directory the last question started in. */
+	Path claudeWorkingDirectory() {
+		try {
+			return FakeClaude.workingDirectory(fake);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
 	List<String> fakeCalls() {
 		try {
 			return FakeClaude.calls(fake);

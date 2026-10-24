@@ -100,7 +100,8 @@ public class ClaudeCli {
 		int timeoutSeconds = config.timeoutSeconds;
 		ClaudeRun.Request request = run.request();
 
-		// Run inside the knowledge folder: Claude can search it, and won't pick up a CLAUDE.md or other files from the game directory.
+		// Run inside the knowledge folder: Claude can search it, and won't pick up a CLAUDE.md or other files from the game
+		// directory. The tiers' pre-approved reads are relative to it (PermissionTier.PRE_APPROVED_READS).
 		Path workDir = knowledge.root();
 		Files.createDirectories(workDir);
 		Files.createDirectories(runsDir());

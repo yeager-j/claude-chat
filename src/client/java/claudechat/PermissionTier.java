@@ -24,9 +24,11 @@ public enum PermissionTier {
 				""".formatted(McpServer.claudeName(GameCommands.TOOL));
 		}
 
+		/** Nothing answers permission prompts, so a read outside the knowledge folder is denied. */
 		@Override
 		public List<String> cliFlags(boolean toolsServer, String gameDir) {
-			return List.of("--tools", READ_TOOLS, "--allowedTools", allowedTools(toolsServer), "--disallowedTools", APPROVE_TOOL);
+			return List.of("--tools", READ_TOOLS, "--allowedTools", allowedTools(toolsServer), "--disallowedTools", APPROVE_TOOL,
+				"--permission-mode", "default");
 		}
 	},
 
@@ -39,14 +41,17 @@ public enum PermissionTier {
 			return actPrompt(worldOpen, "The player approves each change in chat. If they deny one, don't try another way to do it.");
 		}
 
-		/** Anything not pre-approved goes to the approve tool, which asks in chat; without the tools server nobody could answer, so it's denied. */
+		/**
+		 * Anything not pre-approved goes to the approve tool, which asks in chat; without the tools server nobody could
+		 * answer, so it's denied. Reads in the game folder ({@code --add-dir}) don't ask; reads elsewhere do.
+		 */
 		@Override
 		public List<String> cliFlags(boolean toolsServer, String gameDir) {
 			List<String> askHow = toolsServer
 				? List.of("--disallowedTools", APPROVE_TOOL, "--permission-prompt-tool", APPROVE_TOOL)
 				: List.of("--permission-prompts", "none");
 			return Stream.concat(Stream.of("--tools", READ_TOOLS + "," + WRITE_TOOLS, "--allowedTools", allowedTools(toolsServer),
-				"--add-dir", gameDir), askHow.stream()).toList();
+				"--add-dir", gameDir, "--permission-mode", "default"), askHow.stream()).toList();
 		}
 	},
 
@@ -75,8 +80,15 @@ public enum PermissionTier {
 		REFUSE
 	}
 
-	/** Always offered and never asked about: Claude can search the knowledge folder and the web. */
+	/** Always offered: Claude can search the knowledge folder and the web. */
 	static final String READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch";
+	/**
+	 * Never asked about: file reads within the working directory, which {@link ClaudeCli} sets to the knowledge folder,
+	 * and the web. A bare {@code Read} rule would pre-approve reading any file the player's account can, so text Claude
+	 * reads in the world could talk it into reading private files. Rule paths starting {@code ./} are relative to the
+	 * working directory.
+	 */
+	static final String PRE_APPROVED_READS = "Read(./**),Grep(./**),Glob(./**),WebSearch,WebFetch";
 	/** Added for Ask for approval and Full access. Shell commands that only read are still allowed without asking. */
 	static final String WRITE_TOOLS = "Bash,Edit,Write"
 		+ (System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows") ? ",PowerShell" : "");
@@ -119,7 +131,8 @@ public enum PermissionTier {
 
 	/**
 	 * Claude Code's tool and permission flags. Our own MCP tools are always pre-approved: run_command decides for
-	 * itself which game commands need the player's OK.
+	 * itself which game commands need the player's OK. Read only and Ask name {@code --permission-mode default}, so a
+	 * {@code defaultMode} in the player's own Claude Code settings (such as {@code bypassPermissions}) can't loosen them.
 	 *
 	 * @param toolsServer whether the mod's MCP server is running
 	 * @param gameDir     the game folder, which edits and shell commands may reach (config, saves, mods)
@@ -141,7 +154,7 @@ public enum PermissionTier {
 	}
 
 	private static String allowedTools(boolean toolsServer) {
-		return toolsServer ? READ_TOOLS + "," + McpServer.CLAUDE_PREFIX : READ_TOOLS;
+		return toolsServer ? PRE_APPROVED_READS + "," + McpServer.CLAUDE_PREFIX : PRE_APPROVED_READS;
 	}
 
 	private static String actPrompt(boolean worldOpen, String approval) {
