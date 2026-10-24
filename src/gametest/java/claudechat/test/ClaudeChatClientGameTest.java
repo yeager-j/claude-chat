@@ -628,62 +628,17 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 	}
 
 	/**
-	 * Builds a scene facing north from the player's position, calls look and checks what it saw and didn't see. Relative
-	 * to the player, so it works in the superflat and the normal test world.
+	 * Builds scenes facing north from the player's position, calls look and checks what it saw and didn't see. Relative
+	 * to the player, so it works in the superflat and the normal test world. The scenes cover what look must hide: what's
+	 * behind opaque blocks, the back of a sign, a container's name, what's in the dark, past Blindness, or past the fog
+	 * under water; and the third-person crosshair.
 	 */
 	private static void testLook(ClientGameTestContext context, TestSingleplayerContext singleplayer) {
 		var p = singleplayer.getServer().computeOnServer(s -> s.getPlayerList().getPlayers().getFirst().blockPosition());
 		int x = p.getX();
 		int y = p.getY();
 		int z = p.getZ();
-		List<String> commands = List.of(
-			"fill " + (x - 6) + " " + y + " " + (z - 9) + " " + (x + 6) + " " + (y + 8) + " " + (z + 2) + " air",
-			"fill " + (x - 6) + " " + (y - 1) + " " + (z - 9) + " " + (x + 6) + " " + (y - 1) + " " + (z + 2) + " grass_block",
-			"kill @e[type=!player]",
-			"fill " + (x - 3) + " " + y + " " + (z - 4) + " " + (x + 3) + " " + (y + 4) + " " + (z - 4) + " stone",
-			"fill " + (x + 1) + " " + (y + 1) + " " + (z - 4) + " " + (x + 2) + " " + (y + 2) + " " + (z - 4) + " glass",
-			"fill " + (x + 1) + " " + (y + 1) + " " + (z - 6) + " " + (x + 2) + " " + (y + 2) + " " + (z - 6) + " diamond_block",
-			"setblock " + (x - 2) + " " + (y + 2) + " " + (z - 6) + " gold_block",
-			"setblock " + (x - 2) + " " + y + " " + (z - 2) + " oak_sign[rotation=8]{front_text:{messages:[\"Hello\",\"Claude\",\"\",\"\"]}}",
-			"setblock " + (x + 2) + " " + y + " " + (z - 3) + " torch",
-			"summon pig " + (x - 1 + 0.5) + " " + y + " " + (z - 2 + 0.5) + " {NoAI:1b,CustomName:\"Visible\"}",
-			"summon pig " + (x + 0.5) + " " + y + " " + (z - 7 + 0.5) + " {NoAI:1b,CustomName:\"Hidden\"}",
-			"tp @p " + (x + 0.5) + " " + y + " " + (z + 0.5) + " 180 0");
-		commands.forEach(singleplayer.getServer()::runCommand);
-		context.waitTicks(20);
-		singleplayer.getConnection().waitForChunksRender();
-		context.takeScreenshot("claudechat-look");
-
-		// Called directly rather than through logTool, to keep the screenshot; it's saved next to the test's own.
-		long start = System.nanoTime();
-		CompletableFuture<ViewSnapshot.Result> result = CompletableFuture.supplyAsync(() -> {
-			try {
-				return ClaudeChatClient.viewSnapshot().call(new JsonObject());
-			} catch (Exception e) {
-				throw new RuntimeException(e);
-			}
-		});
-		context.waitFor(mc -> result.isDone(), 60 * SECONDS);
-		JsonObject look = result.join().data();
-		LOGGER.info("tool look ({} ms) -> {}", (System.nanoTime() - start) / 1_000_000, look);
-		byte[] png = result.join().png();
-		check(png != null && png.length > 1000, "no screenshot: " + look.get("screenshot"));
-		try {
-			Files.write(FabricLoader.getInstance().getGameDir().resolve("screenshots/claudechat-look-tool.png"), png);
-		} catch (IOException e) {
-			throw new UncheckedIOException(e);
-		}
-		String blocks = look.getAsJsonArray("blocks").toString();
-		String entities = look.getAsJsonArray("entities").toString();
-		check("stone".equals(look.getAsJsonObject("crosshair").has("block") ? look.getAsJsonObject("crosshair").get("block").getAsString() : null),
-			"crosshair isn't on the stone wall: " + look.get("crosshair"));
-		check(blocks.contains("\"diamond_block\"") && blocks.matches(".*\"diamond_block\"[^}]*\"seen_through\":\"glass.*"),
-			"diamond blocks not seen through the glass: " + blocks);
-		check(!blocks.contains("gold_block"), "saw the gold block behind the wall");
-		check(blocks.contains("\"torch\""), "missed the torch");
-		check(look.has("block_details") && look.get("block_details").toString().contains("Hello / Claude"), "sign text missing");
-		check(entities.contains("Visible") && !entities.contains("Hidden"), "wrong pigs: " + entities);
-		check(entities.contains("\"in_image\"") && blocks.matches(".*\"diamond_block\"[^}]*\"in_image\".*"), "image positions missing");
+		testLookOcclusion(context, singleplayer, x, y, z);
 
 		String question = System.getenv("CLAUDECHAT_LOOK_QUESTION");
 		if (question != null && !question.isBlank()) {
@@ -695,6 +650,160 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 			context.takeScreenshot("claudechat-look-answer");
 			context.getInput().pressKey(KEY_ESCAPE);
 		}
+
+		testLookThirdPerson(context);
+		testLookDarkness(context, singleplayer, x, y, z);
+		testLookBlindness(context, singleplayer);
+		testLookUnderWater(context, singleplayer, x, y, z);
+	}
+
+	/**
+	 * A stone wall with a glass window: the diamond blocks behind the window must be seen through glass; the gold block
+	 * and the pig behind the wall must not be seen at all. In front of the wall, a sign whose back text faces away and a
+	 * chest whose name isn't shown in the world.
+	 */
+	private static void testLookOcclusion(ClientGameTestContext context, TestSingleplayerContext singleplayer, int x, int y, int z) {
+		runLookScene(context, singleplayer, List.of(
+			"fill " + (x - 3) + " " + y + " " + (z - 4) + " " + (x + 3) + " " + (y + 4) + " " + (z - 4) + " stone",
+			"fill " + (x + 1) + " " + (y + 1) + " " + (z - 4) + " " + (x + 2) + " " + (y + 2) + " " + (z - 4) + " glass",
+			"fill " + (x + 1) + " " + (y + 1) + " " + (z - 6) + " " + (x + 2) + " " + (y + 2) + " " + (z - 6) + " diamond_block",
+			"setblock " + (x - 2) + " " + (y + 2) + " " + (z - 6) + " gold_block",
+			"setblock " + (x - 2) + " " + y + " " + (z - 2) + " oak_sign[rotation=0]{front_text:{messages:[\"Hello\",\"Claude\",\"\",\"\"]},"
+				+ "back_text:{messages:[\"Behind\",\"\",\"\",\"\"]}}",
+			"setblock " + x + " " + y + " " + (z - 3) + " chest[facing=south]{CustomName:\"Secret\"}",
+			"setblock " + (x + 2) + " " + y + " " + (z - 3) + " torch",
+			"summon pig " + (x - 1 + 0.5) + " " + y + " " + (z - 2 + 0.5) + " {NoAI:1b,CustomName:\"Visible\"}",
+			"summon pig " + (x + 0.5) + " " + y + " " + (z - 7 + 0.5) + " {NoAI:1b,CustomName:\"Hidden\"}"), x, y, z);
+		context.takeScreenshot("claudechat-look");
+
+		JsonObject look = callLook(context, "claudechat-look-tool");
+		String blocks = look.getAsJsonArray("blocks").toString();
+		String entities = look.getAsJsonArray("entities").toString();
+		String details = String.valueOf(look.get("block_details"));
+		check("stone".equals(stringOrNull(look.getAsJsonObject("crosshair"), "block")),
+			"crosshair isn't on the stone wall: " + look.get("crosshair"));
+		check(blocks.matches(".*\"diamond_block\"[^}]*\"seen_through\":\"glass.*"), "diamond blocks not seen through the glass: " + blocks);
+		check(blocks.matches(".*\"block\":\"glass\",\"screen_share\":\"[0-9u].*"), "the glass has no screen share: " + blocks);
+		check(!blocks.contains("gold_block"), "saw the gold block behind the wall");
+		check(blocks.contains("\"torch\""), "missed the torch");
+		check(blocks.contains("\"chest\"") && !look.toString().contains("Secret"), "chest missing, or its hidden name shown: " + blocks);
+		check(details.contains("Hello / Claude") && !details.contains("Behind"), "wrong sign text: " + details);
+		check(entities.contains("Visible") && !entities.contains("Hidden"), "wrong pigs: " + entities);
+		check(entities.contains("\"in_image\"") && blocks.matches(".*\"diamond_block\"[^}]*\"in_image\".*"), "image positions missing");
+	}
+
+	/** In third person there's no crosshair: look must say so, and the player's own body is in view. */
+	private static void testLookThirdPerson(ClientGameTestContext context) {
+		context.runOnClient(mc -> mc.options.setCameraType(net.minecraft.client.CameraType.THIRD_PERSON_BACK));
+		context.waitTicks(5);
+		JsonObject look = callLook(context, "claudechat-look-third-person");
+		context.runOnClient(mc -> mc.options.setCameraType(net.minecraft.client.CameraType.FIRST_PERSON));
+		context.waitTicks(5);
+
+		check("third person".equals(stringOrNull(look.getAsJsonObject("camera"), "perspective")), "not third person: " + look.get("camera"));
+		check(look.getAsJsonObject("crosshair").has("note"), "no third-person note on the crosshair: " + look.get("crosshair"));
+		check(!look.getAsJsonObject("screenshot").has("crosshair"), "third-person screenshot claims a crosshair");
+		check(look.getAsJsonArray("entities").toString().contains("\"type\":\"player\""), "own body not seen in third person");
+	}
+
+	/**
+	 * A sealed stone box with a tinted glass front, which keeps out sky light: the emerald block and the pig inside are
+	 * too dark to see until a glowstone lights them.
+	 */
+	private static void testLookDarkness(ClientGameTestContext context, TestSingleplayerContext singleplayer, int x, int y, int z) {
+		runLookScene(context, singleplayer, List.of(
+			"fill " + (x - 2) + " " + (y - 1) + " " + (z - 8) + " " + (x + 2) + " " + (y + 3) + " " + (z - 4) + " stone",
+			"fill " + (x - 1) + " " + y + " " + (z - 7) + " " + (x + 1) + " " + (y + 2) + " " + (z - 5) + " air",
+			"fill " + (x - 1) + " " + y + " " + (z - 4) + " " + (x + 1) + " " + (y + 2) + " " + (z - 4) + " tinted_glass",
+			"setblock " + x + " " + (y + 1) + " " + (z - 7) + " emerald_block",
+			"summon pig " + (x + 0.5) + " " + y + " " + (z - 5 + 0.5) + " {NoAI:1b,CustomName:\"Lurker\"}"), x, y, z);
+
+		JsonObject dark = callLook(context, "claudechat-look-dark");
+		String darkBlocks = dark.getAsJsonArray("blocks").toString();
+		check(darkBlocks.contains("\"tinted_glass\"") && !darkBlocks.contains("emerald_block"), "saw into the dark box: " + darkBlocks);
+		check(dark.has("too_dark"), "no too_dark share: " + dark);
+		check(!dark.getAsJsonArray("entities").toString().contains("Lurker"), "saw the pig in the dark");
+
+		singleplayer.getServer().runCommand("setblock " + (x - 1) + " " + (y + 2) + " " + (z - 7) + " glowstone");
+		context.waitTicks(20);
+		singleplayer.getConnection().waitForChunksRender();
+		JsonObject lit = callLook(context, "claudechat-look-lit");
+		check(lit.getAsJsonArray("blocks").toString().matches(".*\"emerald_block\"[^}]*\"seen_through\":\"tinted_glass.*"),
+			"emerald block not seen once lit: " + lit.get("blocks"));
+		check(lit.getAsJsonArray("entities").toString().contains("Lurker"), "pig not seen once lit: " + lit.get("entities"));
+	}
+
+	/** Blindness fogs everything past 5 blocks: the box's front (3.5 blocks away) shows, the emerald block (6.5) doesn't. */
+	private static void testLookBlindness(ClientGameTestContext context, TestSingleplayerContext singleplayer) {
+		singleplayer.getServer().runCommand("effect give @p minecraft:blindness 60 0 true");
+		context.waitTicks(10);
+		JsonObject look = callLook(context, "claudechat-look-blind");
+		singleplayer.getServer().runCommand("effect clear @p minecraft:blindness");
+		context.waitTicks(10);
+
+		String blocks = look.getAsJsonArray("blocks").toString();
+		JsonObject camera = look.getAsJsonObject("camera");
+		check(blocks.contains("\"tinted_glass\"") && !blocks.contains("emerald_block"), "Blindness didn't limit the view: " + blocks);
+		check(camera.get("ray_range").getAsInt() <= 5 && "Blindness or Darkness effect".equals(stringOrNull(camera, "ray_range_limited_by")),
+			"ray range not limited by Blindness: " + camera);
+	}
+
+	/** With the camera under water, the water's fog limits how far rays go. */
+	private static void testLookUnderWater(ClientGameTestContext context, TestSingleplayerContext singleplayer, int x, int y, int z) {
+		singleplayer.getServer().runCommand("fill " + (x - 1) + " " + y + " " + (z - 1) + " " + (x + 1) + " " + (y + 2) + " " + (z + 1) + " water");
+		context.waitTicks(10);
+		JsonObject look = callLook(context, "claudechat-look-water");
+		singleplayer.getServer().runCommand("fill " + (x - 10) + " " + (y - 1) + " " + (z - 10) + " " + (x + 10) + " " + (y + 3) + " " + (z + 10)
+			+ " air replace water");
+		context.waitTicks(10);
+
+		JsonObject camera = look.getAsJsonObject("camera");
+		check("water".equals(stringOrNull(camera, "camera_in")) && "water".equals(stringOrNull(camera, "ray_range_limited_by"))
+			&& camera.get("ray_range").getAsInt() <= 96, "water fog didn't limit the view: " + camera);
+	}
+
+	/** Clears the space in front of the player, builds a scene, and faces the player north at it. */
+	private static void runLookScene(ClientGameTestContext context, TestSingleplayerContext singleplayer, List<String> scene, int x, int y, int z) {
+		List<String> commands = new ArrayList<>(List.of(
+			"fill " + (x - 6) + " " + y + " " + (z - 9) + " " + (x + 6) + " " + (y + 8) + " " + (z + 2) + " air",
+			"fill " + (x - 6) + " " + (y - 1) + " " + (z - 9) + " " + (x + 6) + " " + (y - 1) + " " + (z + 2) + " grass_block",
+			"kill @e[type=!player]"));
+		commands.addAll(scene);
+		commands.add("tp @p " + (x + 0.5) + " " + y + " " + (z + 0.5) + " 180 0");
+		commands.forEach(singleplayer.getServer()::runCommand);
+		context.waitTicks(20);
+		singleplayer.getConnection().waitForChunksRender();
+	}
+
+	/**
+	 * Calls look directly rather than through logTool, to keep its screenshot, saved next to the test's own as
+	 * {@code <name>.png}. Returns the data.
+	 */
+	private static JsonObject callLook(ClientGameTestContext context, String name) {
+		long start = System.nanoTime();
+		CompletableFuture<ViewSnapshot.Result> result = CompletableFuture.supplyAsync(() -> {
+			try {
+				return ClaudeChatClient.viewSnapshot().call(new JsonObject());
+			} catch (Exception e) {
+				throw new RuntimeException(e);
+			}
+		});
+		context.waitFor(mc -> result.isDone(), 60 * SECONDS);
+		JsonObject look = result.join().data();
+		LOGGER.info("tool look {} ({} ms) -> {}", name, (System.nanoTime() - start) / 1_000_000, look);
+		byte[] png = result.join().png();
+		check(png != null && png.length > 1000, "no screenshot: " + look.get("screenshot"));
+		try {
+			Files.write(FabricLoader.getInstance().getGameDir().resolve("screenshots/" + name + ".png"), png);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+
+		return look;
+	}
+
+	private static String stringOrNull(JsonObject object, String key) {
+		return object != null && object.has(key) ? object.get(key).getAsString() : null;
 	}
 
 	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {
