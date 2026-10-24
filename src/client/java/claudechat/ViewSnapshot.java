@@ -1,23 +1,23 @@
 package claudechat;
 
+import claudechat.SightTracer.Hit;
+import claudechat.SightTracer.Layer;
+import claudechat.SightTracer.Sample;
+import claudechat.ViewFrame.Ray;
+import claudechat.ViewFrame.ScreenPoint;
 import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.mojang.blaze3d.pipeline.RenderTarget;
-import net.minecraft.util.Util;
-import net.minecraft.client.Screenshot;
-import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.Screenshot;
 import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.renderer.state.GameRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
-import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
-import net.minecraft.tags.BlockTags;
-import net.minecraft.tags.FluidTags;
-import net.minecraft.tags.TagKey;
-import net.minecraft.world.Nameable;
+import net.minecraft.util.LightCoordsUtil;
+import net.minecraft.util.Util;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.EntityType;
 import net.minecraft.world.entity.LivingEntity;
@@ -25,83 +25,95 @@ import net.minecraft.world.entity.decoration.ItemFrame;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.item.ItemStack;
-import net.minecraft.world.level.BlockGetter;
-import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.block.IronBarsBlock;
-import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
 import net.minecraft.world.level.block.entity.SignText;
 import net.minecraft.world.level.block.entity.SignTextSlot;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.FluidState;
-import net.minecraft.world.level.material.Fluids;
 import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.EntityHitResult;
 import net.minecraft.world.phys.HitResult;
 import net.minecraft.world.phys.Vec3;
 
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.util.stream.Collectors;
 
 /**
  * The {@code look} tool: what the player sees, as data rather than pixels, so shaders and resource packs can't disguise
- * it. Casts one ray per cell of a grid laid over the screen through the camera's real projection, walking blocks
- * exactly (DDA) and clipping against block outline shapes, so a torch or a fence is hit where it really is. Sampling in
- * screen space means coverage follows on-screen size, like the player's eye, unlike rays spread evenly by angle from a
- * point (an explosion's), which drift apart with distance. Cells where the hit block or distance changes from a
- * neighbor are sampled 3×3 more, to catch small things on edges. Glass, panes and water let the ray continue, recording
- * what's behind. Entities get their own pass: in the view frustum, then line of sight to a few points on their box.
+ * it. Casts one ray per cell of a grid laid over the image through the projection the last frame was drawn with
+ * ({@link ViewFrame}), walking blocks exactly ({@link SightTracer}) and meeting each block where its model is drawn
+ * ({@link BlockSurfaces}), so a torch, a glass pane's frame or a leaf is hit where it really is. Sampling in screen
+ * space means coverage follows on-screen size, like the player's eye. Cells where what's seen or its distance changes
+ * from a neighbor are sampled 3×3 more, to catch small things on edges. Entities get their own pass: line of sight to a
+ * few points on their box.
  * <p>
- * The data comes with a screenshot of the same frame. The screenshot shows the layout; the data names what's in it,
- * whatever shaders or resource packs make it look like. Screen positions in the data are percent from the image's
- * left and top edges, so the two line up.
+ * The data comes with a screenshot of the same frame. Screen positions in the data are percent from the image's left
+ * and top edges, so the two line up.
  * <p>
- * Reads only the client's world, so it works on multiplayer servers too, and reports only what's in view and not
- * hidden behind opaque blocks: never more than the player could see themselves. Runs on the client thread.
+ * Reads only the client's world, so it works on multiplayer servers too. It never reports more than the player could
+ * see themselves:
+ * <ul>
+ * <li>only what's in view and not hidden behind something drawn opaque;</li>
+ * <li>nothing past the frame's fog: the render distance, water or lava around the camera, Blindness or Darkness;</li>
+ * <li>nothing too dark to make out ({@link SightTracer#bright}), unless the player has night vision; this also limits
+ * how deep into water the player sees;</li>
+ * <li>only the side of a sign that faces the player, and no block entity names, which aren't shown in the world;</li>
+ * <li>no other player's health.</li>
+ * </ul>
+ * Carved out on purpose: mob health (the game sends it to every client, and HUD mods show it), entity names (shown when
+ * the player looks at the entity), and the HUD and open screens, which cover part of the screenshot but not the data.
+ * Runs on the client thread.
  */
 public final class ViewSnapshot {
 	public static final String TOOL = "look";
 
-	/** Rays across the screen before refining edges. Rows follow the window's shape. */
+	/** Rays across the image before refining edges. Rows follow the image's shape. */
 	private static final int COLUMNS = 49;
 	/** Screenshots are scaled down by a whole factor to at most about this wide. */
 	private static final int MAX_IMAGE_WIDTH = 1280;
-	private static final TagKey<net.minecraft.world.level.block.Block> C_GLASS_BLOCKS =
-		TagKey.create(Registries.BLOCK, Identifier.fromNamespaceAndPath("c", "glass_blocks"));
-	private static final TagKey<net.minecraft.world.level.block.Block> C_GLASS_PANES =
-		TagKey.create(Registries.BLOCK, Identifier.fromNamespaceAndPath("c", "glass_panes"));
-	/** At most this many blocks along one ray: see-through layers plus the one that stops it. */
-	private static final int MAX_LAYERS = 6;
+	private static final int DEFAULT_RANGE = 256;
+	private static final int MIN_RANGE = 8;
+	private static final int MAX_RANGE = 512;
 	private static final int MAX_DETAILS = 20;
 	private static final int MAX_ENTITIES = 50;
+	/** Positions kept per kind of block, to bound memory on wide views; past it, counts read "4096+". */
+	private static final int MAX_POSITIONS = 4096;
+	/** A kind of block seen at this many positions or fewer lists them; more get a count and a bounding box. */
+	private static final int MAX_LISTED_POSITIONS = 6;
+	/** Points on an entity's box checked for line of sight. */
+	private static final int SIGHT_POINTS = 7;
 
 	public JsonObject definition() {
 		return WorldTools.tool(TOOL,
 			"What the player sees right now: a screenshot plus data about everything in it. The screenshot shows the "
 				+ "layout, but shaders and resource packs can make blocks look like something else, so go by the data for "
-				+ "what things are. Rays are cast through the player's screen, so only what's in view and not hidden behind "
-				+ "opaque blocks is reported. Returns the camera (position, facing, field of view), the block or entity under "
-				+ "the crosshair (the middle of the image), every visible kind of block (screen share, where it is in the "
-				+ "image, nearest position, the area it spans, what it was seen through such as glass or water), sign text "
-				+ "and custom names of visible blocks, and visible entities (where in the image, distance, health, held "
-				+ "items). Image positions are percent from the image's left and top edges. The screenshot includes the "
-				+ "HUD and any open chat or screen, which cover part of the view; the data doesn't. Use it for \"what am I "
-				+ "looking at\", \"what's that\", or to understand the player's surroundings.",
+				+ "what things are. Rays are cast through the player's screen, so only what the player could see is "
+				+ "reported: nothing hidden behind opaque blocks, past fog, water or a Blindness or Darkness effect, or too "
+				+ "dark to make out (too_dark says how much of the view is). Returns the camera (position, facing, field of "
+				+ "view, how far rays went and why), what the player is aiming at (in first person that's under the "
+				+ "crosshair, the middle of the image), every visible kind of block (screen share, where it is in the "
+				+ "image, nearest position, the area it spans, what it was seen through such as glass or water), the "
+				+ "text on the sides of visible signs facing the player, and visible entities (where in the image, "
+				+ "distance, mob health, held items). Image positions are percent from the image's left and top edges. "
+				+ "The screenshot includes the HUD and any open chat or screen, which cover part of the view; the data "
+				+ "doesn't. Use it for \"what am I looking at\", \"what's that\", or to understand the player's "
+				+ "surroundings.",
 			"""
 			{"type": "object", "properties": {
 			  "screenshot": {"type": "boolean", "description": "Include the screenshot (default true)."},
-			  "max_distance": {"type": "integer", "description": "How far rays go, in blocks (default: render distance, at most 256; max 512)."}
+			  "max_distance": {"type": "integer", "description": "How far rays go, in blocks (default 256, at most 512; never past what fog and the render distance let the player see)."}
 			}}
 			""");
 	}
@@ -121,20 +133,24 @@ public final class ViewSnapshot {
 	 * hand back the screenshot.
 	 */
 	public Result call(JsonObject args) throws Exception {
-		Integer maxDistance = args.has("max_distance") ? Math.max(8, Math.min(512, integer(args, "max_distance", 256))) : null;
+		int requestedRange = Math.clamp(integer(args, "max_distance", DEFAULT_RANGE), MIN_RANGE, MAX_RANGE);
 		boolean screenshot = !args.has("screenshot") || args.get("screenshot").getAsBoolean();
 		Minecraft mc = Minecraft.getInstance();
 		CompletableFuture<byte[]> png = new CompletableFuture<>();
+
 		JsonObject data = mc.submit(() -> {
-			JsonObject out = capture(mc, maxDistance);
+			JsonObject out = capture(mc, requestedRange);
 			if (screenshot) {
 				out.add("screenshot", startScreenshot(mc, png));
 			}
+
 			return out;
 		}).get(20, TimeUnit.SECONDS);
+
 		if (!screenshot) {
 			return new Result(data, null);
 		}
+
 		try {
 			return new Result(data, png.get(10, TimeUnit.SECONDS));
 		} catch (Exception e) {
@@ -156,7 +172,9 @@ public final class ViewSnapshot {
 				factor = f;
 			}
 		}
+
 		Screenshot.takeScreenshot(target, factor, image -> Util.ioPool().execute(() -> {
+			// NativeImage encodes PNGs only into a file (its channel writer is private), so go through a temp file.
 			try (image) {
 				Path file = Files.createTempFile("claudechat-look", ".png");
 				try {
@@ -169,226 +187,171 @@ public final class ViewSnapshot {
 				png.completeExceptionally(e);
 			}
 		}));
+
 		JsonObject o = new JsonObject();
 		o.addProperty("width", target.width / factor);
 		o.addProperty("height", target.height / factor);
-		o.addProperty("crosshair", "50% 50%");
+		if (mc.gameRenderer.gameRenderState().optionsRenderState.cameraType.isFirstPerson()) {
+			o.addProperty("crosshair", "50% 50%");
+		}
+
 		return o;
-	}
-
-	// --- rays -----------------------------------------------------------------------------------------------------
-
-	/** One block or fluid surface a ray hit. {@code label} is the block or fluid id, without "minecraft:". */
-	private record Hit(String label, BlockPos pos, double distance, boolean seeThrough) {
-	}
-
-	/**
-	 * Everything one ray hit, front to back. {@code shown} is what the player sees there: the first hit that isn't
-	 * glass (water counts, since its surface is what the player sees), or null for nothing.
-	 */
-	private record Sample(List<Hit> hits, Hit shown) {
-		String key() {
-			return shown == null ? "" : shown.label();
-		}
-
-		double depth() {
-			return shown == null ? Double.MAX_VALUE : shown.distance();
-		}
-	}
-
-	/** The camera's frame: rays and screen projection both go through it. */
-	private record View(Vec3 eye, Vec3 forward, Vec3 up, Vec3 right, double tanHalfV, double aspect, double range) {
-		/** Ray direction through screen point x, y in -1..1 (right and up positive). */
-		Vec3 ray(double x, double y) {
-			return forward.add(up.scale(y * tanHalfV)).add(right.scale(x * tanHalfV * aspect)).normalize();
-		}
-
-		/** Screen point -1..1 of a world position, or null if it's behind the camera. */
-		double[] project(Vec3 p) {
-			Vec3 v = p.subtract(eye);
-			double depth = v.dot(forward);
-			if (depth <= 0.05) {
-				return null;
-			}
-			return new double[] {v.dot(right) / (depth * tanHalfV * aspect), v.dot(up) / (depth * tanHalfV)};
-		}
-	}
-
-	private static Sample trace(ClientLevel level, View view, Vec3 dir) {
-		return trace(level, view.eye(), view.eye().add(dir.scale(view.range())));
-	}
-
-	/** Walks every block from {@code from} to {@code to}, recording hits until an opaque one stops the ray. */
-	private static Sample trace(ClientLevel level, Vec3 from, Vec3 to) {
-		List<Hit> hits = new ArrayList<>();
-		// Water the camera is already in isn't a surface the player sees; a fluid counts only where the ray enters it.
-		FluidState[] previousFluid = {level.getFluidState(BlockPos.containing(from))};
-		BlockGetter.traverseBlocks(from, to, hits, (list, pos) -> {
-			BlockState state = level.getBlockState(pos);
-			FluidState fluid = state.getFluidState();
-			List<Hit> here = new ArrayList<>(2);
-			if (!state.isAir() && !invisible(state)) {
-				BlockHitResult hit = state.getShape(level, pos).clip(from, to, pos);
-				if (hit != null) {
-					here.add(new Hit(blockLabel(state), pos.immutable(), from.distanceTo(hit.getLocation()), seeThrough(state)));
-				}
-			}
-			if (!fluid.isEmpty() && !fluid.getType().isSame(previousFluid[0].getType())) {
-				BlockHitResult hit = fluid.getShape(level, pos).clip(from, to, pos);
-				if (hit != null) {
-					here.add(new Hit(fluidLabel(fluid), pos.immutable(), from.distanceTo(hit.getLocation()), !fluid.is(FluidTags.LAVA)));
-				}
-			}
-			previousFluid[0] = fluid;
-			here.sort(Comparator.comparingDouble(Hit::distance));
-			for (Hit hit : here) {
-				list.add(hit);
-				if (!hit.seeThrough() || list.size() >= MAX_LAYERS) {
-					return Boolean.TRUE;
-				}
-			}
-			return null;
-		}, list -> Boolean.FALSE);
-		Hit shown = null;
-		for (Hit hit : hits) {
-			if (!hit.seeThrough() || hit.label().equals("water")) {
-				shown = hit;
-				break;
-			}
-		}
-		if (shown == null && !hits.isEmpty()) {
-			shown = hits.getLast(); // Only glass all the way: draw the glass.
-		}
-		return new Sample(hits, shown);
-	}
-
-	/** Glass and panes: the player sees what's behind them. */
-	private static boolean seeThrough(BlockState state) {
-		return state.is(BlockTags.IMPERMEABLE) || state.is(C_GLASS_BLOCKS) || state.is(C_GLASS_PANES)
-			|| state.getBlock() instanceof IronBarsBlock;
-	}
-
-	/** Blocks with a shape but nothing drawn in survival. */
-	private static boolean invisible(BlockState state) {
-		return state.is(Blocks.BARRIER) || state.is(Blocks.LIGHT) || state.is(Blocks.STRUCTURE_VOID);
 	}
 
 	// --- the snapshot ---------------------------------------------------------------------------------------------
 
-	/** Per block or fluid seen: screen share, positions, and what it was seen through. */
-	private static final class Seen {
-		final String label;
-		double weight;
-		/** Where it's shown, in screen coordinates -1..1. */
-		double minX = 1, maxX = -1, minY = 1, maxY = -1;
-		final Set<BlockPos> positions = new LinkedHashSet<>();
-		final Set<String> through = new LinkedHashSet<>();
-		BlockPos nearest;
-		double nearestDistance = Double.MAX_VALUE;
-		double farthest;
-
-		Seen(String label) {
-			this.label = label;
-		}
-	}
-
-	private static JsonObject capture(Minecraft mc, Integer maxDistanceArg) {
+	private static JsonObject capture(Minecraft mc, int requestedRange) {
 		long start = System.nanoTime();
 		ClientLevel level = mc.level;
 		if (level == null || mc.player == null) {
 			throw new IllegalStateException("No world is open.");
 		}
-		Camera camera = mc.gameRenderer.mainCamera();
-		double fov = camera.getFov();
-		int width = Math.max(1, mc.getWindow().getWidth());
-		int height = Math.max(1, mc.getWindow().getHeight());
-		double aspect = (double) width / height;
-		int range = maxDistanceArg != null ? maxDistanceArg : Math.min(256, mc.options.getEffectiveRenderDistance() * 16);
-		Vec3 forward = new Vec3(camera.forwardVector());
-		Vec3 up = new Vec3(camera.upVector());
-		Vec3 right = new Vec3(camera.leftVector()).scale(-1);
-		View view = new View(camera.position(), forward, up, right, Math.tan(Math.toRadians(fov) / 2), aspect, range);
 
-		int columns = COLUMNS;
-		int rows = Math.max(9, (int) Math.round(columns / aspect));
-		Sample[][] grid = new Sample[rows][columns];
-		Map<String, Seen> seen = new HashMap<>();
-		int rays = 0;
-		for (int r = 0; r < rows; r++) {
-			for (int c = 0; c < columns; c++) {
-				grid[r][c] = trace(level, view, view.ray(cellX(c, columns, 0), cellY(r, rows, 0)));
-				rays++;
+		GameRenderState state = mc.gameRenderer.gameRenderState();
+		ViewFrame frame = ViewFrame.lastRendered(mc);
+		double range = Math.min(requestedRange, frame.sightDistance());
+		boolean nightVision = state.lightmapRenderState.nightVisionEffectIntensity > 0;
+		BlockSurfaces surfaces = new BlockSurfaces(mc, level, frame.eye(), state.optionsRenderState.cutoutLeaves);
+		SightTracer tracer = new SightTracer(level, surfaces, nightVision);
+		boolean firstPerson = state.optionsRenderState.cameraType.isFirstPerson();
+		Scan scan = scan(tracer, frame, range);
+
+		JsonObject out = new JsonObject();
+		out.add("camera", cameraJson(mc, level, frame, firstPerson, range, requestedRange));
+		out.add("crosshair", crosshairJson(mc, level, frame, tracer, firstPerson));
+		out.add("blocks", blocksJson(scan, frame));
+		if (scan.darkWeight > 0) {
+			out.addProperty("too_dark", share(scan.darkWeight, scan.cells) + " of the view is too dark to make out");
+		}
+
+		JsonArray signs = signsJson(mc, level, scan.signs, frame.eye());
+		if (!signs.isEmpty()) {
+			out.add("block_details", signs);
+		}
+
+		out.add("entities", entitiesJson(visibleEntities(mc, level, frame, tracer, range, firstPerson)));
+		out.addProperty("rays", scan.rays);
+		out.addProperty("ms", (System.nanoTime() - start) / 1_000_000);
+		return out;
+	}
+
+	/** Per block or fluid seen: screen share, where, and what it was seen through. */
+	private static final class Seen {
+		final Identifier id;
+		double weight;
+		final ImageArea area = new ImageArea();
+		final Set<BlockPos> positions = new LinkedHashSet<>();
+		final Set<Identifier> through = new LinkedHashSet<>();
+		BlockPos nearest;
+		double nearestDistance = Double.MAX_VALUE;
+		double farthest;
+
+		Seen(Identifier id) {
+			this.id = id;
+		}
+
+		void add(Hit hit) {
+			if (positions.size() < MAX_POSITIONS) {
+				positions.add(hit.pos());
+			}
+
+			if (hit.distance() < nearestDistance) {
+				nearestDistance = hit.distance();
+				nearest = hit.pos();
+			}
+
+			farthest = Math.max(farthest, hit.distance());
+		}
+	}
+
+	/** What the grid of rays found, in cells of the coarse grid. */
+	private static final class Scan {
+		final Map<Identifier, Seen> seen = new HashMap<>();
+		/** Signs seen and lit, whose text faces may be readable. */
+		final Set<BlockPos> signs = new LinkedHashSet<>();
+		double darkWeight;
+		int rays;
+		int cells;
+
+		/** Adds one ray's hits, cast through {@code point}, standing for {@code weight} of a cell. */
+		void record(Sample sample, ScreenPoint point, double weight) {
+			if (sample.dark()) {
+				darkWeight += weight;
+			}
+
+			List<Identifier> through = new ArrayList<>();
+			for (Hit hit : sample.hits()) {
+				if (!hit.lit()) {
+					continue;
+				}
+
+				Seen s = seen.computeIfAbsent(hit.id(), Seen::new);
+				s.add(hit);
+				s.area.include(point);
+				if (hit.layer().visible()) {
+					s.weight += weight;
+					if (hit.sign()) {
+						signs.add(hit.pos());
+					}
+				}
+
+				through.stream().filter(id -> !id.equals(hit.id())).forEach(s.through::add);
+				through.add(hit.id());
 			}
 		}
-		// Edges between different blocks, or distance jumps, get 3×3 samples; flat areas count their one ray for the cell.
+	}
+
+	/** One ray per grid cell, then 3×3 more in cells on an edge. */
+	private static Scan scan(SightTracer tracer, ViewFrame frame, double range) {
+		int columns = COLUMNS;
+		int rows = Math.max(9, (int) Math.round(columns / frame.aspect()));
+		Sample[][] grid = new Sample[rows][columns];
+		Scan scan = new Scan();
+		scan.cells = rows * columns;
+
+		for (int r = 0; r < rows; r++) {
+			for (int c = 0; c < columns; c++) {
+				grid[r][c] = trace(tracer, frame, cellPoint(r, c, rows, columns, 0, 0), range);
+				scan.rays++;
+			}
+		}
+
+		// Edges between different things, or distance jumps, get 3×3 samples; flat areas count their one ray for the cell.
 		for (int r = 0; r < rows; r++) {
 			for (int c = 0; c < columns; c++) {
 				if (!isEdge(grid, r, c)) {
-					record(seen, grid[r][c], cellX(c, columns, 0), cellY(r, rows, 0), 1);
+					scan.record(grid[r][c], cellPoint(r, c, rows, columns, 0, 0), 1);
 					continue;
 				}
+
 				for (int sy = -1; sy <= 1; sy++) {
 					for (int sx = -1; sx <= 1; sx++) {
-						double x = cellX(c, columns, sx / 3.0);
-						double y = cellY(r, rows, sy / 3.0);
-						Sample sample = sx == 0 && sy == 0 ? grid[r][c] : trace(level, view, view.ray(x, y));
-						if (sx != 0 || sy != 0) {
-							rays++;
+						ScreenPoint point = cellPoint(r, c, rows, columns, sx / 3.0, sy / 3.0);
+						boolean center = sx == 0 && sy == 0;
+						Sample sample = center ? grid[r][c] : trace(tracer, frame, point, range);
+						if (!center) {
+							scan.rays++;
 						}
-						record(seen, sample, x, y, 1 / 9.0);
+
+						scan.record(sample, point, 1 / 9.0);
 					}
 				}
 			}
 		}
 
-		JsonObject out = new JsonObject();
-		out.add("camera", cameraJson(mc, camera, view, fov, range));
-		out.add("crosshair", crosshair(mc, level));
-
-		List<Seen> byShare = seen.values().stream()
-			.sorted(Comparator.comparingDouble((Seen s) -> -s.weight).thenComparingDouble(s -> s.nearestDistance)).toList();
-		double total = rows * columns;
-		JsonArray blocks = new JsonArray();
-		for (Seen s : byShare) {
-			blocks.add(seenJson(s, total, view));
-		}
-		out.add("blocks", blocks);
-		JsonArray details = blockDetails(level, seen.values(), view.eye());
-		if (!details.isEmpty()) {
-			out.add("block_details", details);
-		}
-		out.add("entities", entitiesJson(visibleEntities(mc, level, view)));
-		out.addProperty("rays", rays);
-		out.addProperty("ms", (System.nanoTime() - start) / 1_000_000);
-		return out;
+		return scan;
 	}
 
-	/** Screen x of a cell's center, plus {@code offset} cells. */
-	private static double cellX(int c, int columns, double offset) {
-		return -1 + (2 * (c + 0.5 + offset)) / columns;
+	private static Sample trace(SightTracer tracer, ViewFrame frame, ScreenPoint point, double range) {
+		Ray ray = frame.ray(point.x(), point.y());
+		return tracer.trace(ray.origin(), ray.at(range));
 	}
 
-	private static double cellY(int r, int rows, double offset) {
-		return 1 - (2 * (r + 0.5 + offset)) / rows;
-	}
-
-	/** Screen x -1..1 as percent from the image's left edge. */
-	private static long percentX(double x) {
-		return Math.round((Math.clamp(x, -1, 1) + 1) / 2 * 100);
-	}
-
-	/** Screen y -1..1 (up) as percent from the image's top edge. */
-	private static long percentY(double y) {
-		return Math.round((1 - Math.clamp(y, -1, 1)) / 2 * 100);
-	}
-
-	/** "x 40%, y 62%" for a world position, or null when it's off screen. */
-	private static String imagePoint(View view, Vec3 p) {
-		double[] screen = view.project(p);
-		if (screen == null || Math.abs(screen[0]) > 1 || Math.abs(screen[1]) > 1) {
-			return null;
-		}
-		return "x " + percentX(screen[0]) + "%, y " + percentY(screen[1]) + "%";
+	/** The image point of a cell's center, moved by {@code dx}, {@code dy} cells (right and down). */
+	private static ScreenPoint cellPoint(int row, int column, int rows, int columns, double dx, double dy) {
+		double x = -1 + (2 * (column + 0.5 + dx)) / columns;
+		double y = 1 - (2 * (row + 0.5 + dy)) / rows;
+		return new ScreenPoint(x, y);
 	}
 
 	private static boolean isEdge(Sample[][] grid, int r, int c) {
@@ -400,122 +363,156 @@ public final class ViewSnapshot {
 			if (nr < 0 || nr >= grid.length || nc < 0 || nc >= grid[0].length) {
 				continue;
 			}
+
 			Sample other = grid[nr][nc];
-			if (!other.key().equals(here.key()) || other.hits().size() != here.hits().size()) {
+			if (!edgeKey(other).equals(edgeKey(here)) || other.hits().size() != here.hits().size()) {
 				return true;
 			}
-			if (here.shown() != null && Math.max(here.depth(), other.depth()) > 1.5 * Math.min(here.depth(), other.depth()) + 1) {
+
+			double depth = depth(here);
+			double otherDepth = depth(other);
+			if (here.shown() != null && Math.max(depth, otherDepth) > 1.5 * Math.min(depth, otherDepth) + 1) {
 				return true;
 			}
 		}
+
 		return false;
 	}
 
-	/** Adds one ray's hits, cast through screen point x, y, standing for {@code weight} of a cell. */
-	private static void record(Map<String, Seen> seen, Sample sample, double x, double y, double weight) {
-		List<String> through = new ArrayList<>();
-		for (Hit hit : sample.hits()) {
-			Seen s = seen.computeIfAbsent(hit.label(), Seen::new);
-			if (hit == sample.shown()) {
-				s.weight += weight;
-				s.minX = Math.min(s.minX, x);
-				s.maxX = Math.max(s.maxX, x);
-				s.minY = Math.min(s.minY, y);
-				s.maxY = Math.max(s.maxY, y);
-			}
-			if (s.positions.size() < 4096) {
-				s.positions.add(hit.pos());
-			}
-			if (hit.distance() < s.nearestDistance) {
-				s.nearestDistance = hit.distance();
-				s.nearest = hit.pos();
-			}
-			s.farthest = Math.max(s.farthest, hit.distance());
-			through.stream().filter(label -> !label.equals(hit.label())).forEach(s.through::add);
-			through.add(hit.label());
+	/** What a ray shows, for telling neighboring cells apart: the block or fluid, darkness, or nothing. */
+	private static String edgeKey(Sample sample) {
+		Hit shown = sample.shown();
+		if (shown != null) {
+			return shown.id().toString();
+		}
+
+		return sample.dark() ? "dark" : "";
+	}
+
+	private static double depth(Sample sample) {
+		Hit shown = sample.shown();
+		return shown == null ? Double.MAX_VALUE : shown.distance();
+	}
+
+	// --- output ---------------------------------------------------------------------------------------------------
+
+	/** The part of the image something covers, grown point by point. */
+	private static final class ImageArea {
+		double minX = Double.MAX_VALUE;
+		double maxX = -Double.MAX_VALUE;
+		double minY = Double.MAX_VALUE;
+		double maxY = -Double.MAX_VALUE;
+
+		void include(ScreenPoint point) {
+			minX = Math.min(minX, point.x());
+			maxX = Math.max(maxX, point.x());
+			minY = Math.min(minY, point.y());
+			maxY = Math.max(maxY, point.y());
+		}
+
+		/** "x 10-40%, y 20-62%", clamped to the image. */
+		String describe() {
+			ScreenPoint topLeft = new ScreenPoint(minX, maxY);
+			ScreenPoint bottomRight = new ScreenPoint(maxX, minY);
+			return "x " + topLeft.percentX() + "-" + bottomRight.percentX() + "%, y " + topLeft.percentY() + "-"
+				+ bottomRight.percentY() + "%";
 		}
 	}
 
-	private static JsonObject seenJson(Seen s, double totalCells, View view) {
+	/** Most of the screen first; ties nearest first, then by id, so the order is stable. */
+	private static JsonArray blocksJson(Scan scan, ViewFrame frame) {
+		Comparator<Seen> order = Comparator.comparingDouble((Seen s) -> -s.weight)
+			.thenComparingDouble(s -> s.nearestDistance)
+			.thenComparing(s -> s.id.toString());
+		JsonArray blocks = new JsonArray();
+		scan.seen.values().stream().sorted(order).forEach(s -> blocks.add(seenJson(s, scan.cells, frame)));
+		return blocks;
+	}
+
+	private static JsonObject seenJson(Seen s, int cells, ViewFrame frame) {
 		JsonObject o = new JsonObject();
-		o.addProperty("block", s.label);
-		double share = 100 * s.weight / totalCells;
-		o.addProperty("screen_share", s.weight <= 0 ? "none: only seen partly, around other blocks" // Never the front-most hit.
-			: share < 0.1 ? "under 0.1%" : String.format(java.util.Locale.ROOT, "%.1f%%", share));
-		if (s.weight > 0) {
-			o.addProperty("in_image", "x " + percentX(s.minX) + "-" + percentX(s.maxX) + "%, y "
-				+ percentY(s.maxY) + "-" + percentY(s.minY) + "%");
-		}
+		o.addProperty("block", shortId(s.id));
+		// Clear blocks (the middle of a glass pane) are crossed but show what's behind them.
+		o.addProperty("screen_share", s.weight > 0 ? share(s.weight, cells) : "none: clear, only seen through");
+		o.addProperty("in_image", s.area.describe());
 		o.addProperty("nearest", posText(s.nearest));
 		o.addProperty("nearest_distance", Math.round(s.nearestDistance * 10) / 10.0);
 		o.addProperty("farthest_distance", Math.round(s.farthest));
-		if (s.positions.size() <= 6) {
-			// Few enough to list each one, with where its center is in the image.
+
+		if (s.positions.size() <= MAX_LISTED_POSITIONS) {
 			JsonArray positions = new JsonArray();
-			s.positions.stream().sorted(Comparator.comparingDouble((BlockPos p) -> Vec3.atCenterOf(p).distanceToSqr(view.eye())))
-				.forEach(p -> {
-					String point = imagePoint(view, Vec3.atCenterOf(p));
-					positions.add(posText(p) + (point == null ? "" : " (image " + point + ")"));
-				});
+			s.positions.stream().sorted(nearestFirst(frame.eye())).forEach(p -> {
+				ScreenPoint point = frame.project(Vec3.atCenterOf(p));
+				boolean shown = point != null && point.onScreen();
+				positions.add(posText(p) + (shown ? " (image " + point.describe() + ")" : ""));
+			});
 			o.add("positions", positions);
 		} else {
-			o.addProperty("blocks_seen", s.positions.size() >= 4096 ? "4096+" : String.valueOf(s.positions.size()));
-			int[] min = {Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE};
-			int[] max = {Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE};
-			for (BlockPos p : s.positions) {
-				min[0] = Math.min(min[0], p.getX());
-				min[1] = Math.min(min[1], p.getY());
-				min[2] = Math.min(min[2], p.getZ());
-				max[0] = Math.max(max[0], p.getX());
-				max[1] = Math.max(max[1], p.getY());
-				max[2] = Math.max(max[2], p.getZ());
-			}
-			o.addProperty("spans", "x " + min[0] + ".." + max[0] + ", y " + min[1] + ".." + max[1] + ", z " + min[2] + ".." + max[2]);
+			o.addProperty("blocks_seen", s.positions.size() >= MAX_POSITIONS ? MAX_POSITIONS + "+" : String.valueOf(s.positions.size()));
+			o.addProperty("spans", spans(s.positions));
 		}
+
 		if (!s.through.isEmpty()) {
-			o.addProperty("seen_through", String.join(", ", s.through));
+			o.addProperty("seen_through", s.through.stream().map(ViewSnapshot::shortId).collect(Collectors.joining(", ")));
 		}
+
 		return o;
 	}
 
-	/** Sign text and custom names of visible block entities, nearest first. */
-	private static JsonArray blockDetails(ClientLevel level, Iterable<Seen> seen, Vec3 eye) {
-		List<BlockPos> positions = new ArrayList<>();
-		for (Seen s : seen) {
-			positions.addAll(s.positions);
+	/** "x 1..9, y 60..64, z -3..4": the box around the positions. */
+	private static String spans(Set<BlockPos> positions) {
+		int[] min = {Integer.MAX_VALUE, Integer.MAX_VALUE, Integer.MAX_VALUE};
+		int[] max = {Integer.MIN_VALUE, Integer.MIN_VALUE, Integer.MIN_VALUE};
+		for (BlockPos p : positions) {
+			min[0] = Math.min(min[0], p.getX());
+			min[1] = Math.min(min[1], p.getY());
+			min[2] = Math.min(min[2], p.getZ());
+			max[0] = Math.max(max[0], p.getX());
+			max[1] = Math.max(max[1], p.getY());
+			max[2] = Math.max(max[2], p.getZ());
 		}
-		positions.sort(Comparator.comparingDouble((BlockPos p) -> Vec3.atCenterOf(p).distanceToSqr(eye)));
+
+		return "x " + min[0] + ".." + max[0] + ", y " + min[1] + ".." + max[1] + ", z " + min[2] + ".." + max[2];
+	}
+
+	private static String share(double weight, int cells) {
+		double percent = 100 * weight / cells;
+		return percent < 0.1 ? "under 0.1%" : String.format(Locale.ROOT, "%.1f%%", percent);
+	}
+
+	private static Comparator<BlockPos> nearestFirst(Vec3 eye) {
+		return Comparator.comparingDouble((BlockPos p) -> Vec3.atCenterOf(p).distanceToSqr(eye)).thenComparing(p -> p);
+	}
+
+	/**
+	 * Text on the visible signs, nearest first: only the side facing the player, as the game decides it when the player
+	 * edits a sign.
+	 */
+	private static JsonArray signsJson(Minecraft mc, ClientLevel level, Set<BlockPos> signs, Vec3 eye) {
 		JsonArray details = new JsonArray();
-		for (BlockPos pos : positions) {
+		for (BlockPos pos : signs.stream().sorted(nearestFirst(eye)).toList()) {
 			if (details.size() >= MAX_DETAILS) {
 				break;
 			}
-			BlockEntity blockEntity = level.getChunkAt(pos).getBlockEntities().get(pos);
-			if (blockEntity == null) {
+
+			if (!(level.getBlockEntity(pos) instanceof SignBlockEntity sign)) {
 				continue;
 			}
-			JsonObject o = new JsonObject();
-			if (blockEntity instanceof SignBlockEntity sign) {
-				String front = signText(sign.getText(SignTextSlot.FRONT));
-				String back = signText(sign.getText(SignTextSlot.BACK));
-				if (!front.isEmpty()) {
-					o.addProperty("front_text", front);
-				}
-				if (!back.isEmpty()) {
-					o.addProperty("back_text", back);
-				}
+
+			SignTextSlot side = sign.getSlotPlayerIsFacing(mc.player);
+			String text = signText(sign.getText(side));
+			if (text.isEmpty()) {
+				continue;
 			}
-			if (blockEntity instanceof Nameable nameable && nameable.getCustomName() != null) {
-				o.addProperty("name", nameable.getCustomName().getString());
-			}
-			if (!o.isEmpty()) {
-				JsonObject detail = new JsonObject();
-				detail.addProperty("block", blockLabel(blockEntity.getBlockState()));
-				detail.addProperty("position", posText(pos));
-				o.entrySet().forEach(e -> detail.add(e.getKey(), e.getValue()));
-				details.add(detail);
-			}
+
+			JsonObject detail = new JsonObject();
+			detail.addProperty("block", shortId(BuiltInRegistries.BLOCK.getKey(sign.getBlockState().getBlock())));
+			detail.addProperty("position", posText(pos));
+			detail.addProperty("side", side == SignTextSlot.FRONT ? "front" : "back");
+			detail.addProperty("text", text);
+			details.add(detail);
 		}
+
 		return details;
 	}
 
@@ -526,103 +523,175 @@ public final class ViewSnapshot {
 
 	// --- camera, crosshair, entities ------------------------------------------------------------------------------
 
-	private static JsonObject cameraJson(Minecraft mc, Camera camera, View view, double fov, int range) {
+	private static JsonObject cameraJson(Minecraft mc, ClientLevel level, ViewFrame frame, boolean firstPerson, double range,
+		int requestedRange) {
 		JsonObject o = new JsonObject();
-		Vec3 eye = view.eye();
-		o.addProperty("dimension", mc.level.dimension().identifier().toString());
-		o.addProperty("eye_position", String.format(java.util.Locale.ROOT, "%.1f %.1f %.1f", eye.x, eye.y, eye.z));
-		o.addProperty("facing", WorldTools.compass(view.forward().x * 100, view.forward().z * 100));
-		double pitch = camera.xRot();
+		Vec3 eye = frame.eye();
+		o.addProperty("dimension", level.dimension().identifier().toString());
+		o.addProperty("eye_position", String.format(Locale.ROOT, "%.1f %.1f %.1f", eye.x, eye.y, eye.z));
+		o.addProperty("facing", WorldTools.compass(frame.forward().x * 100, frame.forward().z * 100));
+		float pitch = frame.pitch();
 		o.addProperty("looking", Math.abs(pitch) < 10 ? "level" : (pitch < 0 ? "up " : "down ") + Math.round(Math.abs(pitch)) + "°");
-		o.addProperty("fov_vertical", Math.round(fov));
-		o.addProperty("fov_horizontal", Math.round(Math.toDegrees(2 * Math.atan(view.tanHalfV() * view.aspect()))));
-		o.addProperty("perspective", mc.options.getCameraType().isFirstPerson() ? "first person" : "third person");
-		o.addProperty("ray_range", range);
-		FluidState inFluid = mc.level.getFluidState(BlockPos.containing(eye));
+		o.addProperty("fov_vertical", Math.round(frame.fovVertical()));
+		o.addProperty("fov_horizontal", Math.round(frame.fovHorizontal()));
+		o.addProperty("perspective", firstPerson ? "first person" : "third person");
+		o.addProperty("ray_range", Math.round(range));
+		o.addProperty("ray_range_limited_by", range < requestedRange ? frame.sightLimit() : "max_distance");
+
+		FluidState inFluid = level.getFluidState(BlockPos.containing(eye));
 		if (!inFluid.isEmpty()) {
-			o.addProperty("camera_in", fluidLabel(inFluid));
+			o.addProperty("camera_in", shortId(SightTracer.fluidId(inFluid)));
 		}
+
 		return o;
 	}
 
-	private static JsonObject crosshair(Minecraft mc, ClientLevel level) {
+	/**
+	 * What the player aims at: the game's own pick from the player's eyes, within reach. In first person that's under
+	 * the crosshair, in the middle of the image; in third person no crosshair is drawn, so it says where in the image the
+	 * target is.
+	 */
+	private static JsonObject crosshairJson(Minecraft mc, ClientLevel level, ViewFrame frame, SightTracer tracer,
+		boolean firstPerson) {
 		JsonObject o = new JsonObject();
+		if (!firstPerson) {
+			o.addProperty("note", "Third person: no crosshair is drawn. This is what the player aims at from their eyes.");
+		}
+
 		HitResult hit = mc.hitResult;
 		if (hit instanceof BlockHitResult block && hit.getType() == HitResult.Type.BLOCK) {
 			BlockState state = level.getBlockState(block.getBlockPos());
-			o.addProperty("block", blockLabel(state));
+			o.addProperty("in_reach", true);
+			addImagePoint(o, frame, hit.getLocation());
+			if (!tracer.lit(state, block.getBlockPos(), block.getDirection())) {
+				o.addProperty("too_dark", true);
+				return o;
+			}
+
+			o.addProperty("block", shortId(BuiltInRegistries.BLOCK.getKey(state.getBlock())));
 			o.addProperty("position", posText(block.getBlockPos()));
 			o.addProperty("face", block.getDirection().getSerializedName());
 			String properties = state.getValues().map(Object::toString).collect(Collectors.joining(", "));
 			if (!properties.isEmpty()) {
 				o.addProperty("state", properties);
 			}
-			o.addProperty("in_reach", true);
-		} else if (hit instanceof EntityHitResult entity) {
-			o.add("entity", entityJson(entity.getEntity(), mc.gameRenderer.mainCamera().position(), null));
-			o.addProperty("in_reach", true);
-		} else {
-			o.addProperty("in_reach", false);
-			o.addProperty("note", "Nothing within reach; the middle cell of the screen picture shows what's farther away.");
+
+			return o;
 		}
+
+		if (hit instanceof EntityHitResult entityHit) {
+			o.addProperty("in_reach", true);
+			Entity entity = entityHit.getEntity();
+			if (!lit(mc, level, tracer, entity)) {
+				o.addProperty("too_dark", true);
+				addImagePoint(o, frame, hit.getLocation());
+				return o;
+			}
+
+			o.add("entity", entityJson(mc, entity, frame));
+			return o;
+		}
+
+		o.addProperty("in_reach", false);
+		o.addProperty("note", firstPerson
+			? "Nothing within reach; the blocks at the middle of the image are what's farther away."
+			: "Third person: no crosshair is drawn, and nothing is within the player's reach.");
 		return o;
 	}
 
-	/** Entities in view with a line of sight to some part of them, nearest first. */
-	private static List<Map.Entry<Entity, JsonObject>> visibleEntities(Minecraft mc, ClientLevel level, View view) {
+	private static void addImagePoint(JsonObject o, ViewFrame frame, Vec3 position) {
+		ScreenPoint point = frame.project(position);
+		if (point != null && point.onScreen()) {
+			o.addProperty("in_image", point.describe());
+		}
+	}
+
+	/** Entities in view, lit, and with a line of sight to some part of them, nearest first. */
+	private static List<JsonObject> visibleEntities(Minecraft mc, ClientLevel level, ViewFrame frame, SightTracer tracer,
+		double range, boolean firstPerson) {
 		Entity self = mc.getCameraEntity();
-		boolean firstPerson = mc.options.getCameraType().isFirstPerson();
-		var frustum = mc.gameRenderer.mainCamera().getCullFrustum();
-		List<Map.Entry<Entity, JsonObject>> visible = new ArrayList<>();
+		Vec3 eye = frame.eye();
+		Map<Entity, Integer> visible = new HashMap<>();
+
 		for (Entity entity : level.entitiesForRendering()) {
 			if ((entity == self && firstPerson) || entity.isInvisibleTo(mc.player)) {
 				continue;
 			}
-			AABB box = entity.getBoundingBox();
-			if (box.getCenter().distanceTo(view.eye()) > view.range() || !frustum.isVisible(box)) {
+
+			if (entity.getBoundingBox().getCenter().distanceTo(eye) > range || !lit(mc, level, tracer, entity)) {
 				continue;
 			}
-			// Line of sight to the middle, top, bottom and four side points of its box.
-			Vec3 c = box.getCenter();
-			double dx = box.getXsize() * 0.35;
-			double dz = box.getZsize() * 0.35;
-			Vec3[] points = {c, new Vec3(c.x, box.maxY - 0.05, c.z), new Vec3(c.x, box.minY + 0.05, c.z),
-				new Vec3(c.x + dx, c.y, c.z + dz), new Vec3(c.x - dx, c.y, c.z - dz), new Vec3(c.x + dx, c.y, c.z - dz), new Vec3(c.x - dx, c.y, c.z + dz)};
-			int seen = 0;
-			for (Vec3 point : points) {
-				double[] screen = view.project(point);
-				if (screen == null || Math.abs(screen[0]) > 1 || Math.abs(screen[1]) > 1) {
-					continue;
-				}
-				Sample sample = trace(level, view.eye(), point);
-				double distance = point.distanceTo(view.eye());
-				if (sample.hits().stream().noneMatch(h -> !h.seeThrough() && h.distance() < distance - 0.05)) {
-					seen++;
-				}
+
+			int points = visiblePoints(entity, frame, tracer);
+			if (points > 0) {
+				visible.put(entity, points);
 			}
-			if (seen == 0) {
-				continue;
-			}
-			JsonObject o = entityJson(entity, view.eye(), view);
-			o.addProperty("visible", seen == points.length ? "fully" : "partly");
-			visible.add(Map.entry(entity, o));
 		}
-		visible.sort(Comparator.comparingDouble(e -> e.getKey().getBoundingBox().getCenter().distanceToSqr(view.eye())));
-		return visible;
+
+		Comparator<Entity> nearestFirst = Comparator.comparingDouble((Entity e) -> e.getBoundingBox().getCenter().distanceToSqr(eye))
+			.thenComparingInt(Entity::getId);
+		List<JsonObject> out = new ArrayList<>();
+		for (Entity entity : visible.keySet().stream().sorted(nearestFirst).toList()) {
+			JsonObject o = entityJson(mc, entity, frame);
+			o.addProperty("visible", visible.get(entity) == SIGHT_POINTS ? "fully" : "partly");
+			out.add(o);
+		}
+
+		return out;
 	}
 
-	private static JsonArray entitiesJson(List<Map.Entry<Entity, JsonObject>> visible) {
+	/**
+	 * How many of the middle, top, bottom and four side points of the entity's box ({@link #SIGHT_POINTS}) are in the
+	 * image with nothing opaque between them and the camera.
+	 */
+	private static int visiblePoints(Entity entity, ViewFrame frame, SightTracer tracer) {
+		AABB box = entity.getBoundingBox();
+		Vec3 c = box.getCenter();
+		double dx = box.getXsize() * 0.35;
+		double dz = box.getZsize() * 0.35;
+		Vec3[] points = {c, new Vec3(c.x, box.maxY - 0.05, c.z), new Vec3(c.x, box.minY + 0.05, c.z),
+			new Vec3(c.x + dx, c.y, c.z + dz), new Vec3(c.x - dx, c.y, c.z - dz), new Vec3(c.x + dx, c.y, c.z - dz),
+			new Vec3(c.x - dx, c.y, c.z + dz)};
+		int seen = 0;
+
+		for (Vec3 point : points) {
+			ScreenPoint screen = frame.project(point);
+			if (screen == null || !screen.onScreen()) {
+				continue;
+			}
+
+			double distance = point.distanceTo(frame.eye());
+			Sample sample = tracer.trace(frame.eye(), point);
+			boolean blocked = sample.hits().stream().anyMatch(h -> h.layer() == Layer.OPAQUE && h.distance() < distance - 0.05);
+			if (!blocked) {
+				seen++;
+			}
+		}
+
+		return seen;
+	}
+
+	/** Whether the entity is lit enough to make out, by the light its renderer draws it with (glowing mobs count). */
+	private static boolean lit(Minecraft mc, ClientLevel level, SightTracer tracer, Entity entity) {
+		float partialTicks = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+		int packed = mc.getEntityRenderDispatcher().getPackedLightCoords(entity, partialTicks);
+		int light = Math.max(LightCoordsUtil.block(packed), LightCoordsUtil.sky(packed) - level.getSkyDarken());
+		return tracer.bright(light);
+	}
+
+	private static JsonArray entitiesJson(List<JsonObject> visible) {
 		JsonArray out = new JsonArray();
-		visible.stream().limit(MAX_ENTITIES).forEach(e -> out.add(e.getValue()));
+		visible.stream().limit(MAX_ENTITIES).forEach(out::add);
 		if (visible.size() > MAX_ENTITIES) {
 			JsonObject more = new JsonObject();
 			more.addProperty("more", visible.size() - MAX_ENTITIES + " farther entities not listed");
 			out.add(more);
 		}
+
 		return out;
 	}
 
-	private static JsonObject entityJson(Entity entity, Vec3 eye, View view) {
+	private static JsonObject entityJson(Minecraft mc, Entity entity, ViewFrame frame) {
 		JsonObject o = new JsonObject();
 		o.addProperty("type", shortId(EntityType.getKey(entity.getType())));
 		if (entity instanceof Player player) {
@@ -630,74 +699,72 @@ public final class ViewSnapshot {
 		} else if (entity.getCustomName() != null) {
 			o.addProperty("name", entity.getCustomName().getString());
 		}
+
 		Vec3 center = entity.getBoundingBox().getCenter();
-		o.addProperty("position", String.format(java.util.Locale.ROOT, "%.1f %.1f %.1f", entity.getX(), entity.getY(), entity.getZ()));
-		o.addProperty("distance", Math.round(center.distanceTo(eye) * 10) / 10.0);
-		if (view != null) {
-			// The box its bounding box covers in the image, from its eight corners.
-			AABB box = entity.getBoundingBox();
-			double minX = 1, maxX = -1, minY = 1, maxY = -1;
-			boolean behind = false;
-			for (int corner = 0; corner < 8; corner++) {
-				double[] screen = view.project(new Vec3((corner & 1) == 0 ? box.minX : box.maxX,
-					(corner & 2) == 0 ? box.minY : box.maxY, (corner & 4) == 0 ? box.minZ : box.maxZ));
-				if (screen == null) {
-					behind = true;
-					break;
-				}
-				minX = Math.min(minX, screen[0]);
-				maxX = Math.max(maxX, screen[0]);
-				minY = Math.min(minY, screen[1]);
-				maxY = Math.max(maxY, screen[1]);
-			}
-			String point = imagePoint(view, center);
-			if (!behind) {
-				o.addProperty("in_image", "x " + percentX(minX) + "-" + percentX(maxX) + "%, y " + percentY(maxY) + "-" + percentY(minY) + "%");
-			} else if (point != null) {
-				o.addProperty("in_image", point);
-			}
+		o.addProperty("position", String.format(Locale.ROOT, "%.1f %.1f %.1f", entity.getX(), entity.getY(), entity.getZ()));
+		o.addProperty("distance", Math.round(center.distanceTo(frame.eye()) * 10) / 10.0);
+		String inImage = imageArea(entity.getBoundingBox(), frame);
+		if (inImage != null) {
+			o.addProperty("in_image", inImage);
 		}
+
 		if (entity instanceof LivingEntity living) {
-			o.addProperty("health", Math.round(living.getHealth()) + "/" + Math.round(living.getMaxHealth()));
+			// Other players' health isn't shown in the game; the player's own is on their HUD.
+			if (!(entity instanceof Player) || entity == mc.player) {
+				o.addProperty("health", Math.round(living.getHealth()) + "/" + Math.round(living.getMaxHealth()));
+			}
+
 			if (living.isBaby()) {
 				o.addProperty("baby", true);
 			}
+
 			JsonArray held = new JsonArray();
 			for (ItemStack stack : new ItemStack[] {living.getMainHandItem(), living.getOffhandItem()}) {
 				if (!stack.isEmpty()) {
 					held.add(itemText(stack));
 				}
 			}
+
 			if (!held.isEmpty()) {
 				o.add("holding", held);
 			}
 		}
+
 		if (entity instanceof ItemEntity item) {
 			o.addProperty("item", itemText(item.getItem()));
-		} else if (entity instanceof ItemFrame frame && !frame.getItem().isEmpty()) {
-			o.addProperty("item", itemText(frame.getItem()));
+		} else if (entity instanceof ItemFrame itemFrame && !itemFrame.getItem().isEmpty()) {
+			o.addProperty("item", itemText(itemFrame.getItem()));
 		}
+
 		if (entity.getVehicle() != null) {
 			o.addProperty("riding", shortId(EntityType.getKey(entity.getVehicle().getType())));
 		}
+
 		return o;
 	}
 
+	/**
+	 * Where the box is in the image, from its eight corners; just its center when part of it is behind the camera; null
+	 * when the center is off the image too.
+	 */
+	private static String imageArea(AABB box, ViewFrame frame) {
+		ImageArea area = new ImageArea();
+		for (int corner = 0; corner < 8; corner++) {
+			Vec3 position = new Vec3((corner & 1) == 0 ? box.minX : box.maxX, (corner & 2) == 0 ? box.minY : box.maxY,
+				(corner & 4) == 0 ? box.minZ : box.maxZ);
+			ScreenPoint point = frame.project(position);
+			if (point == null) {
+				ScreenPoint center = frame.project(box.getCenter());
+				return center != null && center.onScreen() ? center.describe() : null;
+			}
+
+			area.include(point);
+		}
+
+		return area.describe();
+	}
+
 	// --- labels ---------------------------------------------------------------------------------------------------
-
-	private static String blockLabel(BlockState state) {
-		return shortId(BuiltInRegistries.BLOCK.getKey(state.getBlock()));
-	}
-
-	private static String fluidLabel(FluidState fluid) {
-		if (fluid.is(FluidTags.WATER)) {
-			return "water";
-		}
-		if (fluid.is(FluidTags.LAVA)) {
-			return "lava";
-		}
-		return shortId(BuiltInRegistries.FLUID.getKey(fluid.getType() == Fluids.EMPTY ? Fluids.EMPTY : fluid.getType()));
-	}
 
 	private static String itemText(ItemStack stack) {
 		String id = shortId(BuiltInRegistries.ITEM.getKey(stack.getItem()));
