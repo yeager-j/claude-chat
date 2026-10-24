@@ -242,11 +242,6 @@ public class KnowledgeBase {
 		return generation.get();
 	}
 
-	/** True while anything is queued or building. */
-	public boolean isBusy() {
-		return allFolders().anyMatch(folder -> folder.progress().busy());
-	}
-
 	/**
 	 * Fabric API's own modules ("fabric-networking-api-v1", ...): part of the loader setup, never one of the player's
 	 * mods, and not worth decompiling.
