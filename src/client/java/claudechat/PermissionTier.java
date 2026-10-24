@@ -19,14 +19,20 @@ public enum PermissionTier {
 		public String prompt(boolean worldOpen) {
 			return """
 
-				Permissions: read only. You can't edit files or run shell commands, and %s only runs commands
-				that change nothing. When the player wants something done, give them the command in backticks to click instead.
+				Permissions: read only. You can read files only in the knowledge folder (your working directory),
+				you can't edit files or run shell commands, and %s only runs commands that change nothing. When the player wants something done, give them the command in backticks to click instead.
 				""".formatted(McpServer.claudeName(GameCommands.TOOL));
 		}
 
+		/**
+		 * Reads are confined to the knowledge folder (the working directory): text Claude reads in the world, in mods or
+		 * on the web could otherwise talk it into reading any file the player can, and sending it out. With nobody to
+		 * ask, dontAsk denies whatever isn't allowed here.
+		 */
 		@Override
 		public List<String> cliFlags(boolean toolsServer, String gameDir) {
-			return List.of("--tools", READ_TOOLS, "--allowedTools", allowedTools(toolsServer), "--disallowedTools", APPROVE_TOOL);
+			return List.of("--tools", READ_TOOLS, "--allowedTools", allowedTools(toolsServer), "--disallowedTools", APPROVE_TOOL,
+				"--permission-mode", "dontAsk");
 		}
 	},
 
@@ -39,7 +45,10 @@ public enum PermissionTier {
 			return actPrompt(worldOpen, "The player approves each change in chat. If they deny one, don't try another way to do it.");
 		}
 
-		/** Anything not pre-approved goes to the approve tool, which asks in chat; without the tools server nobody could answer, so it's denied. */
+		/**
+		 * Anything not pre-approved goes to the approve tool, which asks in chat; without the tools server nobody could
+		 * answer, so it's denied. Reads outside the knowledge and game folders (the working directories) are asked about too.
+		 */
 		@Override
 		public List<String> cliFlags(boolean toolsServer, String gameDir) {
 			List<String> askHow = toolsServer
@@ -75,8 +84,13 @@ public enum PermissionTier {
 		REFUSE
 	}
 
-	/** Always offered and never asked about: Claude can search the knowledge folder and the web. */
+	/** Always offered: Claude can search the knowledge folder and the web. */
 	static final String READ_TOOLS = "Read,Grep,Glob,WebSearch,WebFetch";
+	/**
+	 * What's allowed without asking, of {@link #READ_TOOLS}: reads only inside the working directory (Claude Code applies
+	 * Read rules to Grep and Glob too), never a bare {@code Read}, which would allow every file the player can read.
+	 */
+	static final String READ_RULES = "Read(./**),WebSearch,WebFetch";
 	/** Added for Ask for approval and Full access. Shell commands that only read are still allowed without asking. */
 	static final String WRITE_TOOLS = "Bash,Edit,Write"
 		+ (System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows") ? ",PowerShell" : "");
@@ -141,7 +155,7 @@ public enum PermissionTier {
 	}
 
 	private static String allowedTools(boolean toolsServer) {
-		return toolsServer ? READ_TOOLS + "," + McpServer.CLAUDE_PREFIX : READ_TOOLS;
+		return toolsServer ? READ_RULES + "," + McpServer.CLAUDE_PREFIX : READ_RULES;
 	}
 
 	private static String actPrompt(boolean worldOpen, String approval) {

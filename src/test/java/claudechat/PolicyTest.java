@@ -46,9 +46,22 @@ class PolicyTest {
 
 		assertEquals(PermissionTier.READ_TOOLS, valueAfter(flags, "--tools"));
 		assertFalse(flags.contains("--add-dir"), flags.toString());
-		assertFalse(flags.contains("--permission-mode"), flags.toString());
+		// Nobody can be asked, so whatever isn't allowed is denied.
+		assertEquals("dontAsk", valueAfter(flags, "--permission-mode"));
 		assertEquals(PermissionTier.APPROVE_TOOL, valueAfter(flags, "--disallowedTools"));
 		assertTrue(PermissionTier.READ_ONLY.prompt(true).contains("read only"));
+	}
+
+	/** A bare Read rule would allow every file the player can read, wherever text in the game asks Claude to look. */
+	@ParameterizedTest
+	@CsvSource({"READ_ONLY, true", "READ_ONLY, false", "ASK, true", "ASK, false"})
+	void readsAreAllowedOnlyInTheWorkingDirectory(PermissionTier tier, boolean toolsServer) {
+		List<String> allowed = List.of(valueAfter(tier.cliFlags(toolsServer, GAME_DIR), "--allowedTools").split(","));
+
+		assertTrue(allowed.contains("Read(./**)"), allowed.toString());
+		for (String tool : List.of("Read", "Grep", "Glob", "Bash", "Edit", "Write")) {
+			assertFalse(allowed.contains(tool), tool + " allowed everywhere: " + allowed);
+		}
 	}
 
 	@Test

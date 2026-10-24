@@ -3,7 +3,6 @@ package claudechat;
 import net.minecraft.network.chat.Component;
 
 import java.io.IOException;
-import java.util.List;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
@@ -48,7 +47,7 @@ public final class ClaudeRun {
 	private final CompletableFuture<Outcome> outcome = new CompletableFuture<>();
 	private final Object lock = new Object();
 	private boolean cancelled;
-	private Process process;
+	private ProcessTree process;
 	private McpServer.Grant grant;
 	private Thread thread;
 
@@ -82,7 +81,7 @@ public final class ClaudeRun {
 	 * stops its thread. Nothing it was doing is reported. Safe to call more than once, from any thread.
 	 */
 	public void cancel() {
-		Process running;
+		ProcessTree running;
 		McpServer.Grant access;
 		Thread worker;
 		synchronized (lock) {
@@ -102,7 +101,7 @@ public final class ClaudeRun {
 			access.close();
 		}
 		if (running != null) {
-			killWithDescendants(running);
+			running.close();
 		}
 		if (worker != null) {
 			worker.interrupt();
@@ -142,15 +141,30 @@ public final class ClaudeRun {
 	}
 
 	/**
-	 * Starts claude for this question.
+	 * Starts claude for this question, as the root of a {@link ProcessTree}: {@link #endProcess} or a cancel kills it
+	 * and everything it started.
 	 *
 	 * @throws CancellationException once the question is cancelled, so a cancel can't miss a process
 	 */
 	Process startProcess(ProcessBuilder builder) throws IOException {
 		synchronized (lock) {
 			throwIfCancelled();
-			process = builder.start();
-			return process;
+			process = ProcessTree.start(builder);
+			return process.process();
+		}
+	}
+
+	/**
+	 * Kills the process from {@link #startProcess} and everything it started, however claude ended: a shell command or
+	 * helper it left behind would otherwise keep the player's authority after the question.
+	 */
+	void endProcess() {
+		ProcessTree running;
+		synchronized (lock) {
+			running = process;
+		}
+		if (running != null) {
+			running.close();
 		}
 	}
 
@@ -161,13 +175,5 @@ public final class ClaudeRun {
 				throw new CancellationException("The question was cancelled.");
 			}
 		}
-	}
-
-	/** Shell commands claude started would outlive it, and could keep changing files, if only claude were killed. */
-	static void killWithDescendants(Process process) {
-		// Listed first: once claude is gone, its children are no longer its descendants.
-		List<ProcessHandle> descendants = process.descendants().toList();
-		process.destroyForcibly();
-		descendants.forEach(ProcessHandle::destroyForcibly);
 	}
 }
