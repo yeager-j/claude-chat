@@ -23,7 +23,7 @@ import java.util.Set;
  * the last one is a {@link #READ_ONLY} command that Minecraft itself registered.
  * <p>
  * Only Minecraft's own nodes count. A command's code must come from a {@code net.minecraft} class, so a mod's command
- * under a read-only root ({@code data get}, {@code locate}) never reads as read-only. Modifiers are matched by their
+ * under a read-only root ({@code data get}, {@code locate biome}) never reads as read-only. Modifiers are matched by their
  * whole path of node names instead: Brigadier merges a same-named node into the existing one and keeps the existing
  * redirect, so an exact vanilla path can only reach Minecraft's own modifier.
  * <p>
@@ -35,9 +35,13 @@ final class CommandRules {
 	 * any one part, "a|b" is either word, and a trailing "$" means nothing may follow. Without "$" a pattern is a prefix.
 	 */
 
-	/** Commands that change nothing. A bare {@code execute if …} only reports whether the condition holds. */
+	/**
+	 * Commands that change nothing. A bare {@code execute if …} only reports whether the condition holds. Of
+	 * {@code locate}, only {@code biome} qualifies: it samples the seed's climate, while {@code locate structure} loads
+	 * candidate chunks to {@code structure_starts} and saves them, and {@code locate poi} loads chunks too.
+	 */
 	static final List<String> READ_ONLY = List.of(
-		"help", "list", "seed", "locate", "version", "time query", "time of * query", "data get", "tick query", "team list",
+		"help", "list", "seed", "locate biome", "version", "time query", "time of * query", "data get", "tick query", "team list",
 		"bossbar list", "bossbar get", "forceload query", "datapack list", "worldborder get", "experience query",
 		"scoreboard objectives list", "scoreboard players list", "scoreboard players get",
 		"attribute * * get", "attribute * * base get", "attribute * * modifier value get",

@@ -9,8 +9,11 @@ import net.minecraft.world.level.biome.Biome;
 import net.minecraft.world.level.biome.BiomeResolver;
 import net.minecraft.world.level.biome.BiomeSource;
 
-import java.util.ArrayList;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -27,6 +30,13 @@ public final class BiomeFinder {
 	public static final int VERTICAL_STEP = 64;
 	/** /locate biome's radius is 6400 blocks; a whole 30000-block search is about 2.8M columns. */
 	private static final long MAX_SAMPLES = 20_000_000L;
+	/**
+	 * Patches kept for the spacing check, matching or not: a search whose visited filter rejects a common biome's
+	 * patches would otherwise keep one for every column at the smallest spacing.
+	 */
+	static final int MAX_PATCHES = 250_000;
+	/** How long one search may take: it holds one of the MCP server's workers throughout. */
+	private static final Duration TIMEOUT = Duration.ofSeconds(60);
 
 	public record Found(String biome, int x, int y, int z, double distance, Visit visit) {
 	}
@@ -43,61 +53,152 @@ public final class BiomeFinder {
 
 	/**
 	 * Not on the server thread: a wide search samples millions of columns. {@code visits} gives the time players spent
-	 * near each chunk of the origin's dimension.
+	 * near each chunk of the origin's dimension. Stops with what it has (truncated) at its sample, patch or time budget,
+	 * and throws once its thread is interrupted (the question was cancelled).
 	 */
-	public static Result find(ServerLevel level, Origin origin, Request request, Visit.ByChunk visits) {
+	public static Result find(ServerLevel level, Origin origin, Request request, Visit.ByChunk visits) throws InterruptedException {
 		ServerTasks.requireOffServerThread(level.getServer());
 		BiomeSource source = level.getChunkSource().getGenerator().getBiomeSource();
 		BiomeResolver resolver = source.createCachingResolver(level.getChunkSource().randomState());
 		int[] ys = Mth.outFromOrigin((int) Math.floor(origin.y()), level.getMinY() + 1, level.getMaxY() + 1, VERTICAL_STEP).toArray();
+		long[] samples = {0};
+		return search(origin, request, System.nanoTime() + TIMEOUT.toNanos(), (x, z, distance) -> {
+			if (samples[0] > MAX_SAMPLES) {
+				throw new Budget();
+			}
+			for (int y : ys) {
+				samples[0]++;
+				Holder<Biome> biome = resolver.getNoiseBiome(QuartPos.fromBlock(x), QuartPos.fromBlock(y), QuartPos.fromBlock(z));
+				if (request.biomes().contains(biome)) {
+					Visit visit = visits.at(SectionPos.blockToSectionCoord(x), SectionPos.blockToSectionCoord(z));
+					return new Found(RegistryQuery.id(biome), x, y, z, distance, visit);
+				}
+			}
+			return null;
+		});
+	}
+
+	/** One column of the search: the requested biome found there, or null. Throws {@link Budget} to stop the search. */
+	@FunctionalInterface
+	interface Column {
+		Found sample(int x, int z, double distance);
+	}
+
+	/** Thrown by a {@link Column} when the search has used up its budget. */
+	static final class Budget extends RuntimeException {
+		Budget() {
+			super(null, null, false, false);
+		}
+	}
+
+	/**
+	 * The search itself, over the grid around {@code origin}: rings outward, skipping columns near a patch already
+	 * found. The work per column is constant (see {@link Patches}), the patches kept are capped, and the deadline and
+	 * interrupts are checked every column.
+	 */
+	static Result search(Origin origin, Request request, long deadline, Column column) throws InterruptedException {
 		int originX = (int) Math.floor(origin.x());
 		int originZ = (int) Math.floor(origin.z());
 		int maxRing = request.maxDistance() / STEP + 1;
 
 		NearestFirst.TopK<Found> nearest = new NearestFirst.TopK<>(request.limit(), request.maxDistance());
 		// Every patch found, accepted or not: a visited patch still hides unvisited samples of the same patch.
-		List<Found> patches = new ArrayList<>();
-		long[] samples = {0};
+		Patches patches = new Patches(request.minSpacing());
+		boolean[] stop = {false};
 		for (int ring = 0; ring <= maxRing; ring++) {
 			NearestFirst.forEachInRing(ring, (dx, dz) -> {
+				if (stop[0]) {
+					return;
+				}
+				if (Thread.currentThread().isInterrupted() || System.nanoTime() > deadline || patches.size() >= MAX_PATCHES) {
+					stop[0] = true;
+					return;
+				}
 				int x = originX + dx * STEP;
 				int z = originZ + dz * STEP;
 				double distance = origin.horizontalDistanceTo(x, z);
-				if (!nearest.couldAccept(distance) || near(patches, x, z, request.minSpacing())) {
+				if (!nearest.couldAccept(distance) || patches.near(x, z)) {
 					return;
 				}
-				for (int y : ys) {
-					samples[0]++;
-					Holder<Biome> biome = resolver.getNoiseBiome(QuartPos.fromBlock(x), QuartPos.fromBlock(y), QuartPos.fromBlock(z));
-					if (request.biomes().contains(biome)) {
-						Visit visit = visits.at(SectionPos.blockToSectionCoord(x), SectionPos.blockToSectionCoord(z));
-						Found found = new Found(RegistryQuery.id(biome), x, y, z, distance, visit);
-						patches.add(found);
-						if (request.visited().accepts(visit)) {
-							nearest.offer(found, distance);
-						}
-						break;
+				Found found;
+				try {
+					found = column.sample(x, z, distance);
+				} catch (Budget e) {
+					stop[0] = true;
+					return;
+				}
+				if (found != null) {
+					patches.add(x, z);
+					if (request.visited().accepts(found.visit())) {
+						nearest.offer(found, distance);
 					}
 				}
 			});
+			if (Thread.interrupted()) {
+				throw new InterruptedException("The biome search was cancelled.");
+			}
+			if (stop[0]) {
+				return new Result(nearest.sorted(), true);
+			}
 			// Every column in the next ring is at least (ring + 1) * STEP away.
 			if (nearest.settled((ring + 1) * STEP)) {
 				break;
-			}
-			if (samples[0] > MAX_SAMPLES) {
-				return new Result(nearest.sorted(), true);
 			}
 		}
 		return new Result(nearest.sorted(), false);
 	}
 
-	private static boolean near(List<Found> patches, int x, int z, int spacing) {
-		for (Found f : patches) {
-			if (Math.abs(f.x() - x) < spacing && Math.abs(f.z() - z) < spacing
-				&& Math.pow(f.x() - x, 2) + Math.pow(f.z() - z, 2) < (double) spacing * spacing) {
-				return true;
-			}
+	/**
+	 * The patches found so far, in a grid of cells as wide as the spacing, so whether a column is near one looks at
+	 * its own cell and the eight around it. Patches are at least the spacing apart, so a cell holds at most a few.
+	 */
+	static final class Patches {
+		private final int spacing;
+		private final Map<Long, long[]> cells = new HashMap<>();
+		private int size;
+
+		Patches(int spacing) {
+			this.spacing = spacing;
 		}
-		return false;
+
+		int size() {
+			return size;
+		}
+
+		/** Whether a patch is closer than the spacing. */
+		boolean near(int x, int z) {
+			int cellX = Math.floorDiv(x, spacing);
+			int cellZ = Math.floorDiv(z, spacing);
+			for (int cx = cellX - 1; cx <= cellX + 1; cx++) {
+				for (int cz = cellZ - 1; cz <= cellZ + 1; cz++) {
+					long[] cell = cells.get(key(cx, cz));
+					if (cell == null) {
+						continue;
+					}
+					for (long patch : cell) {
+						long px = (int) (patch >> 32);
+						long pz = (int) patch;
+						if ((px - x) * (px - x) + (pz - z) * (pz - z) < (long) spacing * spacing) {
+							return true;
+						}
+					}
+				}
+			}
+			return false;
+		}
+
+		void add(int x, int z) {
+			long patch = ((long) x << 32) | (z & 0xFFFFFFFFL);
+			cells.merge(key(Math.floorDiv(x, spacing), Math.floorDiv(z, spacing)), new long[] {patch}, (old, added) -> {
+				long[] grown = Arrays.copyOf(old, old.length + 1);
+				grown[old.length] = patch;
+				return grown;
+			});
+			size++;
+		}
+
+		private static long key(int cellX, int cellZ) {
+			return ((long) cellX << 32) | (cellZ & 0xFFFFFFFFL);
+		}
 	}
 }
