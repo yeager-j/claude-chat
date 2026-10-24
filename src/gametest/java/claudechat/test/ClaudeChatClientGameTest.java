@@ -23,8 +23,11 @@ import net.minecraft.client.input.MouseButtonInfo;
 import net.minecraft.client.resources.language.I18n;
 import net.minecraft.commands.Commands;
 import net.minecraft.network.chat.ClickEvent;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Vec3i;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
 import java.util.ArrayList;
 import java.util.List;
 import com.google.gson.JsonElement;
@@ -178,13 +181,23 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 						"{\"template\": \"minecraft:village/plains/houses/plains_small_house_1\", \"layers\": true}");
 					check(house.getAsJsonArray("used_by_structures").toString().contains("minecraft:village_plains"), "house not traced to plains villages");
 					check(house.getAsJsonArray("layers").size() > 3, "house layers missing");
+					check("vanilla".equals(house.get("from").getAsString()), "house isn't from the vanilla pack: " + house.get("from"));
 					logTool(context, "inspect_structure_template", "{\"template\": \"minecraft:igloo/bottom\"}");
-					try {
-						logTool(context, "inspect_structure_template", "{\"template\": \"plains_small_house\"}");
-						check(false, "a partial template id should fail");
-					} catch (RuntimeException e) {
-						LOGGER.info("tool inspect_structure_template partial id -> {}", e.getCause() != null ? e.getCause().getMessage() : e.getMessage());
-					}
+					check(toolError(context, "inspect_structure_template", "{\"template\": \"plains_small_house\"}").contains("No structure template"),
+						"a partial template id should fail");
+
+					// Saving with a structure block shows up in the next search, and again after saving over it.
+					String towerSearch = "{\"blocks\": [\"gold_block\"], \"query\": \"claudechat:\"}";
+					saveTestTower(singleplayer, 1);
+					JsonObject saved = logTool(context, "search_structure_templates", towerSearch).getAsJsonArray("results").get(0).getAsJsonObject();
+					check(saved.get("template").getAsString().equals("claudechat:test_tower") && saved.get("solid_blocks").getAsInt() == 1
+						&& saved.get("from").getAsString().startsWith("this world"), "saved template not indexed: " + saved);
+					saveTestTower(singleplayer, 3);
+					JsonObject resaved = logTool(context, "search_structure_templates", towerSearch).getAsJsonArray("results").get(0).getAsJsonObject();
+					check(resaved.get("solid_blocks").getAsInt() == 3, "index kept the old save: " + resaved);
+					JsonObject tower = logTool(context, "inspect_structure_template", "{\"template\": \"claudechat:test_tower\", \"layers\": true}");
+					check(tower.get("solid_blocks").getAsInt() == 3 && tower.get("from").getAsString().startsWith("this world"),
+						"inspect doesn't match the save: " + tower);
 					String question = System.getenv("CLAUDECHAT_TEMPLATE_QUESTION");
 					if (question != null && !question.isBlank()) {
 						chat(context, "@claude " + question);
@@ -201,10 +214,22 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 				// folder, reads their material lists, and checks a chest holding all but one redstone dust against the first.
 				String schematicSource = System.getenv("CLAUDECHAT_SCHEMATIC_TEST");
 				if (schematicSource != null && !schematicSource.isBlank()) {
-					copySchematics(Path.of(schematicSource), Schematics.directory());
+					copySchematics(Path.of(schematicSource), Schematics.folder().dir());
 					JsonObject list = logTool(context, "list_schematics", "{}");
 					var files = list.getAsJsonArray("schematics");
 					check(!files.isEmpty(), "no schematics listed");
+					// With the unit tests' fixtures (see ExportSchematicFixtures): matching, upgrades and unreadable files.
+					if (files.toString().contains("\"farms/Witch Farm.litematic\"")) {
+						check(logTool(context, "list_schematics", "{\"query\": \"farms/witch\"}").getAsJsonArray("schematics").size() == 2,
+							"a query with / should list both farms");
+						check(toolError(context, "inspect_schematic", "{\"schematic\": \"witch\"}").contains("several"), "\"witch\" should be ambiguous");
+						JsonObject farm = logTool(context, "inspect_schematic", "{\"schematic\": \"farms\\\\witch farm\"}");
+						check(farm.getAsJsonArray("regions").size() == 2, "the two-region schematic lost a region: " + farm);
+						JsonObject spawner = logTool(context, "inspect_schematic", "{\"schematic\": \"Old Spawner\"}");
+						check(spawner.getAsJsonArray("block_entities").toString().contains("\"spawns\":\"minecraft:skeleton\""),
+							"the 1.12 spawner wasn't upgraded: " + spawner);
+						check(files.toString().matches(".*\"old/Broken.litematic\",\"error\":\"unreadable.*"), "the broken file isn't marked unreadable");
+					}
 					String file = files.get(0).getAsJsonObject().get("file").getAsString();
 					JsonObject schematic = logTool(context, "inspect_schematic", "{\"schematic\": \"" + file + "\", \"layers\": true}");
 					JsonObject materials = schematic.getAsJsonObject("materials");
@@ -711,6 +736,39 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		}
 	}
 
+	/** The message a world tool call fails with; fails the test if the call succeeds. */
+	private static String toolError(ClientGameTestContext context, String name, String args) {
+		try {
+			logTool(context, name, args);
+		} catch (RuntimeException e) {
+			Throwable cause = e;
+			while (cause.getCause() != null) {
+				cause = cause.getCause();
+			}
+			LOGGER.info("tool {} {} -> error: {}", name, args, cause.getMessage());
+			return String.valueOf(cause.getMessage());
+		}
+		throw new AssertionError(name + " " + args + " should have failed");
+	}
+
+	/**
+	 * Saves claudechat:test_tower the way a structure block does: a 1×3×1 column above the player with {@code height}
+	 * gold blocks from the bottom, air above them.
+	 */
+	private static void saveTestTower(TestSingleplayerContext singleplayer, int height) {
+		boolean saved = singleplayer.getServer().computeOnServer(server -> {
+			ServerLevel level = server.overworld();
+			BlockPos base = server.getPlayerList().getPlayers().getFirst().blockPosition().offset(3, 20, 3);
+			for (int y = 0; y < 3; y++) {
+				level.setBlockAndUpdate(base.above(y), y < height ? Blocks.GOLD_BLOCK.defaultBlockState() : Blocks.AIR.defaultBlockState());
+			}
+			Identifier id = Identifier.parse("claudechat:test_tower");
+			server.getStructureTemplateManager().getOrCreate(id).fillFromWorld(level, base, new Vec3i(1, 3, 1), false, List.of(Blocks.STRUCTURE_VOID));
+			return server.getStructureTemplateManager().save(id);
+		});
+		check(saved, "couldn't save the test tower");
+	}
+
 	private static JsonObject logTool(ClientGameTestContext context, String name, String args) {
 		long start = System.nanoTime();
 		CompletableFuture<JsonElement> result = CompletableFuture.supplyAsync(() -> {
@@ -860,11 +918,13 @@ public class ClaudeChatClientGameTest implements FabricClientGameTest {
 		}
 	}
 
+	/** Copies the folder's files, subfolders included. */
 	private static void copySchematics(Path from, Path to) {
-		try (var files = Files.list(from)) {
-			Files.createDirectories(to);
+		try (var files = Files.walk(from)) {
 			for (Path file : files.filter(Files::isRegularFile).toList()) {
-				Files.copy(file, to.resolve(file.getFileName().toString()), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				Path target = to.resolve(from.relativize(file).toString());
+				Files.createDirectories(target.getParent());
+				Files.copy(file, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 			}
 		} catch (IOException e) {
 			throw new UncheckedIOException(e);
