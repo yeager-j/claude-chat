@@ -12,23 +12,27 @@ import net.minecraft.nbt.visitors.CollectFields;
 import net.minecraft.nbt.visitors.FieldSelector;
 
 import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
-import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalLong;
+import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Predicate;
-import java.util.stream.Stream;
 
 /**
  * Schematic files from the player's schematics folder (Litematica's, or the game's schematics/ folder): Litematica
@@ -145,6 +149,9 @@ public final class Schematics {
 	public record Lookup(Match match, Catalog catalog) {
 	}
 
+	/** Folder levels a walk goes down to find schematic files. */
+	static final int MAX_DEPTH = 8;
+
 	/** Folder entries a walk visits, of any kind; it stops after that many. */
 	static final int MAX_WALKED = 100_000;
 
@@ -176,6 +183,11 @@ public final class Schematics {
 	 * The schematics folder as resolved once; see {@link #folder()}. It may hold a downloaded collection of any size, so
 	 * one tool call walks at most {@link #MAX_WALKED} entries and keeps at most {@link #MAX_FILES} files, and reads at
 	 * most {@link #MAX_DESCRIBED} descriptions within {@link #CATALOG_BYTES} and {@link #CATALOG_TIME}.
+	 * <p>
+	 * A downloaded collection may also hold links (see {@link KnowledgeFiles#isLink}), which could lead to a file
+	 * outside the folder that Claude shouldn't see, such as another world's structures. The walk neither lists nor
+	 * enters them, and every read checks again, right before opening, that the file isn't a link and no link on the way
+	 * leads it outside the folder. The folder itself may be a link: the player chose it.
 	 */
 	public record Folder(Path dir) {
 		/** The schematic files under the folder, by path, within the walk's limits. */
@@ -184,35 +196,119 @@ public final class Schematics {
 				return new FileList(List.of(), true);
 			}
 
+			// Walk where the folder really is, so a linked folder is entered, then name each file through the folder.
+			Path root = dir.toRealPath();
 			List<Path> files = new ArrayList<>();
-			boolean complete = true;
-			try (Stream<Path> walk = Files.walk(dir, 8)) {
-				Iterator<Path> paths = walk.iterator();
-				int walked = 0;
-				while (paths.hasNext()) {
+			boolean[] complete = {true};
+			Files.walkFileTree(root, Set.of(), MAX_DEPTH, new SimpleFileVisitor<>() {
+				private int walked;
+
+				@Override
+				public FileVisitResult preVisitDirectory(Path folder, BasicFileAttributes attributes) {
+					return visit(folder, attributes);
+				}
+
+				@Override
+				public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) {
+					return visit(file, attributes);
+				}
+
+				@Override
+				public FileVisitResult visitFileFailed(Path entry, IOException e) throws IOException {
+					// The walk opens a folder before handing it over, so a junction whose target is gone fails here.
+					try {
+						BasicFileAttributes attributes = Files.readAttributes(entry, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+						if (KnowledgeFiles.isLink(entry, attributes)) {
+							return visit(entry, attributes);
+						}
+					} catch (IOException unreadable) {
+						e.addSuppressed(unreadable);
+					}
+
+					throw e;
+				}
+
+				private FileVisitResult visit(Path entry, BasicFileAttributes attributes) {
 					if (Thread.currentThread().isInterrupted()) {
 						throw new CancellationException("Listing schematics was cancelled");
 					}
 
-					Path file = paths.next();
 					if (++walked > MAX_WALKED) {
-						complete = false;
-						break;
+						complete[0] = false;
+						return FileVisitResult.TERMINATE;
 					}
 
-					if (format(file).isPresent() && Files.isRegularFile(file)) {
+					if (KnowledgeFiles.isLink(entry, attributes)) {
+						return FileVisitResult.SKIP_SUBTREE;
+					}
+
+					// Folders at MAX_DEPTH arrive here as entries, not regular files, and are left out.
+					if (attributes.isRegularFile() && format(entry).isPresent()) {
 						if (files.size() >= MAX_FILES) {
-							complete = false;
-							break;
+							complete[0] = false;
+							return FileVisitResult.TERMINATE;
 						}
 
-						files.add(file);
+						files.add(dir.resolve(root.relativize(entry)));
 					}
+
+					return FileVisitResult.CONTINUE;
 				}
-			}
+			});
 
 			files.sort(Comparator.comparing(Path::toString));
-			return new FileList(files, complete);
+			return new FileList(files, complete[0]);
+		}
+
+		/**
+		 * A schematic's description, reading only the fields its format needs.
+		 *
+		 * @throws TooLargeException if the file is over {@link NbtBudget#FILE}
+		 * @throws IOException if the file isn't in the folder, or is a link or reached through one
+		 */
+		public Info info(Path file) throws IOException {
+			return info(file, NbtBudget.FILE, new AtomicLong());
+		}
+
+		/** See {@link #info(Path)}; reads within {@code budget}, adding the bytes decompressed to {@code used}. */
+		private Info info(Path file, NbtBudget budget, AtomicLong used) throws IOException {
+			Format format = requireFormat(file);
+			CollectFields fields = new CollectFields(format.infoFields().toArray(FieldSelector[]::new));
+
+			try {
+				budget.parse(open(file), fields, used);
+			} catch (TooLargeException e) {
+				throw tooLarge(file, e);
+			}
+
+			CompoundTag tag = fields.getResult() instanceof CompoundTag compound ? compound : new CompoundTag();
+			return format.info(tag, stem(file));
+		}
+
+		/**
+		 * Every block of a schematic. Waits while {@link #LOADS} other reads are running, so that several large files
+		 * read at once can't take more memory together than the heap has.
+		 *
+		 * @throws TooLargeException if the file is over {@link NbtBudget#FILE} or over a limit of the volume model
+		 *     (positions, block states) or of {@link StructureNbt} (palettes, block entities, entities)
+		 * @throws IOException if the file isn't in the folder, or is a link or reached through one
+		 */
+		public Schematic load(Path file) throws IOException {
+			Format format = requireFormat(file);
+
+			acquire(LOADS);
+			try (InputStream in = open(file)) {
+				return format.read(NbtBudget.FILE.read(in), stem(file));
+			} catch (TooLargeException e) {
+				throw tooLarge(file, e);
+			} finally {
+				LOADS.release();
+			}
+		}
+
+		/** Opens one of the folder's files, checking first that neither it nor a link on the way leads elsewhere. */
+		private InputStream open(Path file) throws IOException {
+			return KnowledgeFiles.openPlainFileInside(dir, file);
 		}
 
 		/** Every schematic file under the folder with its description, by path. Files that can't be read are listed with the reason. */
@@ -240,7 +336,7 @@ public final class Schematics {
 		private Catalog describe(List<Path> files, boolean complete) throws IOException {
 			acquire(CATALOGS);
 			try {
-				CatalogBudget budget = new CatalogBudget();
+				CatalogBudget budget = new CatalogBudget(this);
 				List<Entry> entries = new ArrayList<>();
 				int notRead = 0;
 				for (Path file : files) {
@@ -268,10 +364,15 @@ public final class Schematics {
 
 	/** One tool call's allowance for reading descriptions, shared by every file it reads. */
 	private static final class CatalogBudget {
+		private final Folder folder;
 		private final AtomicLong used = new AtomicLong();
 		private final long deadline = System.nanoTime() + CATALOG_TIME.toNanos();
 		private int described;
 		private boolean spent;
+
+		CatalogBudget(Folder folder) {
+			this.folder = folder;
+		}
 
 		/**
 		 * The file's description, or empty once the allowance is spent. A file that goes over what is left of the
@@ -287,7 +388,7 @@ public final class Schematics {
 			described++;
 			NbtBudget nbt = new NbtBudget(Math.min(NbtBudget.FILE_BYTES, left), () -> Thread.currentThread().isInterrupted() || pastDeadline());
 			try {
-				return Optional.of(Schematics.info(file, nbt, used));
+				return Optional.of(folder.info(file, nbt, used));
 			} catch (CancellationException e) {
 				if (Thread.currentThread().isInterrupted()) {
 					throw e;
@@ -358,48 +459,8 @@ public final class Schematics {
 		return entry instanceof Readable readable ? Optional.of(readable.info().name().toLowerCase(Locale.ROOT)) : Optional.empty();
 	}
 
-	/**
-	 * A schematic's description, reading only the fields its format needs.
-	 *
-	 * @throws TooLargeException if the file is over {@link NbtBudget#FILE}
-	 */
-	public static Info info(Path file) throws IOException {
-		return info(file, NbtBudget.FILE, new AtomicLong());
-	}
-
-	/** See {@link #info(Path)}; reads within {@code budget}, adding the bytes decompressed to {@code used}. */
-	private static Info info(Path file, NbtBudget budget, AtomicLong used) throws IOException {
-		Format format = format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
-		CollectFields fields = new CollectFields(format.infoFields().toArray(FieldSelector[]::new));
-
-		try {
-			budget.parse(file, fields, used);
-		} catch (TooLargeException e) {
-			throw tooLarge(file, e);
-		}
-
-		CompoundTag tag = fields.getResult() instanceof CompoundTag compound ? compound : new CompoundTag();
-		return format.info(tag, stem(file));
-	}
-
-	/**
-	 * Every block of a schematic. Waits while {@link #LOADS} other reads are running, so that several large files read
-	 * at once can't take more memory together than the heap has.
-	 *
-	 * @throws TooLargeException if the file is over {@link NbtBudget#FILE} or over a limit of the volume model (positions,
-	 *     block states) or of {@link StructureNbt} (palettes, block entities, entities)
-	 */
-	public static Schematic load(Path file) throws IOException {
-		Format format = format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
-
-		acquire(LOADS);
-		try {
-			return format.read(NbtBudget.FILE.read(file), stem(file));
-		} catch (TooLargeException e) {
-			throw tooLarge(file, e);
-		} finally {
-			LOADS.release();
-		}
+	private static Format requireFormat(Path file) throws IOException {
+		return format(file).orElseThrow(() -> new IOException("Not a schematic file: " + file.getFileName()));
 	}
 
 	private static TooLargeException tooLarge(Path file, TooLargeException limit) {

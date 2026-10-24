@@ -1,6 +1,7 @@
 package claudechat;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
@@ -299,6 +300,21 @@ final class KnowledgeFiles {
 		if (real == null || !real.startsWith(realRoot)) {
 			throw new IOException("Refusing to write to " + path + ": a link leads it outside " + root + (real == null ? "" : ", to " + real));
 		}
+	}
+
+	/**
+	 * Opens {@code file}, someone else's file under {@code root}, for reading: only if it's a regular file whose real
+	 * location is where its names say below {@code root} ({@link #isPlainFile}, {@link #isUnlinkedInside}). It opens
+	 * without following links, so a file swapped for a link after the check fails to open. Default file system only.
+	 *
+	 * @throws IOException if {@code file} is a link, isn't a regular file, or a link on the way leads it elsewhere
+	 */
+	static InputStream openPlainFileInside(Path root, Path file) throws IOException {
+		if (!isPlainFile(file) || !isUnlinkedInside(root, file)) {
+			throw new IOException("Not reading " + file.getFileName() + ": it is a link, or a link leads it outside " + root);
+		}
+
+		return Files.newInputStream(file, LinkOption.NOFOLLOW_LINKS);
 	}
 
 	static boolean isEmptyDirectory(Path dir) throws IOException {

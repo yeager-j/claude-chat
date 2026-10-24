@@ -89,9 +89,16 @@ record NbtBudget(long maxBytes, BooleanSupplier cancelled) {
 	 * or not the read succeeds: for a budget shared by many files.
 	 */
 	void parse(Path file, StreamTagVisitor visitor, AtomicLong used) throws IOException {
+		try (InputStream compressed = Files.newInputStream(file)) {
+			parse(compressed, visitor, used);
+		}
+	}
+
+	/** Like {@link #parse(Path, StreamTagVisitor, AtomicLong)}, from a gzipped stream, which it closes. */
+	void parse(InputStream compressed, StreamTagVisitor visitor, AtomicLong used) throws IOException {
 		Accounter accounter = new Accounter(maxBytes);
 
-		try (InputStream compressed = Files.newInputStream(file)) {
+		try (compressed) {
 			Limited limited = new Limited(new GZIPInputStream(compressed));
 			try (DataInputStream in = new DataInputStream(new BufferedInputStream(limited))) {
 				NbtIo.parse(in, visitor, accounter);

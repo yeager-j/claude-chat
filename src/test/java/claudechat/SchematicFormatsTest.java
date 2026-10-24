@@ -13,6 +13,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
@@ -127,9 +128,9 @@ class SchematicFormatsTest {
 		SchematicFixtures.write(dir.resolve("b.schem"), SchematicFixtures.spongeV3());
 		SchematicFixtures.write(dir.resolve("c.nbt"), SchematicFixtures.oldStructure());
 
-		Schematics.Info litematic = Schematics.info(dir.resolve("a.litematic"));
-		Schematics.Info sponge = Schematics.info(dir.resolve("b.schem"));
-		Schematics.Info structure = Schematics.info(dir.resolve("c.nbt"));
+		Schematics.Info litematic = new Schematics.Folder(dir).info(dir.resolve("a.litematic"));
+		Schematics.Info sponge = new Schematics.Folder(dir).info(dir.resolve("b.schem"));
+		Schematics.Info structure = new Schematics.Folder(dir).info(dir.resolve("c.nbt"));
 
 		assertEquals(new Schematics.Info("Two Regions", "tester", "a test", new Vec3i(5, 1, 1), OptionalLong.of(3)), litematic);
 		assertEquals(new Schematics.Info("Sponge Three", "tester", "", new Vec3i(4, 1, 1), OptionalLong.empty()), sponge);
@@ -150,11 +151,96 @@ class SchematicFormatsTest {
 	}
 
 	@Test
+	void linkedFileIsNeitherListedNorRead() throws IOException {
+		Schematics.Folder folder = folderWithOwnSchematic();
+		Path secret = outsideSchematic();
+		Path link = FileLinks.symbolicLink(folder.dir().resolve("link.litematic"), secret);
+
+		assertEquals(List.of("own.litematic"), paths(folder));
+		assertThrows(IOException.class, () -> folder.info(link));
+		assertThrows(IOException.class, () -> folder.load(link));
+	}
+
+	@Test
+	void fileSwappedForALinkAfterListingIsNotRead() throws IOException {
+		Schematics.Folder folder = folderWithOwnSchematic();
+		Path own = folder.files().files().getFirst();
+		Path secret = outsideSchematic();
+
+		Files.delete(own);
+		FileLinks.symbolicLink(own, secret);
+
+		assertThrows(IOException.class, () -> folder.load(own));
+	}
+
+	@Test
+	void linkedFolderIsNeitherEnteredNorRead() throws Exception {
+		Schematics.Folder folder = folderWithOwnSchematic();
+		outsideSchematic();
+		Path linked = FileLinks.junction(folder.dir().resolve("linked"), dir.resolve("outside"));
+
+		assertEquals(List.of("own.litematic"), paths(folder));
+		assertThrows(IOException.class, () -> folder.info(linked.resolve("secret.litematic")));
+		assertThrows(IOException.class, () -> folder.load(linked.resolve("secret.litematic")));
+	}
+
+	@Test
+	void linkedFoldersAreSkippedAtAnyDepthWhereverTheyLead() throws Exception {
+		Schematics.Folder folder = folderWithOwnSchematic();
+		outsideSchematic();
+		Path sub = Files.createDirectories(folder.dir().resolve("sub"));
+		FileLinks.junction(sub.resolve("outside"), dir.resolve("outside"));
+		FileLinks.junction(sub.resolve("back"), folder.dir());
+		Path gone = Files.createDirectories(dir.resolve("gone"));
+		FileLinks.junction(sub.resolve("dangling"), gone);
+		Files.delete(gone);
+
+		assertEquals(List.of("own.litematic"), paths(folder));
+		assertThrows(IOException.class, () -> folder.load(sub.resolve("back/own.litematic")));
+	}
+
+	@Test
+	void fileOutsideTheFolderIsNotRead() throws IOException {
+		Schematics.Folder folder = folderWithOwnSchematic();
+		Path secret = outsideSchematic();
+
+		assertThrows(IOException.class, () -> folder.load(secret));
+		assertThrows(IOException.class, () -> folder.load(folder.dir().resolve("../outside/secret.litematic")));
+	}
+
+	@Test
+	void linkedFolderChosenAsTheSchematicsFolderIsRead() throws Exception {
+		Schematics.Folder real = folderWithOwnSchematic();
+		Schematics.Folder linked = new Schematics.Folder(FileLinks.junction(dir.resolve("linked schematics"), real.dir()));
+
+		assertEquals(List.of("own.litematic"), paths(linked));
+		Path own = linked.files().files().getFirst();
+		assertEquals(linked.dir().resolve("own.litematic"), own);
+		assertEquals("Two Regions", linked.load(own).info().name());
+	}
+
+	private Schematics.Folder folderWithOwnSchematic() throws IOException {
+		Path schematics = Files.createDirectories(dir.resolve("schematics"));
+		SchematicFixtures.write(schematics.resolve("own.litematic"), SchematicFixtures.litematic());
+		return new Schematics.Folder(schematics);
+	}
+
+	private Path outsideSchematic() throws IOException {
+		Path secret = Files.createDirectories(dir.resolve("outside")).resolve("secret.litematic");
+		SchematicFixtures.write(secret, SchematicFixtures.litematic());
+		return secret;
+	}
+
+	private static List<String> paths(Schematics.Folder folder) throws IOException {
+		return folder.entries().entries().stream().map(Schematics.Entry::path).toList();
+	}
+
+	@Test
 	void decompressionBombIsRefusedBeforeItsArrayIsAllocated() throws IOException {
 		Path bomb = dir.resolve("bomb.schem");
 		SchematicFixtures.writeZeroBomb(bomb, NbtBudget.FILE_BYTES + (1 << 20));
 
-		TooLargeException e = assertThrows(TooLargeException.class, () -> Schematics.load(bomb));
+		TooLargeException e = assertThrows(TooLargeException.class, () -> new Schematics.Folder(dir).load(bomb));
 
 		assertTrue(e.getMessage().contains("bomb.schem") && e.getMessage().contains("256 MiB of memory"), e.getMessage());
 	}
@@ -241,7 +327,7 @@ class SchematicFormatsTest {
 	private Schematics.Schematic load(String name, CompoundTag root) throws IOException {
 		Path file = dir.resolve(name);
 		SchematicFixtures.write(file, root);
-		return Schematics.load(file);
+		return new Schematics.Folder(dir).load(file);
 	}
 
 	private static Map<BlockPos, CompoundTag> blockEntityData(BlockVolume v) {
