@@ -39,7 +39,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `ClaudeChatClient` | Entry point: `/claude` commands, `@claude` chat hook, lifecycle events |
 | `ClaudeCli` | Runs `claude -p`: system prompt, stream-json parsing, progress notes, MCP config |
 | `ClaudeConfig` | `config/claudechat.properties`; `configVersion` drives migrations |
-| `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand) with Vineflower in a separate JVM; extracts data and lang files; world data packs; the prompt's file map |
+| `KnowledgeBase` | `config/claudechat/knowledge/`: decompiles Minecraft (always) and mods (on demand); extracts data and lang files; world data packs; each source's `Status`; the prompt's file map |
+| `BuiltFolder`, `Decompiler`, `ModMentions`, `KnowledgeFiles` | One built folder (layout, marker holding the input key, progress, publish by rename, removing superseded folders); Vineflower in a separate JVM; which mods a question names; contained-path and copy helpers |
 | `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset → chat components; `[[item]]` icons; `[[recipe:id]]` grids from data JSON |
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while Xaero's Minimap is loaded) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |

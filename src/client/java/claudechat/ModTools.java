@@ -19,8 +19,8 @@ public class ModTools {
 		JsonArray tools = new JsonArray();
 		tools.add(WorldTools.tool("decompile_mod",
 			"Decompile an installed mod's Java code so you can search it. Only for mods the reference file list marks as "
-				+ "\"code not decompiled yet\"; their data and lang files are already there. Takes a few seconds, up to a "
-				+ "minute for big mods. Returns the folder of the source, relative to the current directory.",
+				+ "\"" + KnowledgeBase.NOT_DECOMPILED + "\"; their data and lang files are already there. Takes a few "
+				+ "seconds, up to a minute for big mods. Returns the folder of the source, relative to the current directory.",
 			"""
 			{"type": "object", "properties": {
 			  "mod": {"type": "string", "description": "The mod id in [brackets] in the reference file list, e.g. \\"veinminer\\"."}
@@ -37,26 +37,37 @@ public class ModTools {
 		if (!has(name)) {
 			throw new IllegalArgumentException("Unknown tool: " + name);
 		}
+
 		String id = args.has("mod") ? args.get("mod").getAsString().trim() : "";
 		KnowledgeBase.Source mod = knowledge.source(id).orElseThrow(() -> new IllegalArgumentException(
 			"No mod with id \"" + id + "\". Use the id in [brackets] from the reference file list."));
-		boolean already = knowledge.hasCode(mod);
-		if (!already) {
-			if (!knowledge.canDecompile(mod)) {
-				throw new IllegalArgumentException(mod.label() + " has no code to decompile (" + knowledge.reason(mod)
-					+ "). Answer from its data and lang files.");
-			}
-			ClaudeChatClient.LOGGER.info("Decompiling {} for Claude", mod.label());
-			knowledge.buildCodeNow(mod, message -> { });
-			if (!knowledge.hasCode(mod)) {
-				throw new IllegalStateException("Decompiling " + mod.label() + " failed. Answer from its data and lang files.");
-			}
+		KnowledgeBase.Status before = knowledge.status(mod);
+
+		if (!before.hasCode()) {
+			decompile(mod, before);
 		}
+
 		JsonObject out = new JsonObject();
 		out.addProperty("mod", mod.id());
 		out.addProperty("name", mod.label());
-		out.addProperty("source", mod.dir() + "/src");
-		out.addProperty("status", already ? "already decompiled" : "decompiled");
+		out.addProperty("source", knowledge.codeFolder(mod));
+		out.addProperty("status", before.hasCode() ? "already decompiled" : "decompiled");
 		return out;
+	}
+
+	private void decompile(KnowledgeBase.Source mod, KnowledgeBase.Status before) {
+		if (!before.canDecompile()) {
+			throw new IllegalArgumentException(mod.label() + " has no code to decompile (" + before.reason()
+				+ "). Answer from its data and lang files.");
+		}
+
+		ClaudeChatClient.LOGGER.info("Decompiling {} for Claude", mod.label());
+		knowledge.buildCodeNow(mod, message -> { });
+		KnowledgeBase.Status after = knowledge.status(mod);
+
+		if (!after.hasCode()) {
+			String why = after.failure() != null ? " (" + after.failure() + ")" : "";
+			throw new IllegalStateException("Decompiling " + mod.label() + " failed" + why + ". Answer from its data and lang files.");
+		}
 	}
 }
