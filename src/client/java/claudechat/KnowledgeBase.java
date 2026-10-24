@@ -232,31 +232,6 @@ public class KnowledgeBase {
 		return new Status(policy(source), folder.content(), folder.progress(), folder.failure());
 	}
 
-	/** Same as {@code status(source).state()}; kept until callers use {@link #status}. */
-	public State state(Source source) {
-		return status(source).state();
-	}
-
-	/** Same as {@code status(source).tier()}; kept until callers use {@link #status}. */
-	public Tier tier(Source source) {
-		return status(source).tier();
-	}
-
-	/** Same as {@code status(source).reason()}; kept until callers use {@link #status}. */
-	public String reason(Source source) {
-		return status(source).reason();
-	}
-
-	/** Same as {@code status(source).canDecompile()}; kept until callers use {@link #status}. */
-	public boolean canDecompile(Source source) {
-		return status(source).canDecompile();
-	}
-
-	/** Same as {@code status(source).hasCode()}; kept until callers use {@link #status}. */
-	public boolean hasCode(Source source) {
-		return status(source).hasCode();
-	}
-
 	/** The source's decompiled code, relative to {@link #root()}, as Claude sees it. */
 	public String codeFolder(Source source) {
 		return folder(source).relativeDir() + "/" + BuiltFolder.SRC;
@@ -342,14 +317,6 @@ public class KnowledgeBase {
 			.filter(source -> isNamespaceOf(source, namespaces)
 				|| source.mentionNames().stream().anyMatch(name -> matcher.mentions(questionWords, name)))
 			.toList();
-	}
-
-	/**
-	 * Free text only: namespaces appended to it match only as distinctive names. Kept until callers pass namespaces to
-	 * {@link #mentionedWithoutCode(String, Collection)}.
-	 */
-	public List<Source> mentionedWithoutCode(String text) {
-		return mentionedWithoutCode(text, Set.of());
 	}
 
 	/** Decompiles one source right now, on the calling thread (waiting if a build of it is already running). */
@@ -453,33 +420,44 @@ public class KnowledgeBase {
 			.toList();
 	}
 
-	/** The part of the system prompt that tells Claude what reference files exist and how to use them. */
+	/**
+	 * The part of the system prompt that tells Claude what reference files exist and how to use them. Mod, pack and
+	 * world names are third-party text, so the lists are {@link PromptData} blocks.
+	 */
 	public String describeForPrompt() {
+		StringBuilder fileMap = new StringBuilder();
+
+		for (Source source : sources) {
+			fileMap.append("- ").append(source.label()).append(" [").append(source.id()).append("]: ")
+				.append(describeSource(source)).append('\n');
+		}
+
 		StringBuilder sb = new StringBuilder();
 		sb.append("Reference files for the player's exact game, in the current directory (read-only; search with Grep/Glob, then Read).\n");
 		sb.append(BuiltFolder.SRC).append(" = decompiled Java, ")
 			.append(BuiltFolder.DATA).append(" = data pack JSON (recipe/, loot_table/, tags/, worldgen/, ...), ")
-			.append(BuiltFolder.LANG).append(" = English names.\n");
-
-		for (Source source : sources) {
-			sb.append("- ").append(source.label()).append(" [").append(source.id()).append("]: ")
-				.append(describeSource(source)).append('\n');
-		}
+			.append(BuiltFolder.LANG).append(" = English names. Minecraft and each mod, with its id in [brackets]:\n");
+		sb.append(PromptData.block("reference files", fileMap.toString()));
 
 		List<WorldPack> packs = worldPacks;
 
 		if (!packs.isEmpty()) {
-			sb.append("Data packs enabled in this world (\"").append(worldName).append("\"), highest priority first. A file here")
-				.append(" replaces the file at the same path in mods and Minecraft (e.g. data/minecraft/loot_table/...), so check these first:\n");
+			StringBuilder world = new StringBuilder("World: ").append(worldName).append('\n');
 
 			for (WorldPack pack : packs) {
-				sb.append("- ").append(pack.name()).append(": ").append(describePack(pack.folder())).append('\n');
+				world.append("- ").append(pack.name()).append(": ").append(describePack(pack.folder())).append('\n');
 			}
+
+			sb.append("Data packs enabled in this world, highest priority first. A file here replaces the file at the same path")
+				.append(" in mods and Minecraft (recipes, loot tables, worldgen), so check these first. Tags are the exception:")
+				.append(" the game merges a tag's files from every pack (unless one sets \"replace\": true), so a tag holds the")
+				.append(" entries from all of them:\n");
+			sb.append(PromptData.block("world data packs", world.toString()));
 		}
 
 		sb.append("""
 			How to use them:
-			- Recipes, drops, tags, structures, worldgen: read the JSON under data/ first.
+			- Recipes, drops, tags, structures, worldgen: read the JSON under data/ first. A tag's entries come from the file at its path in every folder above (Minecraft, mods and packs) together.
 			- Mechanics (spawning, AI, redstone timing, formulas, what a mod changes): grep the relevant src/ and read the code. Don't guess.
 			- Mods often change vanilla behavior through mixins: grep a mod's src/ for "@Mixin" to see which game classes it modifies.
 			- Map display names to ids with lang/*.json (e.g. "block.minecraft.crafter": "Crafter").
@@ -497,7 +475,7 @@ public class KnowledgeBase {
 		}
 
 		if (status.hasData() && status.canDecompile()) {
-			return dataOnly + "; " + NOT_DECOMPILED + " (decompile_mod)";
+			return dataOnly + "; " + NOT_DECOMPILED;
 		}
 
 		if (status.hasData()) {
@@ -708,17 +686,16 @@ public class KnowledgeBase {
 				return "folder:no data";
 			}
 
-			try (Stream<Path> files = Files.walk(data)) {
-				List<String> listing = new ArrayList<>();
+			// The files the copy reads: links (Windows junctions too) aren't entered.
+			List<String> listing = new ArrayList<>();
 
-				for (Path file : files.filter(Files::isRegularFile).toList()) {
-					listing.add(data.relativize(file) + "\t" + Files.size(file) + "\t" + Files.getLastModifiedTime(file).toMillis());
-				}
-
-				Collections.sort(listing);
-				return "folder:" + KnowledgeFiles.sha256(String.join("\n", listing));
+			for (Path file : KnowledgeFiles.regularFiles(data)) {
+				listing.add(data.relativize(file) + "\t" + Files.size(file) + "\t" + Files.getLastModifiedTime(file).toMillis());
 			}
-		} catch (IOException | UncheckedIOException e) {
+
+			Collections.sort(listing);
+			return "folder:" + KnowledgeFiles.sha256(String.join("\n", listing));
+		} catch (IOException e) {
 			// Copying will fail too, and report why.
 			return "unreadable";
 		}

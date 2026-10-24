@@ -241,11 +241,6 @@ public final class Materials {
 		return new Comparison(missingAsPlaced, withStock, useful, notNeeded);
 	}
 
-	/** Reads the game's recipes ahead of the first question (thousands with mods), so the first breakdown is quick. */
-	public void prepare() {
-		recipes.snapshot();
-	}
-
 	/**
 	 * A crafting recipe's ingredients per craft, each as a {@link #material}. Empty for other kinds (smelting,
 	 * stonecutting...), which don't make "crafted components", and for recipes that don't make a fixed item.

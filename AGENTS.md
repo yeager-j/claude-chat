@@ -40,7 +40,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | File | Role |
 | --- | --- |
 | `ClaudeChatClient` | Entry point: `/claude` commands, `@claude` chat hook, lifecycle events. Owns the current `Conversation`: disconnect and `/claude reset` end it |
-| `ClaudeCli` | Runs `claude -p` for a question: system prompt, flags, per-question MCP config (owner-only, deleted after), timeout (kills `claude` and its child processes) |
+| `ClaudeCli` | Runs `claude -p` for a question: flags, per-question MCP config (owner-only, deleted after), timeout (kills `claude` and its child processes) |
+| `SystemPrompt`, `PromptData`, `GameContext` | The system prompt, assembled from fragments their owners keep (`ChatMarkup.PROMPT`, `Waypoints.PROMPT`, `PermissionTier.prompt`, `KnowledgeBase.describeForPrompt`); `{tool:name}` references are checked against the MCP server's tools when it's built. Third-party text (game state, mod, pack and world names) goes in `<game-data>` blocks whose `<` can't be faked. `GameContext` is what's captured when the player asks: the game state text, held/targeted mod namespaces, the dimension |
 | `ClaudeRun`, `Conversation` | One question: its captured `Policy`, MCP `Grant`, `Approvals` and process; `cancel()` kills, revokes and denies, and a cancelled run's outcome is never delivered. A conversation holds the session follow-ups resume and the running question; client thread |
 | `PermissionTier`, `Policy` | One definition per tier: Claude Code flags, the prompt's permissions paragraph, what `run_command` does with a changing command, confirm text, help and tool-description text. A `Policy` is a question's tier and cheats, captured when asked; cheats only set the permission level |
 | `ChatOutput` | The `[Claude] ` prefix and "send if a player exists", for every class that writes to chat |
@@ -50,7 +51,7 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 | `BuiltFolder`, `Decompiler`, `ModMentions`, `KnowledgeFiles` | One built folder (layout, marker holding the input key, progress, publish by rename, removing superseded folders, refusing a folder a link leads outside the root); Vineflower in a separate JVM; which mods a question names; contained-path, link-safe walk, copy and delete helpers |
 | `DataPackCopy` | Copies a world data pack's `data/` from a folder or zip, within entry and byte limits counted from the bytes read |
 | `NbtBudget`, `TooLargeException` | Reading imported gzipped NBT (schematics, world and pack templates) within a decompressed-size, memory and nesting budget, stopping on cancellation; the error for any limit on imported files |
-| `ChatMarkup`, `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset parsed into lines (pure, unit-tested) → chat components; `[[item]]` icons; `[[recipe:id]]` grids from `GameRecipes` |
+| `ChatMarkup`, `ChatFormatter`, `ItemIcons`, `RecipeRenderer` | Markdown subset parsed into lines (pure, unit-tested) → chat components; `[[item]]` icons; `[[recipe:id]]` grids from `GameRecipes`. `ChatFormatter.parse` (any thread: markup and the recipe snapshot) then `build` (client thread: every component) |
 | `GameRecipes`, `GameRecipe` | The one recipe model, for grids and material lists: the integrated server's `RecipeManager` while a single-player world is open, else the knowledge base's recipe files read with the game's codec; lookup by id and each item's main recipe; recipes read through the game's recipe-book displays into immutable records |
 | `Waypoints` | `[[waypoint:Name\|x y z\|dimension]]` → a button running Xaero's `xaero_waypoint_add:` share command (only while a known-good version of Xaero's Minimap is loaded: `KNOWN_GOOD_VERSIONS`) |
 | `StatusLine` + `mixin/ChatComponentAccessor` | The live "Thinking… 3s" line, replaced in place |
@@ -81,6 +82,8 @@ Client-side Fabric mod for Minecraft **26.3**. `@claude <question>` in chat runs
 - Everything is client-side (`"environment": "client"`). World access goes through the integrated server only, so multiplayer gets no world tools.
 - **Read only by default.** `Read,Grep,Glob,WebSearch,WebFetch` plus `mcp__minecraft`. Edit, Write, Bash and PowerShell come only from `/claude permissions ask` or `full` (`PermissionTier.cliFlags`), never by default and never from a migration. Anything that changes the world goes through `run_command`'s own rules; don't pre-approve it in Claude Code.
 - **Never commit decompiled Minecraft or mod code.** It lives under `run/` and `build/`, which are gitignored.
+- **Prompt facts have one owner.** Text Claude reads names tools through `{tool:…}` or `McpServer.claudeName`, and numbers through their constants; `SystemPromptTest` fails if the prompt names a tool the server doesn't have. Anything the mod didn't write goes through `PromptData.block`.
+- **Chat components on the client thread.** Atlas sprites, translations, items and `Minecraft.getInstance()` reads belong there; off-thread work produces plain data.
 
 ## Looking up Minecraft APIs
 

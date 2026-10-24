@@ -27,7 +27,10 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 
-/** Inline item icons for chat, using the game's own texture atlases (the "object" text component). */
+/**
+ * Inline item icons for chat, using the game's own texture atlases (the "object" text component). Call on the client
+ * thread: icons are looked up in the atlases and item models, which a resource reload replaces there.
+ */
 public final class ItemIcons {
 	private record SpriteRef(Identifier atlas, Identifier sprite) {
 	}

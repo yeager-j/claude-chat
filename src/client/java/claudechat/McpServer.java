@@ -52,6 +52,11 @@ import java.util.function.BooleanSupplier;
  * Plain sockets rather than the JDK's HTTP server, which some launchers' trimmed Java runtimes don't include.
  */
 public class McpServer {
+	/** The server's name in claude's MCP config. Claude Code names each of its tools after it: see {@link #claudeName}. */
+	public static final String NAME = "minecraft";
+	/** Claude Code's name for all of this server's tools at once, as {@code --allowedTools} takes it. */
+	public static final String CLAUDE_PREFIX = "mcp__" + NAME;
+
 	/** MCP versions whose Streamable HTTP transport and tool calls this server implements. */
 	private static final Set<String> SUPPORTED_PROTOCOLS = Set.of("2025-03-26", "2025-06-18", "2025-11-25");
 	private static final String PREFERRED_PROTOCOL = "2025-06-18";
@@ -92,6 +97,16 @@ public class McpServer {
 	/** Are the world tools offered right now? */
 	public boolean worldOpen() {
 		return worldOpen.getAsBoolean();
+	}
+
+	/** Claude Code's name for one of this server's tools, e.g. {@code mcp__minecraft__look} for {@code look}. */
+	public static String claudeName(String tool) {
+		return CLAUDE_PREFIX + "__" + tool;
+	}
+
+	/** Every tool the server can offer, whether or not it's available right now. */
+	public Set<String> toolNames() {
+		return Set.copyOf(tools.keySet());
 	}
 
 	private static String newToken() {
@@ -187,7 +202,7 @@ public class McpServer {
 			this.context = context;
 		}
 
-		/** The --mcp-config JSON for claude: this server as "minecraft" with this token, or no servers if it isn't running. */
+		/** The --mcp-config JSON for claude: this server as {@link #NAME} with this token, or no servers if it isn't running. */
 		public String claudeConfig() {
 			JsonObject servers = new JsonObject();
 			ServerSocket s = socket;
@@ -198,7 +213,7 @@ public class McpServer {
 				JsonObject headers = new JsonObject();
 				headers.addProperty("Authorization", "Bearer " + token);
 				minecraft.add("headers", headers);
-				servers.add("minecraft", minecraft);
+				servers.add(NAME, minecraft);
 			}
 
 			JsonObject config = new JsonObject();
@@ -505,7 +520,7 @@ public class McpServer {
 				capabilities.add("tools", new JsonObject());
 				result.add("capabilities", capabilities);
 				JsonObject info = new JsonObject();
-				info.addProperty("name", "minecraft");
+				info.addProperty("name", NAME);
 				info.addProperty("version", "1.0.0");
 				result.add("serverInfo", info);
 				result.addProperty("instructions", "Tools for the player's Minecraft game: decompile a mod's code on demand, and "

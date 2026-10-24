@@ -131,7 +131,7 @@ public final class WorldTools {
 	private final Materials materials;
 	/** Runs the world-independent warm-up in {@link #prepare}, one at a time, at low priority. */
 	private final ExecutorService warmUp = Executors.newSingleThreadExecutor(task -> {
-		Thread thread = new Thread(task, "Claude Chat materials");
+		Thread thread = new Thread(task, "Claude Chat warm-up");
 		thread.setDaemon(true);
 		thread.setPriority(Thread.MIN_PRIORITY);
 		return thread;
@@ -694,9 +694,9 @@ public final class WorldTools {
 	private static final int MAX_TEMPLATE_ENTITIES = 30;
 
 	/**
-	 * Slow first-use work, in the background when the world opens or reloads: the structure template index, the
-	 * recipes for material breakdowns, and the data fixer's rules for old schematics. The last two don't depend on the
-	 * world, so one run at a time is enough.
+	 * Slow first-use work, in the background when the world opens or reloads: the structure template index, and the
+	 * data fixer's rules for old schematics. The second doesn't depend on the world, so one run at a time is enough.
+	 * (Recipes need no warm-up: read from the server's recipe manager they take milliseconds.)
 	 */
 	public void prepare(MinecraftServer server) {
 		templates.prepare(server);
@@ -704,11 +704,8 @@ public final class WorldTools {
 			if (warmUpRun == null || warmUpRun.isDone()) {
 				warmUpRun = warmUp.submit(() -> {
 					long start = System.nanoTime();
-					materials.prepare();
-					long recipesDone = System.nanoTime();
 					Schematics.prepare();
-					ClaudeChatClient.LOGGER.info("Prepared recipes in {} ms and the schematic data fixer in {} ms",
-						(recipesDone - start) / 1_000_000, (System.nanoTime() - recipesDone) / 1_000_000);
+					ClaudeChatClient.LOGGER.info("Prepared the schematic data fixer in {} ms", (System.nanoTime() - start) / 1_000_000);
 				});
 			}
 		}
