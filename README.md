@@ -4,6 +4,8 @@ Ask Claude about Minecraft without leaving the game. ClaudeChat is a client-side
 
 The mod runs the Claude Code terminal app on your computer. It prepares reference files from Minecraft and your mods, including recipes and decompiled code, so Claude can investigate how your game works. Answers appear in chat and can include item icons, recipe grids, clickable commands, and waypoint buttons.
 
+<img width="499" height="205" alt="image" src="https://github.com/user-attachments/assets/fa46cac7-3b12-4be6-83ac-8806afef4bfd" />
+
 ## Why
 
 Claude's training data can be incomplete or out of date, and wikis can contain mistakes or block access by agents. ClaudeChat decompiles Minecraft and your mods so Claude can read their code and data directly when answering questions. This gives it information specific to your game version and installed mods, though its answers can still contain mistakes.
@@ -105,6 +107,11 @@ Try asking:
 - **Prepare a project:** `@claude what materials do I need for my witch farm schematic, and does my Witch Farm chest have them?`
 - **Learn the game:** `@claude how does this spawner work?`
 - **Use your mods:** `@claude how do I craft the item I'm holding?`
+
+<img width="499" height="225" alt="image" src="https://github.com/user-attachments/assets/d79a075e-a79f-431d-8c20-00f4d0d17296" />
+
+<img width="495" height="143" alt="image" src="https://github.com/user-attachments/assets/d1f15d8d-c272-4be7-b487-9c676d40ba88" />
+
 
 Claude can make mistakes, so check the answer before acting on it.
 
